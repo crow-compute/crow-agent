@@ -263,8 +263,8 @@ mod tests {
         let report = run(
             &directory.path().join("state"),
             &report_path,
-            Duration::from_millis(90),
-            Duration::from_millis(30),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
         )
         .await?;
         assert_eq!(report.status, "complete");
