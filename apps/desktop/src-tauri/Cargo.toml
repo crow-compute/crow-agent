@@ -1,0 +1,25 @@
+[package]
+name = "crow-agent-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "crow_agent_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.1", features = [] }
+
+[dependencies]
+crow-agent-protocol = { path = "../../../crates/crow-agent-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.9.3", features = [] }
+
+[lints]
+workspace = true
+

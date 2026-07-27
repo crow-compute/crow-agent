@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crowcompute.ai/schemas/crow-harness-v1.schema.json",
+  "title": "Crow Harness Protocol v1 Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "type", "id", "timestamp", "payload"],
+  "properties": {
+    "protocol": {"const": "crow.harness.v1"},
+    "type": {
+      "enum": [
+        "challenge",
+        "auth",
+        "auth.ok",
+        "heartbeat",
+        "lease.acquire",
+        "lease.granted",
+        "lease.rejected",
+        "event.append",
+        "event.accepted",
+        "event.rejected",
+        "command",
+        "command.accepted",
+        "command.rejected",
+        "reconcile",
+        "shutdown"
+      ]
+    },
+    "id": {"type": "string", "minLength": 1},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "payload": {"type": "object"}
+  }
+}
+
