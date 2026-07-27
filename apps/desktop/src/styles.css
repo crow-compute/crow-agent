@@ -70,10 +70,66 @@ article button {
   background: #111722;
   color: #94a3b8;
 }
+article button:not(:disabled) {
+  cursor: pointer;
+  border-color: #84cc16;
+  color: #ecfccb;
+}
+article button:disabled { opacity: 0.62; }
+.authorization {
+  display: grid;
+  gap: 10px;
+  margin-top: auto;
+}
+.authorization span { color: #97a3b6; font-size: 13px; }
+.authorization strong {
+  color: #ecfccb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 20px;
+  letter-spacing: 0.12em;
+}
+.authorization button { margin-top: 4px; }
+.error { color: #fca5a5; font-size: 13px; margin: 10px 0 0; }
+
+.remote-runs {
+  display: grid;
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.remote-runs > article {
+  min-height: 0;
+  padding: 18px 20px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.remote-runs article > div:first-child {
+  display: grid;
+  gap: 5px;
+}
+
+.remote-runs article span {
+  color: #97a3b6;
+  font-size: 12px;
+}
+
+.remote-runs article > div:last-child {
+  display: flex;
+  gap: 8px;
+}
+
+.remote-runs article button {
+  margin: 0;
+}
 
 @media (max-width: 760px) {
   .shell { padding: 28px 18px; }
   .hero { align-items: flex-start; flex-direction: column; }
   .grid { grid-template-columns: 1fr; }
+  .remote-runs > article { align-items: stretch; flex-direction: column; }
+  .remote-runs article > div:last-child { width: 100%; }
+  .remote-runs article button { flex: 1; }
 }
-

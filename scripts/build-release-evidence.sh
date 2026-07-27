@@ -32,7 +32,8 @@ done
 
 mkdir -p "$output_directory"
 source_commit=$(git rev-parse HEAD)
-release_target=$(uname -s)-$(uname -m)
+source_committed_at=$(git show -s --format=%cI HEAD)
+release_version=${RELEASE_VERSION:-$(git describe --tags --always)}
 checksum_file="$output_directory/SHA256SUMS"
 sbom_file="$output_directory/release.spdx.json"
 scan_file="$output_directory/grype.json"
@@ -53,36 +54,59 @@ if jq -e '[.matches[] | select(.vulnerability.severity == "High" or .vulnerabili
   exit 1
 fi
 
-checksum_digest=$(shasum -a 256 "$checksum_file" | awk '{print $1}')
 sbom_digest=$(shasum -a 256 "$sbom_file" | awk '{print $1}')
 scan_digest=$(shasum -a 256 "$scan_file" | awk '{print $1}')
-ui_digest=$(find apps/desktop/dist -type f -print0 2>/dev/null \
-  | sort -z \
-  | xargs -0 shasum -a 256 2>/dev/null \
-  | shasum -a 256 \
-  | awk '{print $1}')
-if [[ -z "$ui_digest" ]]; then
-  ui_digest=$(printf 'not-built' | shasum -a 256 | awk '{print $1}')
+ui_digest=null
+if [[ -d apps/desktop/dist ]] && find apps/desktop/dist -type f -print -quit | grep -q .; then
+  ui_digest=$(find apps/desktop/dist -type f -print0 \
+    | sort -z \
+    | xargs -0 shasum -a 256 \
+    | shasum -a 256 \
+    | awk '{print $1}')
+  ui_digest="\"$ui_digest\""
 fi
+targets_json=$(jq -R -s '
+  split("\n")
+  | map(select(length > 0))
+  | map(
+      capture("^(?<digest>[0-9a-f]{64})  (?<path>.+)$")
+      | {
+          os: (
+            if (.path | ascii_downcase | contains("macos")) then "macos"
+            elif (.path | ascii_downcase | contains("windows")) then "windows"
+            else "linux"
+            end
+          ),
+          arch: (
+            if (.path | ascii_downcase | contains("universal")) then "universal"
+            else "x86_64"
+            end
+          ),
+          artifact_sha256: .digest
+        }
+    )
+' "$checksum_file")
 
 jq -n \
   --arg protocol "crow.harness.v1" \
+  --arg version "$release_version" \
   --arg source_commit "$source_commit" \
-  --arg target "$release_target" \
-  --arg checksums_sha256 "$checksum_digest" \
-  --arg ui_sha256 "$ui_digest" \
+  --arg source_committed_at "$source_committed_at" \
+  --argjson targets "$targets_json" \
+  --argjson ui_sha256 "$ui_digest" \
   --arg sbom_sha256 "$sbom_digest" \
   --arg vulnerability_evidence_sha256 "$scan_digest" \
   --arg signer "$release_signer" \
   '{
     protocol: $protocol,
+    version: $version,
     source_commit: $source_commit,
-    target: $target,
-    binary_sha256: $checksums_sha256,
+    source_committed_at: $source_committed_at,
+    targets: $targets,
     ui_sha256: $ui_sha256,
     sbom_sha256: $sbom_sha256,
-    vulnerability_evidence_sha256: $vulnerability_evidence_sha256,
-    protocol_versions: [$protocol],
+    vulnerability_report_sha256: $vulnerability_evidence_sha256,
+    compatible_protocols: [$protocol],
     signer: $signer
   }' > "$manifest_file"
 

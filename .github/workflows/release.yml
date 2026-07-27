@@ -57,13 +57,17 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Build Linux daemon
         if: runner.os == 'Linux'
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p crow-agentd
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-gnu -p crow-agentd
+          ./scripts/package-linux.sh \
+            target/x86_64-unknown-linux-gnu/release/crow-agentd \
+            target/x86_64-unknown-linux-gnu/release/crow-agent-linux-x86_64.tar.zst
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: |
             target/${{ matrix.target }}/release/bundle/**
-            target/${{ matrix.target }}/release/crow-agentd*
+            target/${{ matrix.target }}/release/crow-agent*
           if-no-files-found: error
 
   attest:

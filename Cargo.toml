@@ -22,13 +22,20 @@ repository = "https://github.com/crow-compute/crow-agent"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+arrow-array = "=59.1.0"
+arrow-schema = "=59.1.0"
 base64 = "0.22.1"
 chacha20poly1305 = "0.10.1"
 clap = { version = "4.5.51", features = ["derive"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+ethers = { version = "=2.0.14", default-features = false, features = ["eip712"] }
 futures-util = "0.3.31"
 hex = "0.4.3"
 hkdf = "0.12.4"
+hyperliquid_rust_sdk = "=0.6.0"
+keyring = "=4.1.5"
+open = "=5.4.0"
+parquet = { version = "=59.1.0", default-features = false, features = ["arrow", "zstd"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
@@ -36,7 +43,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 thiserror = "2.0.17"
-time = { version = "0.3.44", features = ["formatting", "macros", "parsing", "serde"] }
+time = { version = "0.3.44", features = ["formatting", "macros", "parsing", "serde", "serde-well-known"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1.41"

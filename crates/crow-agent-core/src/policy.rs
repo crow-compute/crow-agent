@@ -79,6 +79,8 @@ pub enum PolicyError {
     OracleGap,
     #[error("long-only policy rejected a non-reducing sell")]
     LongOnly,
+    #[error("reduce-only order would increase or exceed the current position")]
+    ReduceOnly,
     #[error("daily loss limit reached")]
     DailyLoss,
     #[error("drawdown limit reached")]
@@ -131,6 +133,11 @@ pub fn evaluate_proposal(
     }
     if proposal.side == Side::Sell && rules.long_only && !proposal.reduce_only {
         return Err(PolicyError::LongOnly);
+    }
+    if proposal.reduce_only
+        && (proposal.side != Side::Sell || portfolio.symbol_position_micro_usdc <= 0)
+    {
+        return Err(PolicyError::ReduceOnly);
     }
     if loss_bps(
         portfolio.trading_day_start_equity_micro_usdc,
@@ -185,6 +192,9 @@ pub fn evaluate_proposal(
             )?
     {
         return Err(PolicyError::PositionSize);
+    }
+    if proposal.reduce_only && actual_notional > portfolio.symbol_position_micro_usdc {
+        return Err(PolicyError::ReduceOnly);
     }
     let reserve = bps_amount(
         portfolio.equity_micro_usdc,
@@ -339,5 +349,40 @@ mod tests {
             &context(&rules, &market, &portfolio),
         );
         assert_eq!(result, Err(PolicyError::LongOnly));
+    }
+
+    #[test]
+    fn rejects_reduce_only_order_larger_than_position() {
+        let rules = RiskRulesV1::default();
+        let market = MarketState {
+            symbol: "BTC".into(),
+            mark_price_micro_usdc: 60_000_000_000,
+            oracle_price_micro_usdc: 60_000_000_000,
+            spread_bps: 2,
+            book_age_seconds: 1,
+            ask_depth_micro_usdc: 1_000_000_000,
+            bid_depth_micro_usdc: 1_000_000_000,
+            size_decimals: 5,
+            delisted: false,
+        };
+        let portfolio = PortfolioState {
+            equity_micro_usdc: 1_000_000_000,
+            available_collateral_micro_usdc: 900_000_000,
+            trading_day_start_equity_micro_usdc: 1_000_000_000,
+            peak_equity_micro_usdc: 1_000_000_000,
+            symbol_position_micro_usdc: 5_000_000,
+            orders_today: 0,
+        };
+        let proposal = Proposal {
+            symbol: "BTC".into(),
+            side: Side::Sell,
+            notional_bps: 100,
+            limit_price_micro_usdc: market.mark_price_micro_usdc,
+            reduce_only: true,
+        };
+        assert_eq!(
+            evaluate_proposal(&proposal, &context(&rules, &market, &portfolio)),
+            Err(PolicyError::ReduceOnly)
+        );
     }
 }

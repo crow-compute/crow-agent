@@ -41,6 +41,12 @@ impl EncryptedJournal {
                 private_nonce TEXT NOT NULL,
                 private_ciphertext TEXT NOT NULL,
                 PRIMARY KEY(run_id, sequence)
+             );
+             CREATE TABLE IF NOT EXISTS local_secrets (
+                name TEXT PRIMARY KEY,
+                nonce TEXT NOT NULL,
+                ciphertext TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
              );",
         )?;
         Ok(Self {
@@ -118,6 +124,41 @@ impl EncryptedJournal {
         })
         .transpose()
     }
+
+    pub fn put_secret(&self, name: &str, secret: &[u8]) -> Result<(), JournalError> {
+        if name.is_empty() {
+            return Err(JournalError::Sequence);
+        }
+        let encrypted = encrypt_bundle(&self.key, secret, name.as_bytes())?;
+        self.connection.execute(
+            "INSERT INTO local_secrets(name,nonce,ciphertext,updated_at)
+             VALUES(?1,?2,?3,unixepoch())
+             ON CONFLICT(name) DO UPDATE SET
+                nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=unixepoch()",
+            params![name, encrypted.nonce, encrypted.ciphertext],
+        )?;
+        Ok(())
+    }
+
+    pub fn secret(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>, JournalError> {
+        let row: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT nonce,ciphertext FROM local_secrets WHERE name=?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row
+            .map(|(nonce, ciphertext)| {
+                decrypt_bundle(
+                    &self.key,
+                    &BundleCiphertext { nonce, ciphertext },
+                    name.as_bytes(),
+                )
+            })
+            .transpose()?)
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +197,26 @@ mod tests {
         assert!(
             !raw.windows(b"secret strategy".len())
                 .any(|value| value == b"secret strategy")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotating_device_token_is_encrypted_at_rest() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("journal.db");
+        let journal = EncryptedJournal::open(&path, [11_u8; 32])?;
+        journal.put_secret("device-refresh-token", b"crow_device_refresh_secret")?;
+        let stored = journal
+            .secret("device-refresh-token")?
+            .ok_or("encrypted token was not stored")?;
+        assert_eq!(stored.as_slice(), b"crow_device_refresh_secret".as_slice());
+        drop(journal);
+        let database = std::fs::read(path)?;
+        assert!(
+            !database
+                .windows(b"crow_device_refresh_secret".len())
+                .any(|value| value == b"crow_device_refresh_secret")
         );
         Ok(())
     }

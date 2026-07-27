@@ -33,6 +33,10 @@ pub enum ProtocolError {
     InvalidPublicKey,
     #[error("invalid signature encoding")]
     InvalidSignatureEncoding,
+    #[error("remote command is invalid")]
+    InvalidRemoteCommand,
+    #[error("inference receipt is invalid")]
+    InvalidInferenceReceipt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,7 +178,9 @@ pub struct ArenaManifestV1 {
     pub arena_id: Uuid,
     pub manifest_version: u32,
     pub mode: ArenaMode,
+    #[serde(with = "time::serde::rfc3339")]
     pub starts_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub ends_at: OffsetDateTime,
     pub decision_interval_seconds: u32,
     pub symbols: Vec<String>,
@@ -251,6 +257,155 @@ impl ArenaManifestV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedArenaManifestV1 {
+    pub manifest: ArenaManifestV1,
+    pub manifest_sha256: String,
+    pub signer_public_key: String,
+    pub signature: String,
+}
+
+impl SignedArenaManifestV1 {
+    pub fn sign(
+        manifest: ArenaManifestV1,
+        signing_key: &SigningKey,
+    ) -> Result<Self, ProtocolError> {
+        manifest.validate()?;
+        let digest = sha256(&canonical_json(&manifest)?);
+        Ok(Self {
+            manifest,
+            manifest_sha256: hex::encode(digest),
+            signer_public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes()),
+            signature: URL_SAFE_NO_PAD.encode(signing_key.sign(&digest).to_bytes()),
+        })
+    }
+
+    pub fn verify(&self) -> Result<(), ProtocolError> {
+        self.manifest.validate()?;
+        let digest = sha256(&canonical_json(&self.manifest)?);
+        if hex::encode(digest) != self.manifest_sha256 {
+            return Err(ProtocolError::InvalidEventHash);
+        }
+        verify_signature(&self.signer_public_key, &self.signature, &digest)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetFileV1 {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetManifestV1 {
+    pub protocol: String,
+    pub dataset_id: Uuid,
+    pub version: u32,
+    pub interval_seconds: u32,
+    pub symbols: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub starts_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub ends_at: OffsetDateTime,
+    pub files: Vec<DatasetFileV1>,
+    pub package_sha256: String,
+    pub signer_public_key: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UnsignedDatasetManifest<'a> {
+    protocol: &'a str,
+    dataset_id: Uuid,
+    version: u32,
+    interval_seconds: u32,
+    symbols: &'a [String],
+    #[serde(with = "time::serde::rfc3339")]
+    starts_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    ends_at: OffsetDateTime,
+    files: &'a [DatasetFileV1],
+    package_sha256: &'a str,
+    signer_public_key: &'a str,
+}
+
+impl DatasetManifestV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign(
+        signing_key: &SigningKey,
+        dataset_id: Uuid,
+        version: u32,
+        starts_at: OffsetDateTime,
+        ends_at: OffsetDateTime,
+        files: Vec<DatasetFileV1>,
+        package_sha256: String,
+    ) -> Result<Self, ProtocolError> {
+        let signer_public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
+        let mut manifest = Self {
+            protocol: HARNESS_PROTOCOL_V1.into(),
+            dataset_id,
+            version,
+            interval_seconds: 900,
+            symbols: ALLOWED_SYMBOLS.map(str::to_owned).to_vec(),
+            starts_at,
+            ends_at,
+            files,
+            package_sha256,
+            signer_public_key,
+            signature: String::new(),
+        };
+        manifest.validate()?;
+        let digest = sha256(&canonical_json(&manifest.unsigned())?);
+        manifest.signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&digest).to_bytes());
+        Ok(manifest)
+    }
+
+    pub fn verify(&self) -> Result<(), ProtocolError> {
+        self.validate()?;
+        let digest = sha256(&canonical_json(&self.unsigned())?);
+        verify_signature(&self.signer_public_key, &self.signature, &digest)
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.protocol != HARNESS_PROTOCOL_V1
+            || self.version == 0
+            || self.interval_seconds != 900
+            || self.symbols != ALLOWED_SYMBOLS.map(str::to_owned)
+            || self.starts_at >= self.ends_at
+            || self.files.is_empty()
+            || !is_sha256(&self.package_sha256)
+            || self.files.iter().any(|file| {
+                file.path.is_empty()
+                    || file.path.starts_with('/')
+                    || file.path.contains("..")
+                    || file.bytes == 0
+                    || !is_sha256(&file.sha256)
+            })
+        {
+            return Err(ProtocolError::InvalidManifest(
+                "dataset manifest is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn unsigned(&self) -> UnsignedDatasetManifest<'_> {
+        UnsignedDatasetManifest {
+            protocol: &self.protocol,
+            dataset_id: self.dataset_id,
+            version: self.version,
+            interval_seconds: self.interval_seconds,
+            symbols: &self.symbols,
+            starts_at: self.starts_at,
+            ends_at: self.ends_at,
+            files: &self.files,
+            package_sha256: &self.package_sha256,
+            signer_public_key: &self.signer_public_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceKeyWrapV1 {
     pub device_id: Uuid,
     pub ephemeral_public_key: String,
@@ -269,6 +424,7 @@ pub struct AgentVersionEnvelopeV1 {
     pub ciphertext: String,
     pub nonce: String,
     pub key_wraps: Vec<DeviceKeyWrapV1>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
@@ -290,7 +446,69 @@ pub struct ArenaInferenceReceiptV1 {
     pub amount_microcredits: u64,
     pub gateway_public_key: String,
     pub gateway_signature: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub finalized_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+struct UnsignedArenaInferenceReceipt<'a> {
+    protocol: &'a str,
+    receipt_id: Uuid,
+    arena_id: Uuid,
+    run_id: Uuid,
+    cycle_id: Uuid,
+    model_id: &'a str,
+    model_revision: &'a str,
+    runtime_digest: &'a str,
+    input_sha256: &'a str,
+    output_sha256: &'a str,
+    tool_calls_sha256: &'a str,
+    input_tokens: u64,
+    output_tokens: u64,
+    amount_microcredits: u64,
+    gateway_public_key: &'a str,
+    #[serde(with = "time::serde::rfc3339")]
+    finalized_at: OffsetDateTime,
+}
+
+impl ArenaInferenceReceiptV1 {
+    pub fn verify(&self) -> Result<(), ProtocolError> {
+        if self.protocol != HARNESS_PROTOCOL_V1
+            || self.model_id.is_empty()
+            || self.model_revision.is_empty()
+            || self.runtime_digest.is_empty()
+            || self.runtime_digest.len() > 256
+            || !is_sha256(&self.input_sha256)
+            || !is_sha256(&self.output_sha256)
+            || !is_sha256(&self.tool_calls_sha256)
+        {
+            return Err(ProtocolError::InvalidInferenceReceipt);
+        }
+        let unsigned = UnsignedArenaInferenceReceipt {
+            protocol: &self.protocol,
+            receipt_id: self.receipt_id,
+            arena_id: self.arena_id,
+            run_id: self.run_id,
+            cycle_id: self.cycle_id,
+            model_id: &self.model_id,
+            model_revision: &self.model_revision,
+            runtime_digest: &self.runtime_digest,
+            input_sha256: &self.input_sha256,
+            output_sha256: &self.output_sha256,
+            tool_calls_sha256: &self.tool_calls_sha256,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            amount_microcredits: self.amount_microcredits,
+            gateway_public_key: &self.gateway_public_key,
+            finalized_at: self.finalized_at,
+        };
+        verify_signature(
+            &self.gateway_public_key,
+            &self.gateway_signature,
+            &canonical_json(&unsigned)?,
+        )
+        .map_err(|_| ProtocolError::InvalidInferenceReceipt)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +523,7 @@ pub struct ReleaseManifestV1 {
     pub protocol: String,
     pub version: String,
     pub source_commit: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub source_committed_at: OffsetDateTime,
     pub targets: Vec<ReleaseTargetV1>,
     pub ui_sha256: Option<String>,
@@ -330,11 +549,99 @@ pub struct RemoteCommandV1 {
     pub run_id: Uuid,
     pub action: RemoteAction,
     pub nonce: u64,
+    #[serde(with = "time::serde::rfc3339")]
     pub issued_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     pub controller_device_id: Uuid,
     pub controller_signature: String,
     pub relay_receipt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UnsignedRemoteCommand<'a> {
+    protocol: &'a str,
+    command_id: Uuid,
+    target_device_id: Uuid,
+    run_id: Uuid,
+    action: RemoteAction,
+    nonce: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    issued_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: OffsetDateTime,
+    controller_device_id: Uuid,
+}
+
+impl RemoteCommandV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign(
+        signing_key: &SigningKey,
+        target_device_id: Uuid,
+        run_id: Uuid,
+        action: RemoteAction,
+        nonce: u64,
+        issued_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+        controller_device_id: Uuid,
+    ) -> Result<Self, ProtocolError> {
+        if expires_at <= issued_at {
+            return Err(ProtocolError::InvalidRemoteCommand);
+        }
+        let command_id = Uuid::new_v4();
+        let unsigned = UnsignedRemoteCommand {
+            protocol: HARNESS_PROTOCOL_V1,
+            command_id,
+            target_device_id,
+            run_id,
+            action,
+            nonce,
+            issued_at,
+            expires_at,
+            controller_device_id,
+        };
+        let digest = sha256(&canonical_json(&unsigned)?);
+        Ok(Self {
+            protocol: HARNESS_PROTOCOL_V1.into(),
+            command_id,
+            target_device_id,
+            run_id,
+            action,
+            nonce,
+            issued_at,
+            expires_at,
+            controller_device_id,
+            controller_signature: URL_SAFE_NO_PAD.encode(signing_key.sign(&digest).to_bytes()),
+            relay_receipt: None,
+        })
+    }
+
+    pub fn verify(
+        &self,
+        controller_public_key: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), ProtocolError> {
+        if self.protocol != HARNESS_PROTOCOL_V1
+            || self.expires_at <= self.issued_at
+            || now < self.issued_at
+            || now > self.expires_at
+        {
+            return Err(ProtocolError::InvalidRemoteCommand);
+        }
+        let unsigned = UnsignedRemoteCommand {
+            protocol: &self.protocol,
+            command_id: self.command_id,
+            target_device_id: self.target_device_id,
+            run_id: self.run_id,
+            action: self.action,
+            nonce: self.nonce,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+            controller_device_id: self.controller_device_id,
+        };
+        let digest = sha256(&canonical_json(&unsigned)?);
+        verify_signature(controller_public_key, &self.controller_signature, &digest)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,11 +654,14 @@ pub struct RunEventEnvelopeV1 {
     pub sequence: u64,
     pub previous_event_sha256: String,
     pub event_type: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub occurred_at: OffsetDateTime,
     pub payload: Value,
     pub event_sha256: String,
     pub device_public_key: String,
     pub device_signature: String,
+    #[serde(default)]
+    pub server_receipt: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -364,6 +674,7 @@ struct UnsignedRunEvent<'a> {
     sequence: u64,
     previous_event_sha256: &'a str,
     event_type: &'a str,
+    #[serde(with = "time::serde::rfc3339")]
     occurred_at: OffsetDateTime,
     payload: &'a Value,
 }
@@ -410,6 +721,7 @@ impl RunEventEnvelopeV1 {
             event_sha256: hex::encode(digest),
             device_public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes()),
             device_signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            server_receipt: None,
         })
     }
 
@@ -433,22 +745,13 @@ impl RunEventEnvelopeV1 {
         if hex::encode(digest) != self.event_sha256 {
             return Err(ProtocolError::InvalidEventHash);
         }
-        let public_raw = URL_SAFE_NO_PAD
-            .decode(&self.device_public_key)
-            .map_err(|_| ProtocolError::InvalidPublicKey)?;
-        let public_array: [u8; 32] = public_raw
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidPublicKey)?;
-        let public =
-            VerifyingKey::from_bytes(&public_array).map_err(|_| ProtocolError::InvalidPublicKey)?;
-        let signature_raw = URL_SAFE_NO_PAD
-            .decode(&self.device_signature)
-            .map_err(|_| ProtocolError::InvalidSignatureEncoding)?;
-        let signature = Signature::from_slice(&signature_raw)
-            .map_err(|_| ProtocolError::InvalidSignatureEncoding)?;
-        public
-            .verify(&digest, &signature)
-            .map_err(|_| ProtocolError::InvalidEventSignature)
+        verify_signature(&self.device_public_key, &self.device_signature, &digest)
+    }
+
+    #[must_use]
+    pub fn with_server_receipt(mut self, receipt: String) -> Self {
+        self.server_receipt = Some(receipt);
+        self
     }
 }
 
@@ -499,6 +802,29 @@ pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError>
     serde_json::to_vec(&sorted).map_err(ProtocolError::CanonicalJson)
 }
 
+fn verify_signature(
+    public_key: &str,
+    encoded_signature: &str,
+    message: &[u8],
+) -> Result<(), ProtocolError> {
+    let public_raw = URL_SAFE_NO_PAD
+        .decode(public_key)
+        .map_err(|_| ProtocolError::InvalidPublicKey)?;
+    let public_array: [u8; 32] = public_raw
+        .try_into()
+        .map_err(|_| ProtocolError::InvalidPublicKey)?;
+    let public =
+        VerifyingKey::from_bytes(&public_array).map_err(|_| ProtocolError::InvalidPublicKey)?;
+    let signature_raw = URL_SAFE_NO_PAD
+        .decode(encoded_signature)
+        .map_err(|_| ProtocolError::InvalidSignatureEncoding)?;
+    let signature = Signature::from_slice(&signature_raw)
+        .map_err(|_| ProtocolError::InvalidSignatureEncoding)?;
+    public
+        .verify(message, &signature)
+        .map_err(|_| ProtocolError::InvalidEventSignature)
+}
+
 fn sort_json(value: Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -530,7 +856,98 @@ mod tests {
 
     #[test]
     fn default_manifest_is_valid() {
-        let manifest = ArenaManifestV1 {
+        let manifest = valid_manifest();
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn signed_manifest_detects_mutation() -> Result<(), ProtocolError> {
+        let identity = DeviceIdentity::generate();
+        let mut signed = SignedArenaManifestV1::sign(valid_manifest(), identity.signing_key())?;
+        signed.manifest.required_client_version = "0.2.0".into();
+        assert!(signed.verify().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_command_binds_expiry_and_action() -> Result<(), ProtocolError> {
+        let identity = DeviceIdentity::generate();
+        let issued_at = datetime!(2026-07-01 00:00 UTC);
+        let expires_at = datetime!(2026-07-01 00:00:05 UTC);
+        let mut command = RemoteCommandV1::sign(
+            identity.signing_key(),
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            RemoteAction::Stop,
+            1,
+            issued_at,
+            expires_at,
+            Uuid::from_u128(3),
+        )?;
+        command.verify(&identity.public_key(), datetime!(2026-07-01 00:00:03 UTC))?;
+        command.action = RemoteAction::Resume;
+        assert!(
+            command
+                .verify(&identity.public_key(), datetime!(2026-07-01 00:00:03 UTC))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inference_receipt_signature_binds_accounting_and_hashes() -> Result<(), ProtocolError> {
+        let identity = DeviceIdentity::generate();
+        let mut receipt = ArenaInferenceReceiptV1 {
+            protocol: HARNESS_PROTOCOL_V1.into(),
+            receipt_id: Uuid::from_u128(1),
+            arena_id: Uuid::from_u128(2),
+            run_id: Uuid::from_u128(3),
+            cycle_id: Uuid::from_u128(4),
+            model_id: ALLOWED_MODELS[0].into(),
+            model_revision: "revision".into(),
+            runtime_digest: "managed-capacity/v1".into(),
+            input_sha256: "1".repeat(64),
+            output_sha256: "2".repeat(64),
+            tool_calls_sha256: "3".repeat(64),
+            input_tokens: 100,
+            output_tokens: 20,
+            amount_microcredits: 120,
+            gateway_public_key: identity.public_key(),
+            gateway_signature: String::new(),
+            finalized_at: datetime!(2026-07-01 00:00 UTC),
+        };
+        let unsigned = UnsignedArenaInferenceReceipt {
+            protocol: &receipt.protocol,
+            receipt_id: receipt.receipt_id,
+            arena_id: receipt.arena_id,
+            run_id: receipt.run_id,
+            cycle_id: receipt.cycle_id,
+            model_id: &receipt.model_id,
+            model_revision: &receipt.model_revision,
+            runtime_digest: &receipt.runtime_digest,
+            input_sha256: &receipt.input_sha256,
+            output_sha256: &receipt.output_sha256,
+            tool_calls_sha256: &receipt.tool_calls_sha256,
+            input_tokens: receipt.input_tokens,
+            output_tokens: receipt.output_tokens,
+            amount_microcredits: receipt.amount_microcredits,
+            gateway_public_key: &receipt.gateway_public_key,
+            finalized_at: receipt.finalized_at,
+        };
+        receipt.gateway_signature = URL_SAFE_NO_PAD.encode(
+            identity
+                .signing_key()
+                .sign(&canonical_json(&unsigned)?)
+                .to_bytes(),
+        );
+        receipt.verify()?;
+        receipt.amount_microcredits += 1;
+        assert!(receipt.verify().is_err());
+        Ok(())
+    }
+
+    fn valid_manifest() -> ArenaManifestV1 {
+        ArenaManifestV1 {
             protocol: HARNESS_PROTOCOL_V1.into(),
             arena_id: Uuid::nil(),
             manifest_version: 1,
@@ -551,8 +968,7 @@ mod tests {
             scoring: ScoringWeightsV1::default(),
             penalties: PenaltyRulesV1::default(),
             ticket: TicketConfigV1::default(),
-        };
-        assert!(manifest.validate().is_ok());
+        }
     }
 
     #[test]

@@ -28,7 +28,29 @@ npm run build
 ```
 
 The daemon refuses plaintext key CLI flags and reads unattended Linux secrets
-only from files below systemd's `CREDENTIALS_DIRECTORY`.
+only from files below systemd's `CREDENTIALS_DIRECTORY`. The initial
+browser authorization writes the rotating refresh token directly into the
+encrypted SQLite/WAL journal; it is never printed. Every replacement is
+persisted before the next relay session. The journal key, Ed25519 seed, X25519
+secret, and Hyperliquid Testnet API-wallet key are separate
+`LoadCredentialEncrypted` inputs.
+
+For a headless host, generate the three device credentials locally with
+`openssl rand 32 | systemd-creds encrypt --name=<credential> - <destination>`.
+Capture the 32-byte Hyperliquid Testnet API-wallet key through a hidden prompt
+and pipe its decoded bytes directly to `systemd-creds`; do not place its hex
+value in shell history. Run the one-time authorization command with the signing,
+encryption, and journal credentials loaded:
+
+```bash
+crow-agentd authorize "Trading host" \
+  --state-directory /var/lib/crow-agent
+```
+
+The command prints only the short-lived Crow URL/user code and the resulting
+public device ID. Put that public ID and the outbound relay URL in
+`/etc/crow/agent.json`, install `deploy/crow-agentd.service`, and start the
+service. The unit opens no inbound socket.
 
 OpenProphet is a noncommercial project and no OpenProphet source is included.
 

@@ -4,6 +4,7 @@ use crate::policy::{
 };
 use crow_agent_protocol::{ExecutionAssumptionsV1, RiskRulesV1};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +18,7 @@ pub struct CandleV1 {
     pub close_micro_usdc: i64,
     pub volume_e8: i64,
     pub funding_micros_per_usdc: i64,
+    pub size_decimals: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,8 +34,24 @@ pub struct SimulatedFill {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BacktestResult {
     pub ending_cash_micro_usdc: i64,
+    pub ending_equity_micro_usdc: i64,
+    pub fees_micro_usdc: i64,
+    pub funding_micro_usdc: i64,
     pub fills: Vec<SimulatedFill>,
+    pub equity_curve: Vec<EquityPoint>,
     pub policy_rejections: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledProposal {
+    pub decision_open_time_ms: i64,
+    pub proposal: Proposal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquityPoint {
+    pub close_time_ms: i64,
+    pub equity_micro_usdc: i64,
 }
 
 #[derive(Debug, Error)]
@@ -97,7 +115,7 @@ impl BacktestEngine {
             book_age_seconds: 0,
             ask_depth_micro_usdc: i64::MAX / 4,
             bid_depth_micro_usdc: i64::MAX / 4,
-            size_decimals: 8,
+            size_decimals: decision_candle.size_decimals,
             delisted: false,
         };
         let mut executable = proposal.clone();
@@ -188,10 +206,207 @@ impl BacktestEngine {
         let _ = MICRO_USDC_PER_USDC;
         Ok(BacktestResult {
             ending_cash_micro_usdc: cash,
+            ending_equity_micro_usdc: cash.checked_add(position).ok_or(BacktestError::Overflow)?,
+            fees_micro_usdc: fills.iter().try_fold(0_i64, |total, fill| {
+                total
+                    .checked_add(fill.fee_micro_usdc)
+                    .ok_or(BacktestError::Overflow)
+            })?,
+            funding_micro_usdc: 0,
             fills,
+            equity_curve: Vec::new(),
             policy_rejections,
         })
     }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn run_synchronized_proposals(
+        &self,
+        candles: &[CandleV1],
+        proposals: &[ScheduledProposal],
+        starting_cash_micro_usdc: i64,
+    ) -> Result<BacktestResult, BacktestError> {
+        const SYMBOLS: [&str; 3] = ["BTC", "ETH", "SOL"];
+        const DAY_MILLIS: i64 = 86_400_000;
+        if starting_cash_micro_usdc <= 0 || candles.len() < 6 || !candles.len().is_multiple_of(3) {
+            return Err(BacktestError::CandleOrder);
+        }
+        let intervals = candles.chunks_exact(3).collect::<Vec<_>>();
+        for (index, interval) in intervals.iter().enumerate() {
+            let open_time = interval[0].open_time_ms;
+            for (symbol_index, candle) in interval.iter().enumerate() {
+                if candle.symbol != SYMBOLS[symbol_index]
+                    || candle.open_time_ms != open_time
+                    || candle.close_time_ms != open_time + 900_000 - 1
+                    || candle.size_decimals > 8
+                {
+                    return Err(BacktestError::CandleOrder);
+                }
+                if index > 0
+                    && candle.open_time_ms
+                        != intervals[index - 1][symbol_index].open_time_ms + 900_000
+                {
+                    return Err(BacktestError::CandleOrder);
+                }
+            }
+        }
+        let mut scheduled = BTreeMap::<i64, &Proposal>::new();
+        for proposal in proposals {
+            if scheduled
+                .insert(proposal.decision_open_time_ms, &proposal.proposal)
+                .is_some()
+            {
+                return Err(BacktestError::CandleOrder);
+            }
+        }
+
+        let mut cash = starting_cash_micro_usdc;
+        let mut positions = BTreeMap::<String, i64>::from([
+            ("BTC".into(), 0),
+            ("ETH".into(), 0),
+            ("SOL".into(), 0),
+        ]);
+        let mut fills = Vec::new();
+        let mut equity_curve = Vec::with_capacity(intervals.len());
+        let mut fees = 0_i64;
+        let mut funding = 0_i64;
+        let mut policy_rejections = 0_u32;
+        let mut peak_equity = starting_cash_micro_usdc;
+        let mut day = intervals[0][0].close_time_ms / DAY_MILLIS;
+        let mut day_start_equity = starting_cash_micro_usdc;
+        let mut orders_today = 0_u16;
+
+        for (index, interval) in intervals.iter().enumerate() {
+            for candle in *interval {
+                let quantity = *positions
+                    .get(&candle.symbol)
+                    .ok_or(BacktestError::CandleOrder)?;
+                let notional = position_notional(quantity, candle.close_micro_usdc)?;
+                let payment = i64::try_from(
+                    i128::from(notional) * i128::from(candle.funding_micros_per_usdc) / 1_000_000,
+                )
+                .map_err(|_| BacktestError::Overflow)?;
+                cash = cash.checked_sub(payment).ok_or(BacktestError::Overflow)?;
+                funding = funding
+                    .checked_add(payment)
+                    .ok_or(BacktestError::Overflow)?;
+            }
+            let mut equity = portfolio_equity(cash, &positions, interval)?;
+            let current_day = interval[0].close_time_ms / DAY_MILLIS;
+            if current_day != day {
+                day = current_day;
+                day_start_equity = equity;
+                orders_today = 0;
+            }
+            peak_equity = peak_equity.max(equity);
+
+            if let Some(proposal) = scheduled.remove(&interval[0].open_time_ms) {
+                if index + 1 >= intervals.len() {
+                    return Err(BacktestError::CandleOrder);
+                }
+                let symbol_index = SYMBOLS
+                    .iter()
+                    .position(|symbol| *symbol == proposal.symbol)
+                    .ok_or(BacktestError::CandleOrder)?;
+                let decision = &interval[symbol_index];
+                let next = &intervals[index + 1][symbol_index];
+                let quantity = *positions
+                    .get(&proposal.symbol)
+                    .ok_or(BacktestError::CandleOrder)?;
+                let position = position_notional(quantity, decision.close_micro_usdc)?;
+                let portfolio = PortfolioState {
+                    equity_micro_usdc: equity,
+                    available_collateral_micro_usdc: cash,
+                    trading_day_start_equity_micro_usdc: day_start_equity,
+                    peak_equity_micro_usdc: peak_equity,
+                    symbol_position_micro_usdc: position,
+                    orders_today,
+                };
+                match self.execute_next_open(decision, next, proposal, &portfolio) {
+                    Ok(Some(fill)) => {
+                        let notional = position_notional(fill.quantity_e8, fill.price_micro_usdc)?;
+                        let held = positions
+                            .get_mut(&fill.symbol)
+                            .ok_or(BacktestError::CandleOrder)?;
+                        match fill.side {
+                            Side::Buy => {
+                                cash = cash
+                                    .checked_sub(notional)
+                                    .and_then(|value| value.checked_sub(fill.fee_micro_usdc))
+                                    .ok_or(BacktestError::Overflow)?;
+                                *held = held
+                                    .checked_add(fill.quantity_e8)
+                                    .ok_or(BacktestError::Overflow)?;
+                            }
+                            Side::Sell => {
+                                if fill.quantity_e8 > *held {
+                                    return Err(BacktestError::Policy(PolicyError::ReduceOnly));
+                                }
+                                cash = cash
+                                    .checked_add(notional)
+                                    .and_then(|value| value.checked_sub(fill.fee_micro_usdc))
+                                    .ok_or(BacktestError::Overflow)?;
+                                *held -= fill.quantity_e8;
+                            }
+                        }
+                        fees = fees
+                            .checked_add(fill.fee_micro_usdc)
+                            .ok_or(BacktestError::Overflow)?;
+                        orders_today = orders_today.saturating_add(1);
+                        fills.push(fill);
+                    }
+                    Ok(None) => {}
+                    Err(BacktestError::Policy(_)) => {
+                        policy_rejections = policy_rejections.saturating_add(1);
+                    }
+                    Err(error) => return Err(error),
+                }
+                equity = portfolio_equity(cash, &positions, interval)?;
+                peak_equity = peak_equity.max(equity);
+            }
+            equity_curve.push(EquityPoint {
+                close_time_ms: interval[0].close_time_ms,
+                equity_micro_usdc: equity,
+            });
+        }
+        if !scheduled.is_empty() {
+            return Err(BacktestError::CandleOrder);
+        }
+        let ending_equity = portfolio_equity(
+            cash,
+            &positions,
+            intervals.last().ok_or(BacktestError::CandleOrder)?,
+        )?;
+        Ok(BacktestResult {
+            ending_cash_micro_usdc: cash,
+            ending_equity_micro_usdc: ending_equity,
+            fees_micro_usdc: fees,
+            funding_micro_usdc: funding,
+            fills,
+            equity_curve,
+            policy_rejections,
+        })
+    }
+}
+
+fn position_notional(quantity_e8: i64, price_micro_usdc: i64) -> Result<i64, BacktestError> {
+    i64::try_from(i128::from(quantity_e8) * i128::from(price_micro_usdc) / 100_000_000)
+        .map_err(|_| BacktestError::Overflow)
+}
+
+fn portfolio_equity(
+    cash: i64,
+    positions: &BTreeMap<String, i64>,
+    candles: &[CandleV1],
+) -> Result<i64, BacktestError> {
+    candles.iter().try_fold(cash, |equity, candle| {
+        let quantity = *positions
+            .get(&candle.symbol)
+            .ok_or(BacktestError::CandleOrder)?;
+        equity
+            .checked_add(position_notional(quantity, candle.close_micro_usdc)?)
+            .ok_or(BacktestError::Overflow)
+    })
 }
 
 #[cfg(test)]
@@ -218,6 +433,7 @@ mod tests {
             close_micro_usdc: 60_000_000_000,
             volume_e8: 1,
             funding_micros_per_usdc: 0,
+            size_decimals: 5,
         };
         let next = CandleV1 {
             open_time_ms: 900_000,
@@ -245,6 +461,60 @@ mod tests {
             &portfolio,
         )?;
         assert_eq!(fill.map(|value| value.candle_open_time_ms), Some(900_000));
+        Ok(())
+    }
+
+    #[test]
+    fn synchronized_backtest_charges_fees_and_funding_deterministically()
+    -> Result<(), BacktestError> {
+        let engine = BacktestEngine::new(
+            RiskRulesV1::default(),
+            ExecutionAssumptionsV1 {
+                half_spread_bps: 0,
+                slippage_bps: 0,
+                taker_fee_bps: 5,
+            },
+        );
+        let mut candles = Vec::new();
+        for interval in 0..3_i64 {
+            for (symbol, price, decimals) in [
+                ("BTC", 60_000_000_000, 5),
+                ("ETH", 3_000_000_000, 4),
+                ("SOL", 150_000_000, 2),
+            ] {
+                candles.push(CandleV1 {
+                    symbol: symbol.into(),
+                    open_time_ms: interval * 900_000,
+                    close_time_ms: interval * 900_000 + 899_999,
+                    open_micro_usdc: price,
+                    high_micro_usdc: price,
+                    low_micro_usdc: price,
+                    close_micro_usdc: price,
+                    volume_e8: 100,
+                    funding_micros_per_usdc: 10,
+                    size_decimals: decimals,
+                });
+            }
+        }
+        let result = engine.run_synchronized_proposals(
+            &candles,
+            &[ScheduledProposal {
+                decision_open_time_ms: 0,
+                proposal: Proposal {
+                    symbol: "BTC".into(),
+                    side: Side::Buy,
+                    notional_bps: 100,
+                    limit_price_micro_usdc: 60_000_000_000,
+                    reduce_only: false,
+                },
+            }],
+            1_000_000_000,
+        )?;
+        assert_eq!(result.fills.len(), 1);
+        assert!(result.fees_micro_usdc > 0);
+        assert!(result.funding_micro_usdc > 0);
+        assert_eq!(result.equity_curve.len(), 3);
+        assert!(result.ending_equity_micro_usdc < 1_000_000_000);
         Ok(())
     }
 }
