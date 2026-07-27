@@ -82,7 +82,7 @@ ExecStartPre=/usr/bin/test -s %d/journal-key
 ExecStartPre=/usr/bin/test -s %d/hyperliquid-api-wallet-key
 UNIT
 systemctl daemon-reload
-systemctl reset-failed crow-agentd.service
+systemctl reset-failed crow-agentd.service >/dev/null 2>&1 || true
 rm -f "$report_path"
 rm -rf "$state_directory"
 
