@@ -52,7 +52,7 @@ public device ID. Put that public ID and the outbound relay URL in
 `/etc/crow/agent.json`, install `deploy/crow-agentd.service`, and start the
 service. The unit opens no inbound socket.
 
-The release candidate also includes a checkpointed 24-hour component soak:
+The release candidate also includes a checkpointed two-hour component soak:
 
 ```bash
 crow-agentd soak \

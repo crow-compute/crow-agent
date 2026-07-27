@@ -78,7 +78,7 @@ enum Command {
         state_directory: PathBuf,
         #[arg(long, default_value = "/var/lib/crow-agent/soak-report.json")]
         report: PathBuf,
-        #[arg(long, default_value_t = 86_400)]
+        #[arg(long, default_value_t = 7_200)]
         duration_seconds: u64,
         #[arg(long, default_value_t = 900)]
         interval_seconds: u64,
