@@ -70,9 +70,6 @@ jobs:
     environment: release
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.97.1"
       - uses: actions/download-artifact@v4
         with:
           name: linux-x86_64
@@ -80,7 +77,18 @@ jobs:
       - uses: anchore/sbom-action/download-syft@v0
       - uses: anchore/scan-action/download-grype@v6
       - name: Install Minisign
-        run: cargo install minisign --locked --version 0.9.1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libsodium-dev pkg-config
+          git clone --depth 1 --branch 0.12 \
+            https://github.com/jedisct1/minisign.git \
+            "$RUNNER_TEMP/minisign"
+          test "$(git -C "$RUNNER_TEMP/minisign" rev-parse HEAD)" = \
+            b85e15d45ac9eab34e44596fd309f5b07db9545c
+          cmake -S "$RUNNER_TEMP/minisign" -B "$RUNNER_TEMP/minisign/build" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/minisign/build" --parallel
+          sudo cmake --install "$RUNNER_TEMP/minisign/build"
       - name: Materialize signing credential
         shell: bash
         env:
