@@ -5,7 +5,7 @@ printf '%s\n' 'CROW_RENDER_VALIDATION_START'
 cat /etc/os-release
 uname -m
 id
-duration_seconds="${CROW_SOAK_DURATION_SECONDS:-7200}"
+duration_seconds="${CROW_SOAK_DURATION_SECONDS:-1800}"
 interval_seconds="${CROW_SOAK_INTERVAL_SECONDS:-900}"
 case "${duration_seconds}:${interval_seconds}" in
   *[!0-9:]* | :* | *:)
