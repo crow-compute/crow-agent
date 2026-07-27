@@ -12,7 +12,7 @@ fi
 
 package_path=$(realpath "$1")
 evidence_path=$(realpath -m "$2")
-for tool_name in jq openssl realpath shasum sqlite3 ss systemctl tar zstd; do
+for tool_name in jq openssl realpath shasum sqlite3 ss stat systemctl tar zstd; do
   if ! command -v "$tool_name" >/dev/null 2>&1; then
     echo "required systemd acceptance tool is unavailable: $tool_name" >&2
     exit 69
@@ -36,6 +36,25 @@ cleanup() {
   rm -rf "$temporary_directory"
 }
 trap cleanup EXIT
+
+wait_for_daemon_pid() {
+  local candidate_pid
+  for _ in $(seq 1 100); do
+    candidate_pid=$(systemctl show crow-agentd.service --property=MainPID --value)
+    if [[ -n "$candidate_pid" \
+      && "$candidate_pid" != 0 \
+      && -e "/proc/$candidate_pid/exe" \
+      && $(stat -c %U "/proc/$candidate_pid") == crow-agent \
+      && $(cat "/proc/$candidate_pid/comm") == crow-agentd ]]; then
+      printf '%s\n' "$candidate_pid"
+      return 0
+    fi
+    sleep 0.05
+  done
+  systemctl status crow-agentd.service --no-pager >&2 || true
+  echo "systemd did not settle on the non-root crow-agentd process" >&2
+  return 1
+}
 
 tar --zstd -xf "$package_path" -C "$temporary_directory"
 package_root="$temporary_directory/crow-agent-linux-x86_64"
@@ -101,29 +120,17 @@ if [[ ! -f "$report_path" ]] \
   exit 1
 fi
 
-first_pid=$(systemctl show crow-agentd.service --property=MainPID --value)
+first_pid=$(wait_for_daemon_pid)
 first_started_at=$(jq -r .started_at "$report_path")
-if [[ -z "$first_pid" || "$first_pid" == 0 ]]; then
-  echo "daemon has no first systemd process" >&2
-  exit 1
-fi
-if [[ $(ps -p "$first_pid" -o user= | tr -d ' ') != crow-agent ]]; then
-  echo "daemon is not running as the non-root crow-agent user" >&2
-  exit 1
-fi
 if ss -H -lntup | grep -F "pid=$first_pid," >/dev/null; then
   echo "daemon unexpectedly opened an inbound listener" >&2
   exit 1
 fi
 
 systemctl restart crow-agentd.service
-second_pid=$(systemctl show crow-agentd.service --property=MainPID --value)
-if [[ -z "$second_pid" || "$second_pid" == 0 || "$second_pid" == "$first_pid" ]]; then
+second_pid=$(wait_for_daemon_pid)
+if [[ "$second_pid" == "$first_pid" ]]; then
   echo "systemd restart did not replace the daemon process" >&2
-  exit 1
-fi
-if [[ $(ps -p "$second_pid" -o user= | tr -d ' ') != crow-agent ]]; then
-  echo "restarted daemon is not running as the non-root crow-agent user" >&2
   exit 1
 fi
 if [[ $(jq -r .started_at "$report_path") != "$first_started_at" ]]; then
