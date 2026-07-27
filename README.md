@@ -87,5 +87,5 @@ RELEASE_SIGNER=crow-compute-release-v1 \
 
 ./scripts/verify-release-evidence.sh \
   release/evidence \
-  release/crow-compute-release-v1.pub
+  deploy/crow-compute-release-v1.pub
 ```
