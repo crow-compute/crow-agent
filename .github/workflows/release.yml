@@ -116,8 +116,17 @@ jobs:
         with:
           name: linux-x86_64
           path: release/artifacts/linux-x86_64
-      - uses: anchore/sbom-action/download-syft@v0
-      - uses: anchore/scan-action/download-grype@v6
+      - id: syft
+        uses: anchore/sbom-action/download-syft@v0
+      - id: grype
+        uses: anchore/scan-action/download-grype@v6
+      - name: Add evidence tools to PATH
+        env:
+          SYFT_COMMAND: ${{ steps.syft.outputs.cmd }}
+          GRYPE_COMMAND: ${{ steps.grype.outputs.cmd }}
+        run: |
+          dirname "$SYFT_COMMAND" >> "$GITHUB_PATH"
+          dirname "$GRYPE_COMMAND" >> "$GITHUB_PATH"
       - name: Install Minisign
         run: |
           sudo apt-get update
