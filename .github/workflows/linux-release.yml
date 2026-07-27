@@ -1,0 +1,98 @@
+name: signed-linux-daemon
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package Linux x86-64 daemon
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          targets: x86_64-unknown-linux-gnu
+      - name: Install packaging dependencies
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Build deterministic daemon package
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-gnu -p crow-agentd
+          ./scripts/package-linux.sh \
+            target/x86_64-unknown-linux-gnu/release/crow-agentd \
+            target/x86_64-unknown-linux-gnu/release/crow-agent-linux-x86_64.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: target/x86_64-unknown-linux-gnu/release/crow-agent-linux-x86_64.tar.zst
+          if-no-files-found: error
+
+  systemd-acceptance:
+    name: systemd / ${{ matrix.os }}
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: ${{ runner.temp }}/linux-x86_64
+      - name: Install acceptance dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq sqlite3 zstd
+      - name: Verify install, credentials, hardening, and restart
+        run: |
+          sudo ./scripts/test-systemd-install.sh \
+            "$RUNNER_TEMP/linux-x86_64/crow-agent-linux-x86_64.tar.zst" \
+            "$RUNNER_TEMP/systemd-${{ matrix.os }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: systemd-${{ matrix.os }}
+          path: ${{ runner.temp }}/systemd-${{ matrix.os }}.json
+          if-no-files-found: error
+
+  attest:
+    name: Sign package, manifest, SBOM, and scan
+    needs: [package, systemd-acceptance]
+    runs-on: ubuntu-22.04
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: release/artifacts/linux-x86_64
+      - uses: anchore/sbom-action/download-syft@v0
+      - uses: anchore/scan-action/download-grype@v6
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Materialize signing credential
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/release.minisign.key"
+      - name: Create and verify signed Linux release
+        env:
+          MINISIGN_SECRET_KEY_PATH: ${{ runner.temp }}/release.minisign.key
+          RELEASE_SIGNER: crow-compute-release-v1
+        run: |
+          ./scripts/build-release-evidence.sh release/artifacts release/evidence
+          ./scripts/test-release-evidence.sh \
+            release/evidence \
+            "$MINISIGN_SECRET_KEY_PATH" \
+            release/artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-linux-release-evidence
+          path: release/evidence/**
+          if-no-files-found: error
