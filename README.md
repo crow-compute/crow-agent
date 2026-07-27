@@ -52,6 +52,13 @@ public device ID. Put that public ID and the outbound relay URL in
 `/etc/crow/agent.json`, install `deploy/crow-agentd.service`, and start the
 service. The unit opens no inbound socket.
 
+Ubuntu 24.04 uses host-bound `LoadCredentialEncrypted` files. Ubuntu 22.04
+ships systemd 249, before encrypted systemd credentials were introduced, so
+the installer selects a `LoadCredential` unit whose root-only sources live
+only under `/run/crow-agent-credentials`. Provisioning must repopulate that
+volatile directory after every boot; plaintext credentials are never written
+to persistent configuration, arguments, logs, or environment files.
+
 The release candidate also includes a checkpointed 30-minute component soak:
 
 ```bash

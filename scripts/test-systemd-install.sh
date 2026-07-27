@@ -12,7 +12,7 @@ fi
 
 package_path=$(realpath "$1")
 evidence_path=$(realpath -m "$2")
-for tool_name in jq openssl realpath shasum sqlite3 ss systemctl systemd-creds tar zstd; do
+for tool_name in jq openssl realpath shasum sqlite3 ss systemctl tar zstd; do
   if ! command -v "$tool_name" >/dev/null 2>&1; then
     echo "required systemd acceptance tool is unavailable: $tool_name" >&2
     exit 69
@@ -43,10 +43,27 @@ package_root="$temporary_directory/crow-agent-linux-x86_64"
 systemd-analyze verify /etc/systemd/system/crow-agentd.service
 
 umask 077
+systemd_major=$(systemd --version | awk 'NR == 1 { print $2 }')
+credential_transport=systemd_load_credential_encrypted
+credential_source_directory=/etc/credstore.encrypted
+if (( systemd_major < 250 )); then
+  credential_transport=systemd_load_credential_volatile
+  credential_source_directory=/run/crow-agent-credentials
+  install -d -m 0700 -o root -g crow-agent "$credential_source_directory"
+elif ! command -v systemd-creds >/dev/null 2>&1; then
+  echo "systemd-creds is unavailable on a host that supports encrypted credentials" >&2
+  exit 69
+fi
 while IFS=: read -r credential_name credential_file; do
-  openssl rand 32 \
-    | systemd-creds encrypt --name="$credential_name" - \
-      "/etc/credstore.encrypted/$credential_file"
+  if (( systemd_major < 250 )); then
+    openssl rand 32 > "$credential_source_directory/$credential_file"
+    chown root:crow-agent "$credential_source_directory/$credential_file"
+    chmod 0600 "$credential_source_directory/$credential_file"
+  else
+    openssl rand 32 \
+      | systemd-creds encrypt --name="$credential_name" - \
+        "$credential_source_directory/$credential_file"
+  fi
 done <<'CREDENTIALS'
 device-signing-seed:crow-agent-device-seed
 device-encryption-secret:crow-agent-device-encryption
@@ -59,6 +76,10 @@ cat > "$drop_in_directory/acceptance.conf" <<'UNIT'
 [Service]
 ExecStart=
 ExecStart=/usr/local/bin/crow-agentd soak --state-directory /var/lib/crow-agent/systemd-acceptance --report /var/lib/crow-agent/systemd-acceptance-report.json --duration-seconds 12 --interval-seconds 6
+ExecStartPre=/usr/bin/test -s %d/device-signing-seed
+ExecStartPre=/usr/bin/test -s %d/device-encryption-secret
+ExecStartPre=/usr/bin/test -s %d/journal-key
+ExecStartPre=/usr/bin/test -s %d/hyperliquid-api-wallet-key
 UNIT
 systemctl daemon-reload
 systemctl reset-failed crow-agentd.service
@@ -180,10 +201,10 @@ if [[ "$report_sha256" != "$(shasum -a 256 "$report_path" | awk '{print $1}')" \
 fi
 
 credential_directives=$(systemctl cat crow-agentd.service \
-  | grep -c '^LoadCredentialEncrypted=')
-credential_files=$(find /etc/credstore.encrypted -maxdepth 1 -type f | wc -l | tr -d ' ')
+  | grep -Ec '^LoadCredential(Encrypted)?=')
+credential_files=$(find "$credential_source_directory" -maxdepth 1 -type f | wc -l | tr -d ' ')
 if [[ "$credential_directives" != 4 || "$credential_files" != 4 ]]; then
-  echo "encrypted systemd credential configuration is incomplete" >&2
+  echo "systemd credential configuration is incomplete" >&2
   exit 1
 fi
 
@@ -197,6 +218,7 @@ jq -n \
   --arg package_sha256 "$(shasum -a 256 "$package_path" | awk '{print $1}')" \
   --arg binary_sha256 "$(shasum -a 256 /usr/local/bin/crow-agentd | awk '{print $1}')" \
   --arg unit_sha256 "$(shasum -a 256 /etc/systemd/system/crow-agentd.service | awk '{print $1}')" \
+  --arg credential_transport "$credential_transport" \
   --arg report_sha256 "$report_sha256" \
   --arg journal_sha256 "$journal_sha256" \
   --arg first_pid "$first_pid" \
@@ -210,7 +232,9 @@ jq -n \
     pid1: "systemd",
     systemd_version: $systemd_version,
     service_user: "crow-agent",
-    encrypted_credential_files: 4,
+    credential_transport: $credential_transport,
+    credential_files: 4,
+    persistent_plaintext_credentials: 0,
     package_sha256: $package_sha256,
     binary_sha256: $binary_sha256,
     systemd_unit_sha256: $unit_sha256,

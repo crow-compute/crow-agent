@@ -27,6 +27,8 @@ install -d "$package_root/usr/local/bin" "$package_root/lib/systemd/system" \
 install -m 0755 "$binary" "$package_root/usr/local/bin/crow-agentd"
 install -m 0644 deploy/crow-agentd.service \
   "$package_root/lib/systemd/system/crow-agentd.service"
+install -m 0644 deploy/crow-agentd-jammy.service \
+  "$package_root/lib/systemd/system/crow-agentd-jammy.service"
 install -m 0755 deploy/install-linux.sh "$package_root/install.sh"
 install -m 0644 README.md "$package_root/share/doc/crow-agent/README.md"
 

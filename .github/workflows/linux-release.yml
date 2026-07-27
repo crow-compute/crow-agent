@@ -19,6 +19,9 @@ jobs:
         with:
           toolchain: "1.97.1"
           targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: signed-linux-x86_64
       - name: Install packaging dependencies
         run: sudo apt-get update && sudo apt-get install -y zstd
       - name: Build deterministic daemon package

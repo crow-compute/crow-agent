@@ -6,7 +6,7 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exit 77
 fi
 
-package_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+package_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [[ ! -x "$package_directory/usr/local/bin/crow-agentd" ]]; then
   echo "signed package does not contain crow-agentd" >&2
   exit 66
@@ -24,9 +24,20 @@ install -d -m 0700 -o crow-agent -g crow-agent /var/lib/crow-agent
 install -d -m 0750 -o root -g crow-agent /etc/crow
 install -d -m 0700 -o root -g root /etc/credstore.encrypted
 install -m 0755 "$package_directory/usr/local/bin/crow-agentd" /usr/local/bin/crow-agentd
-install -m 0644 "$package_directory/lib/systemd/system/crow-agentd.service" \
+systemd_major=$(systemd --version | awk 'NR == 1 { print $2 }')
+service_name=crow-agentd.service
+if (( systemd_major < 250 )); then
+  service_name=crow-agentd-jammy.service
+  install -d -m 0700 -o root -g crow-agent /run/crow-agent-credentials
+fi
+install -m 0644 "$package_directory/lib/systemd/system/$service_name" \
   /etc/systemd/system/crow-agentd.service
 systemctl daemon-reload
 
 echo "Crow Agent installed but not started."
-echo "Create encrypted credentials, authorize the device, and write /etc/crow/agent.json first."
+if (( systemd_major < 250 )); then
+  echo "Provision root-only credentials in /run/crow-agent-credentials after each boot,"
+  echo "authorize the device, and write /etc/crow/agent.json first."
+else
+  echo "Create encrypted credentials, authorize the device, and write /etc/crow/agent.json first."
+fi

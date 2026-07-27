@@ -1,0 +1,45 @@
+[Unit]
+Description=Crow user-hosted arena agent
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=crow-agent
+Group=crow-agent
+ExecStart=/usr/local/bin/crow-agentd run /etc/crow/agent.json
+LoadCredential=device-signing-seed:/run/crow-agent-credentials/crow-agent-device-seed
+LoadCredential=device-encryption-secret:/run/crow-agent-credentials/crow-agent-device-encryption
+LoadCredential=journal-key:/run/crow-agent-credentials/crow-agent-journal-key
+LoadCredential=hyperliquid-api-wallet-key:/run/crow-agent-credentials/crow-agent-hyperliquid-wallet
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib/crow-agent
+StateDirectory=crow-agent
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
