@@ -1,0 +1,13 @@
+.git
+.github
+target
+apps/desktop/node_modules
+apps/desktop/dist
+apps/desktop/src-tauri/target
+release
+local-staging
+*.db
+*.db-shm
+*.db-wal
+*.log
+
