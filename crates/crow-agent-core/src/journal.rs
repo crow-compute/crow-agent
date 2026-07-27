@@ -104,6 +104,27 @@ impl EncryptedJournal {
         Ok(())
     }
 
+    pub fn latest_event_state(
+        &self,
+        run_id: uuid::Uuid,
+    ) -> Result<Option<(u64, String)>, JournalError> {
+        let row: Option<(i64, String)> = self
+            .connection
+            .query_row(
+                "SELECT sequence,event_sha256 FROM run_events
+                 WHERE run_id=?1 ORDER BY sequence DESC LIMIT 1",
+                [run_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(sequence, hash)| {
+            u64::try_from(sequence)
+                .map(|sequence| (sequence, hash))
+                .map_err(|_| JournalError::Sequence)
+        })
+        .transpose()
+    }
+
     pub fn private_payload(&self, event_sha256: &str) -> Result<Option<Value>, JournalError> {
         let row: Option<(String, String)> = self
             .connection
@@ -217,6 +238,33 @@ mod tests {
             !database
                 .windows(b"crow_device_refresh_secret".len())
                 .any(|value| value == b"crow_device_refresh_secret")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_event_state_recovers_sequence_and_hash() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("journal.db");
+        let identity = DeviceIdentity::generate();
+        let run_id = Uuid::new_v4();
+        let event = RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            Uuid::new_v4(),
+            run_id,
+            None,
+            1,
+            "0".repeat(64),
+            "decision".into(),
+            OffsetDateTime::now_utc(),
+            json!({"action": "hold"}),
+        )?;
+        let mut journal = EncryptedJournal::open(&path, [13_u8; 32])?;
+        assert_eq!(journal.latest_event_state(run_id)?, None);
+        journal.append(&event, &json!({}))?;
+        assert_eq!(
+            journal.latest_event_state(run_id)?,
+            Some((1, event.event_sha256))
         );
         Ok(())
     }

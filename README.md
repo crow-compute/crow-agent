@@ -84,4 +84,8 @@ Local release evidence can be reproduced with:
 MINISIGN_SECRET_KEY_PATH=/run/credentials/release-key \
 RELEASE_SIGNER=crow-compute-release-v1 \
 ./scripts/build-release-evidence.sh release/artifacts release/evidence
+
+./scripts/verify-release-evidence.sh \
+  release/evidence \
+  release/crow-compute-release-v1.pub
 ```

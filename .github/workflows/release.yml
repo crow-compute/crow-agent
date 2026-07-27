@@ -70,15 +70,52 @@ jobs:
             target/${{ matrix.target }}/release/crow-agent*
           if-no-files-found: error
 
-  attest:
-    name: Manifest, SBOM, scan, and signature
+  systemd-acceptance:
+    name: systemd / ${{ matrix.os }}
     needs: build
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: release/artifacts
+          name: linux-x86_64
+          path: ${{ runner.temp }}/linux-x86_64
+      - name: Install acceptance dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq sqlite3 zstd
+      - name: Verify real systemd install and restart reconciliation
+        run: |
+          sudo ./scripts/test-systemd-install.sh \
+            "$RUNNER_TEMP/linux-x86_64/crow-agent-linux-x86_64.tar.zst" \
+            "$RUNNER_TEMP/systemd-${{ matrix.os }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: systemd-${{ matrix.os }}
+          path: ${{ runner.temp }}/systemd-${{ matrix.os }}.json
+          if-no-files-found: error
+
+  attest:
+    name: Manifest, SBOM, scan, and signature
+    needs: [build, systemd-acceptance]
+    runs-on: ubuntu-22.04
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-universal
+          path: release/artifacts/macos-universal
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+          path: release/artifacts/windows-x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: release/artifacts/linux-x86_64
       - uses: anchore/sbom-action/download-syft@v0
       - uses: anchore/scan-action/download-grype@v6
       - name: Install Minisign
@@ -96,7 +133,10 @@ jobs:
           RELEASE_SIGNER: crow-compute-release-v1
         run: |
           ./scripts/build-release-evidence.sh release/artifacts release/evidence
-          ./scripts/test-release-evidence.sh release/evidence "$MINISIGN_SECRET_KEY_PATH"
+          ./scripts/test-release-evidence.sh \
+            release/evidence \
+            "$MINISIGN_SECRET_KEY_PATH" \
+            release/artifacts
       - uses: actions/upload-artifact@v4
         with:
           name: signed-release-evidence

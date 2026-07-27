@@ -6,7 +6,7 @@ use serde_json::json;
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -37,6 +37,10 @@ pub enum SoakError {
     Recovery,
     #[error("soak remote control state transition failed")]
     RemoteControl,
+    #[error("soak checkpoint does not match its encrypted journal")]
+    Checkpoint,
+    #[error("soak report is already complete")]
+    AlreadyComplete,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,53 +71,46 @@ pub async fn run(
     duration: Duration,
     interval: Duration,
 ) -> Result<SoakReport, SoakError> {
-    if duration < interval || interval.is_zero() {
+    if duration < interval
+        || interval.is_zero()
+        || duration.subsec_nanos() != 0
+        || interval.subsec_nanos() != 0
+        || !duration.as_secs().is_multiple_of(interval.as_secs())
+    {
         return Err(SoakError::InvalidSchedule);
     }
     fs::create_dir_all(state_directory)?;
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let started_at = OffsetDateTime::now_utc();
     let duration_seconds = duration.as_secs();
     let interval_seconds = interval.as_secs();
-    let expected_end_at = started_at
-        + time::Duration::seconds(
-            i64::try_from(duration_seconds).map_err(|_| SoakError::InvalidSchedule)?,
-        );
-    let mut report = SoakReport {
-        protocol: HARNESS_PROTOCOL_V1.into(),
-        mode: "local_headless_component_soak".into(),
-        status: "running".into(),
-        started_at: format_time(started_at),
-        expected_end_at: format_time(expected_end_at),
-        updated_at: format_time(started_at),
-        duration_seconds,
-        interval_seconds,
-        cycles_completed: 0,
-        events_appended: 0,
-        journal_reopens: 0,
-        duplicate_events_rejected: 0,
-        sequence_gaps_rejected: 0,
-        remote_controls_applied: 0,
-        encrypted_recoveries: 0,
-        plaintext_leak_scans: 0,
-        last_event_sha256: "0".repeat(64),
-    };
-    write_report(report_path, &report)?;
-
     let journal_path = state_directory.join("journal.db");
     let identity = DeviceIdentity::from_seed(&DEVICE_SEED);
     let arena_id = Uuid::from_u128(1);
     let run_id = Uuid::from_u128(2);
-    let opened_at = Instant::now();
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        ticker.tick().await;
-        if report.cycles_completed > 0 && opened_at.elapsed() >= duration {
-            break;
-        }
+    let (mut report, started_at, expected_end_at) = if report_path.exists() {
+        resume_report(
+            report_path,
+            &journal_path,
+            run_id,
+            duration_seconds,
+            interval_seconds,
+        )?
+    } else {
+        new_report(report_path, duration_seconds, interval_seconds)?
+    };
+    let expected_cycles = duration_seconds / interval_seconds;
+
+    while report.cycles_completed < expected_cycles {
+        let cycle_offset = interval_seconds
+            .checked_mul(report.cycles_completed)
+            .ok_or(SoakError::InvalidSchedule)?;
+        let target = started_at
+            + time::Duration::seconds(
+                i64::try_from(cycle_offset).map_err(|_| SoakError::InvalidSchedule)?,
+            );
+        sleep_until(target).await;
         let sequence = report
             .events_appended
             .checked_add(1)
@@ -186,10 +183,100 @@ pub async fn run(
         report.updated_at = format_time(OffsetDateTime::now_utc());
         write_report(report_path, &report)?;
     }
+    sleep_until(expected_end_at).await;
     report.status = "complete".into();
     report.updated_at = format_time(OffsetDateTime::now_utc());
     write_report(report_path, &report)?;
     Ok(report)
+}
+
+fn new_report(
+    report_path: &Path,
+    duration_seconds: u64,
+    interval_seconds: u64,
+) -> Result<(SoakReport, OffsetDateTime, OffsetDateTime), SoakError> {
+    let started_at = OffsetDateTime::now_utc();
+    let expected_end_at = started_at
+        + time::Duration::seconds(
+            i64::try_from(duration_seconds).map_err(|_| SoakError::InvalidSchedule)?,
+        );
+    let report = SoakReport {
+        protocol: HARNESS_PROTOCOL_V1.into(),
+        mode: "local_headless_component_soak".into(),
+        status: "running".into(),
+        started_at: format_time(started_at),
+        expected_end_at: format_time(expected_end_at),
+        updated_at: format_time(started_at),
+        duration_seconds,
+        interval_seconds,
+        cycles_completed: 0,
+        events_appended: 0,
+        journal_reopens: 0,
+        duplicate_events_rejected: 0,
+        sequence_gaps_rejected: 0,
+        remote_controls_applied: 0,
+        encrypted_recoveries: 0,
+        plaintext_leak_scans: 0,
+        last_event_sha256: "0".repeat(64),
+    };
+    write_report(report_path, &report)?;
+    Ok((report, started_at, expected_end_at))
+}
+
+fn resume_report(
+    report_path: &Path,
+    journal_path: &Path,
+    run_id: Uuid,
+    duration_seconds: u64,
+    interval_seconds: u64,
+) -> Result<(SoakReport, OffsetDateTime, OffsetDateTime), SoakError> {
+    let report: SoakReport = serde_json::from_slice(&fs::read(report_path)?)?;
+    if report.status == "complete" {
+        return Err(SoakError::AlreadyComplete);
+    }
+    let balanced = report.protocol == HARNESS_PROTOCOL_V1
+        && report.mode == "local_headless_component_soak"
+        && report.status == "running"
+        && report.duration_seconds == duration_seconds
+        && report.interval_seconds == interval_seconds
+        && report.events_appended == report.cycles_completed
+        && report.journal_reopens == report.cycles_completed
+        && report.duplicate_events_rejected == report.cycles_completed
+        && report.sequence_gaps_rejected == report.cycles_completed
+        && report.remote_controls_applied == report.cycles_completed.saturating_mul(3)
+        && report.encrypted_recoveries == report.cycles_completed.saturating_mul(2)
+        && report.plaintext_leak_scans == report.cycles_completed;
+    if !balanced {
+        return Err(SoakError::Checkpoint);
+    }
+    let started_at = parse_time(&report.started_at)?;
+    let expected_end_at = parse_time(&report.expected_end_at)?;
+    let calculated_end = started_at
+        + time::Duration::seconds(
+            i64::try_from(duration_seconds).map_err(|_| SoakError::InvalidSchedule)?,
+        );
+    if expected_end_at != calculated_end {
+        return Err(SoakError::Checkpoint);
+    }
+    let journal = EncryptedJournal::open(journal_path, JOURNAL_KEY)?;
+    let expected_state = if report.events_appended == 0 {
+        None
+    } else {
+        Some((report.events_appended, report.last_event_sha256.clone()))
+    };
+    if journal.latest_event_state(run_id)? != expected_state {
+        return Err(SoakError::Checkpoint);
+    }
+    Ok((report, started_at, expected_end_at))
+}
+
+async fn sleep_until(target: OffsetDateTime) {
+    let remaining = target - OffsetDateTime::now_utc();
+    if remaining.is_positive()
+        && let Ok(duration) = Duration::try_from(remaining)
+    {
+        tokio::time::sleep(duration).await;
+    }
 }
 
 fn exercise_remote_controls() -> Result<(), SoakError> {
@@ -251,29 +338,70 @@ fn format_time(value: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "invalid-time".into())
 }
 
+fn parse_time(value: &str) -> Result<OffsetDateTime, SoakError> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| SoakError::Checkpoint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn short_soak_reopens_and_rejects_faults() -> Result<(), Box<dyn std::error::Error>> {
+    async fn short_soak_resumes_after_restart() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let report_path = directory.path().join("report.json");
+        let state_path = directory.path().join("state");
+        let task_state = state_path.clone();
+        let task_report = report_path.clone();
+        let first = tokio::spawn(async move {
+            run(
+                &task_state,
+                &task_report,
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if let Ok(raw) = fs::read(&report_path)
+                && let Ok(report) = serde_json::from_slice::<SoakReport>(&raw)
+                && report.cycles_completed == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before_restart: SoakReport = serde_json::from_slice(&fs::read(&report_path)?)?;
+        assert_eq!(before_restart.cycles_completed, 1);
+        first.abort();
+        let _ = first.await;
         let report = run(
-            &directory.path().join("state"),
+            &state_path,
             &report_path,
             Duration::from_secs(2),
-            Duration::from_millis(100),
+            Duration::from_secs(1),
         )
         .await?;
         assert_eq!(report.status, "complete");
-        assert!(report.cycles_completed >= 2);
+        assert_eq!(report.started_at, before_restart.started_at);
+        assert_eq!(report.cycles_completed, 2);
         assert_eq!(report.events_appended, report.cycles_completed);
         assert_eq!(report.duplicate_events_rejected, report.cycles_completed);
         assert_eq!(report.sequence_gaps_rejected, report.cycles_completed);
         assert_eq!(report.remote_controls_applied, report.cycles_completed * 3);
         assert_eq!(report.plaintext_leak_scans, report.cycles_completed);
+        assert!(matches!(
+            run(
+                &state_path,
+                &report_path,
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            )
+            .await,
+            Err(SoakError::AlreadyComplete)
+        ));
         Ok(())
     }
 }

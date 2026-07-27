@@ -112,3 +112,13 @@ jq -n \
 
 minisign -S -s "$signing_key_path" -m "$manifest_file"
 minisign -S -s "$signing_key_path" -m "$checksum_file"
+
+signature_directory="$output_directory/artifact-signatures"
+while IFS= read -r checksum_line; do
+  relative_path=${checksum_line#*  }
+  signature_file="$signature_directory/$relative_path.minisig"
+  mkdir -p "$(dirname "$signature_file")"
+  minisign -S -s "$signing_key_path" \
+    -m "$artifact_directory/$relative_path" \
+    -x "$signature_file"
+done < "$checksum_file"
