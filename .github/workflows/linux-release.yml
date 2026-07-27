@@ -3,6 +3,7 @@ name: signed-linux-daemon
 on:
   workflow_dispatch:
   push:
+    branches: ["codex/render-ubuntu-validation"]
     tags: ["v*"]
 
 permissions:
