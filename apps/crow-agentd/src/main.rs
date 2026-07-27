@@ -35,6 +35,8 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod soak;
+
 const REFRESH_TOKEN_SECRET: &str = "device-refresh-token";
 const DEVICE_ID_SECRET: &str = "device-id";
 const EXECUTION_RUNNING: u8 = 0;
@@ -69,6 +71,17 @@ enum Command {
         api_origin: String,
         #[arg(long, default_value = "/var/lib/crow-agent")]
         state_directory: PathBuf,
+    },
+    /// Run the checkpointed encrypted-journal and fail-closed component soak.
+    Soak {
+        #[arg(long, default_value = "/var/lib/crow-agent/soak")]
+        state_directory: PathBuf,
+        #[arg(long, default_value = "/var/lib/crow-agent/soak-report.json")]
+        report: PathBuf,
+        #[arg(long, default_value_t = 86_400)]
+        duration_seconds: u64,
+        #[arg(long, default_value_t = 900)]
+        interval_seconds: u64,
     },
     /// Maintain the outbound Crow control connection.
     Run { config: PathBuf },
@@ -199,9 +212,12 @@ enum DaemonError {
     AuthorizationExpired,
     #[error("remote command is invalid")]
     RemoteCommand,
+    #[error("headless component soak failed")]
+    Soak(#[from] soak::SoakError),
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), DaemonError> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -277,6 +293,21 @@ async fn main() -> Result<(), DaemonError> {
             state_directory,
         } => {
             authorize_device(&device_label, &api_origin, &state_directory).await?;
+        }
+        Command::Soak {
+            state_directory,
+            report,
+            duration_seconds,
+            interval_seconds,
+        } => {
+            let result = soak::run(
+                &state_directory,
+                &report,
+                Duration::from_secs(duration_seconds),
+                Duration::from_secs(interval_seconds),
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&result)?);
         }
         Command::Run { config } => {
             let config = serde_json::from_slice::<DaemonConfig>(&fs::read(config)?)?;

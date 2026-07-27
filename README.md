@@ -52,6 +52,21 @@ public device ID. Put that public ID and the outbound relay URL in
 `/etc/crow/agent.json`, install `deploy/crow-agentd.service`, and start the
 service. The unit opens no inbound socket.
 
+The release candidate also includes a checkpointed 24-hour component soak:
+
+```bash
+crow-agentd soak \
+  --state-directory /var/lib/crow-agent/soak \
+  --report /var/lib/crow-agent/soak-report.json
+```
+
+It runs at the production 15-minute cadence, reopens the encrypted journal
+every cycle, rejects duplicate and sequence-gap events, exercises local
+pause/resume/stop transitions, recovers encrypted token/private state, scans
+state files for plaintext leakage, and updates the JSON report after every
+cycle. This component gate complements—rather than replaces—the staging soak
+that uses an authorized Crow device and actual Hyperliquid Testnet account.
+
 OpenProphet is a noncommercial project and no OpenProphet source is included.
 
 ## Releases
