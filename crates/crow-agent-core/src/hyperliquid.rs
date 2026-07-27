@@ -1,9 +1,16 @@
 use crate::{OrderDecision, Side};
 use crow_agent_protocol::ALLOWED_SYMBOLS;
-use ethers::signers::LocalWallet;
-use hyperliquid_rust_sdk::{
-    BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
-    ExchangeResponseStatus, InfoClient, Message, Meta, Subscription,
+use futures_util::StreamExt;
+use hypersdk::{
+    Decimal,
+    hypercore::{
+        self, Cloid, HttpClient, NonceHandler, PerpMarket, PrivateKeySigner, WebSocket,
+        types::{
+            BatchCancel, BatchOrder, Cancel, Incoming, OrderGrouping, OrderRequest,
+            OrderResponseStatus, OrderTypePlacement, Subscription, TimeInForce,
+        },
+        ws::Event,
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -11,7 +18,6 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use zeroize::Zeroizing;
 
 const REST_WEIGHT_PER_MINUTE: u16 = 1_000;
@@ -21,7 +27,7 @@ const INFO_L2_WEIGHT: u16 = 2;
 #[derive(Debug, Error)]
 pub enum HyperliquidError {
     #[error("Hyperliquid SDK request failed")]
-    Sdk(#[from] hyperliquid_rust_sdk::Error),
+    Sdk,
     #[error("API wallet key is invalid")]
     Wallet,
     #[error("required BTC/ETH/SOL perpetual metadata is unavailable")]
@@ -92,7 +98,7 @@ impl RequestBudget {
 
     fn consume(&self, weight: u16) -> Result<(), HyperliquidError> {
         let mut state = self.state.lock().map_err(|_| HyperliquidError::RateLimit)?;
-        if state.opened_at.elapsed() >= Duration::from_secs(60) {
+        if state.opened_at.elapsed() >= Duration::from_mins(1) {
             state.opened_at = Instant::now();
             state.used = 0;
         }
@@ -105,7 +111,9 @@ impl RequestBudget {
 }
 
 pub struct HyperliquidVenue {
-    exchange: ExchangeClient,
+    client: HttpClient,
+    signer: PrivateKeySigner,
+    nonce: NonceHandler,
     assets: BTreeMap<String, CoreAsset>,
     budget: Arc<RequestBudget>,
 }
@@ -125,15 +133,19 @@ impl HyperliquidVenue {
     pub async fn connect_testnet(
         api_wallet_key: &Zeroizing<[u8; 32]>,
     ) -> Result<Self, HyperliquidError> {
-        let wallet = LocalWallet::from_bytes(api_wallet_key.as_ref())
+        let encoded_key = Zeroizing::new(format!("0x{}", hex::encode(api_wallet_key.as_ref())));
+        let signer = encoded_key
+            .parse::<PrivateKeySigner>()
             .map_err(|_| HyperliquidError::Wallet)?;
         let budget = Arc::new(RequestBudget::new());
         budget.consume(INFO_META_WEIGHT)?;
-        let exchange =
-            ExchangeClient::new(None, wallet, Some(BaseUrl::Testnet), None, None).await?;
-        let assets = discover_core_assets(&exchange.meta)?;
+        let client = hypercore::testnet();
+        let markets = client.perps().await.map_err(|_| HyperliquidError::Sdk)?;
+        let assets = discover_core_assets(&markets)?;
         Ok(Self {
-            exchange,
+            client,
+            signer,
+            nonce: NonceHandler::default(),
             assets,
             budget,
         })
@@ -147,37 +159,54 @@ impl HyperliquidVenue {
     pub async fn submit_ioc(
         &self,
         order: &OrderDecision,
-    ) -> Result<ExchangeResponseStatus, HyperliquidError> {
+    ) -> Result<Vec<OrderResponseStatus>, HyperliquidError> {
         self.budget.consume(1)?;
         let request = build_ioc_request(order, &self.assets)?;
-        self.exchange.order(request, None).await.map_err(Into::into)
+        self.client
+            .place(
+                &self.signer,
+                BatchOrder {
+                    orders: vec![request],
+                    grouping: OrderGrouping::Na,
+                    builder: None,
+                },
+                self.nonce.next(),
+                None,
+                None,
+            )
+            .await
+            .map_err(|_| HyperliquidError::Sdk)
     }
 
     pub async fn cancel_direct(
         &self,
         symbol: &str,
         order_id: u64,
-    ) -> Result<ExchangeResponseStatus, HyperliquidError> {
-        if !self.assets.contains_key(symbol) {
-            return Err(HyperliquidError::Symbol);
-        }
+    ) -> Result<Vec<OrderResponseStatus>, HyperliquidError> {
+        let asset = self.assets.get(symbol).ok_or(HyperliquidError::Symbol)?;
         self.budget.consume(1)?;
-        self.exchange
+        self.client
             .cancel(
-                ClientCancelRequest {
-                    asset: symbol.to_owned(),
-                    oid: order_id,
+                &self.signer,
+                BatchCancel {
+                    cancels: vec![Cancel {
+                        asset: usize::try_from(asset.asset_index)
+                            .map_err(|_| HyperliquidError::Numeric)?,
+                        oid: order_id,
+                    }],
                 },
+                self.nonce.next(),
+                None,
                 None,
             )
             .await
-            .map_err(Into::into)
+            .map_err(|_| HyperliquidError::Sdk)
     }
 }
 
 pub struct HyperliquidBookStream {
-    info: InfoClient,
-    receiver: UnboundedReceiver<Message>,
+    info: HttpClient,
+    stream: WebSocket,
     budget: Arc<RequestBudget>,
 }
 
@@ -191,39 +220,35 @@ impl std::fmt::Debug for HyperliquidBookStream {
 }
 
 impl HyperliquidBookStream {
-    pub async fn connect_testnet() -> Result<Self, HyperliquidError> {
+    pub fn connect_testnet() -> Result<Self, HyperliquidError> {
         let budget = Arc::new(RequestBudget::new());
-        let mut info = InfoClient::with_reconnect(None, Some(BaseUrl::Testnet)).await?;
-        let (sender, receiver) = unbounded_channel();
+        let stream = hypercore::testnet_ws();
         for symbol in ALLOWED_SYMBOLS {
-            info.subscribe(
-                Subscription::L2Book {
-                    coin: symbol.to_owned(),
-                },
-                sender.clone(),
-            )
-            .await?;
+            stream.subscribe(Subscription::L2Book {
+                coin: symbol.to_owned(),
+                n_sig_figs: None,
+                mantissa: None,
+                fast: false,
+            });
         }
         Ok(Self {
-            info,
-            receiver,
+            info: hypercore::testnet(),
+            stream,
             budget,
         })
     }
 
     pub async fn next_snapshot(&mut self) -> Result<BookSnapshot, HyperliquidError> {
         loop {
-            match self.receiver.recv().await {
-                Some(Message::L2Book(message)) => {
+            match self.stream.next().await {
+                Some(Event::Message(Incoming::L2Book(message))) => {
                     return BookSnapshot::try_from_parts(
-                        message.data.coin,
-                        message.data.time,
-                        &message.data.levels,
+                        message.coin,
+                        message.time,
+                        &message.levels,
                     );
                 }
-                Some(Message::HyperliquidError(_)) | None => {
-                    return Err(HyperliquidError::StreamClosed);
-                }
+                None => return Err(HyperliquidError::StreamClosed),
                 Some(_) => {}
             }
         }
@@ -233,7 +258,11 @@ impl HyperliquidBookStream {
         let mut snapshots = Vec::with_capacity(ALLOWED_SYMBOLS.len());
         for symbol in ALLOWED_SYMBOLS {
             self.budget.consume(INFO_L2_WEIGHT)?;
-            let snapshot = self.info.l2_snapshot(symbol.to_owned()).await?;
+            let snapshot = self
+                .info
+                .l2_book(symbol.to_owned(), None, None)
+                .await
+                .map_err(|_| HyperliquidError::Sdk)?;
             snapshots.push(BookSnapshot::try_from_parts(
                 snapshot.coin,
                 snapshot.time,
@@ -271,37 +300,39 @@ trait VenueBookLevel {
     fn normalized(&self) -> BookLevel;
 }
 
-impl VenueBookLevel for hyperliquid_rust_sdk::Level {
+impl VenueBookLevel for hypersdk::hypercore::types::BookLevel {
     fn normalized(&self) -> BookLevel {
         BookLevel {
-            price: self.px.clone(),
-            size: self.sz.clone(),
-            order_count: self.n,
+            price: self.px.normalize().to_string(),
+            size: self.sz.normalize().to_string(),
+            order_count: u64::try_from(self.n).unwrap_or(u64::MAX),
         }
     }
 }
 
-impl VenueBookLevel for hyperliquid_rust_sdk::BookLevel {
-    fn normalized(&self) -> BookLevel {
-        BookLevel {
-            price: self.px.clone(),
-            size: self.sz.clone(),
-            order_count: self.n,
-        }
-    }
+fn discover_core_assets(
+    markets: &[PerpMarket],
+) -> Result<BTreeMap<String, CoreAsset>, HyperliquidError> {
+    discover_core_assets_from(
+        markets
+            .iter()
+            .map(|market| (market.name.as_str(), market.index, market.sz_decimals)),
+    )
 }
 
-fn discover_core_assets(meta: &Meta) -> Result<BTreeMap<String, CoreAsset>, HyperliquidError> {
+fn discover_core_assets_from<'a>(
+    markets: impl IntoIterator<Item = (&'a str, usize, i64)>,
+) -> Result<BTreeMap<String, CoreAsset>, HyperliquidError> {
     let mut assets = BTreeMap::new();
-    for (index, asset) in meta.universe.iter().enumerate() {
-        if ALLOWED_SYMBOLS.contains(&asset.name.as_str()) {
+    for (name, index, size_decimals) in markets {
+        if ALLOWED_SYMBOLS.contains(&name) {
             let asset_index = u32::try_from(index).map_err(|_| HyperliquidError::Metadata)?;
             let size_decimals =
-                u8::try_from(asset.sz_decimals).map_err(|_| HyperliquidError::Metadata)?;
+                u8::try_from(size_decimals).map_err(|_| HyperliquidError::Metadata)?;
             assets.insert(
-                asset.name.clone(),
+                name.to_owned(),
                 CoreAsset {
-                    symbol: asset.name.clone(),
+                    symbol: name.to_owned(),
                     asset_index,
                     size_decimals,
                 },
@@ -317,25 +348,29 @@ fn discover_core_assets(meta: &Meta) -> Result<BTreeMap<String, CoreAsset>, Hype
 fn build_ioc_request(
     order: &OrderDecision,
     assets: &BTreeMap<String, CoreAsset>,
-) -> Result<ClientOrderRequest, HyperliquidError> {
+) -> Result<OrderRequest, HyperliquidError> {
     let asset = assets.get(&order.symbol).ok_or(HyperliquidError::Symbol)?;
     let limit_price = fixed_decimal(order.limit_price_micro_usdc, 6)?;
     let size = fixed_decimal(order.quantity_e8, 8)?;
     let limit_px = limit_price
-        .parse::<f64>()
+        .parse::<Decimal>()
         .map_err(|_| HyperliquidError::Numeric)?;
-    let sz = size.parse::<f64>().map_err(|_| HyperliquidError::Numeric)?;
+    let sz = size
+        .parse::<Decimal>()
+        .map_err(|_| HyperliquidError::Numeric)?;
     if decimal_places(&size) > usize::from(asset.size_decimals) {
         return Err(HyperliquidError::Numeric);
     }
-    Ok(ClientOrderRequest {
-        asset: order.symbol.clone(),
+    Ok(OrderRequest {
+        asset: usize::try_from(asset.asset_index).map_err(|_| HyperliquidError::Numeric)?,
         is_buy: order.side == Side::Buy,
         reduce_only: order.reduce_only,
         limit_px,
         sz,
-        cloid: None,
-        order_type: ClientOrder::Limit(ClientLimit { tif: "Ioc".into() }),
+        cloid: Cloid::default(),
+        order_type: OrderTypePlacement::Limit {
+            tif: TimeInForce::Ioc,
+        },
     })
 }
 
@@ -367,19 +402,15 @@ fn decimal_places(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperliquid_rust_sdk::AssetMeta;
 
     #[test]
     fn metadata_indices_are_discovered_in_venue_order() -> Result<(), HyperliquidError> {
-        let meta = Meta {
-            universe: vec![
-                asset("DOGE", 0),
-                asset("SOL", 2),
-                asset("BTC", 5),
-                asset("ETH", 4),
-            ],
-        };
-        let assets = discover_core_assets(&meta)?;
+        let assets = discover_core_assets_from([
+            ("DOGE", 0, 0),
+            ("SOL", 1, 2),
+            ("BTC", 2, 5),
+            ("ETH", 3, 4),
+        ])?;
         assert_eq!(assets["SOL"].asset_index, 1);
         assert_eq!(assets["BTC"].asset_index, 2);
         assert_eq!(assets["ETH"].asset_index, 3);
@@ -388,9 +419,7 @@ mod tests {
 
     #[test]
     fn order_builder_is_ioc_only() -> Result<(), HyperliquidError> {
-        let assets = discover_core_assets(&Meta {
-            universe: vec![asset("BTC", 5), asset("ETH", 4), asset("SOL", 2)],
-        })?;
+        let assets = discover_core_assets_from([("BTC", 0, 5), ("ETH", 1, 4), ("SOL", 2, 2)])?;
         let request = build_ioc_request(
             &OrderDecision {
                 symbol: "BTC".into(),
@@ -404,17 +433,13 @@ mod tests {
             &assets,
         )?;
         assert!(request.is_buy);
-        assert_eq!(request.asset, "BTC");
-        assert!(
-            matches!(request.order_type, ClientOrder::Limit(ClientLimit { tif }) if tif == "Ioc")
-        );
+        assert_eq!(request.asset, 0);
+        assert!(matches!(
+            request.order_type,
+            OrderTypePlacement::Limit {
+                tif: TimeInForce::Ioc
+            }
+        ));
         Ok(())
-    }
-
-    fn asset(name: &str, size_decimals: u32) -> AssetMeta {
-        AssetMeta {
-            name: name.into(),
-            sz_decimals: size_decimals,
-        }
     }
 }

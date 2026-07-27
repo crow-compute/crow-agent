@@ -15,8 +15,9 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.97"
 license = "LicenseRef-Proprietary"
+publish = false
 authors = ["Crow Compute <306424470+crow-compute@users.noreply.github.com>"]
 repository = "https://github.com/crow-compute/crow-agent"
 
@@ -28,11 +29,10 @@ base64 = "0.22.1"
 chacha20poly1305 = "0.10.1"
 clap = { version = "4.5.51", features = ["derive"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
-ethers = { version = "=2.0.14", default-features = false, features = ["eip712"] }
 futures-util = "0.3.31"
 hex = "0.4.3"
 hkdf = "0.12.4"
-hyperliquid_rust_sdk = "=0.6.0"
+hypersdk = "=0.2.14"
 keyring = "=4.1.5"
 open = "=5.4.0"
 parquet = { version = "=59.1.0", default-features = false, features = ["arrow", "zstd"] }

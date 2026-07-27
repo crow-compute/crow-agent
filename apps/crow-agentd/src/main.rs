@@ -427,7 +427,7 @@ async fn run_relay(
             Err(error) => {
                 warn!(error = %error, "device token rotation failed; no new decisions are permitted");
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(60));
+                backoff = (backoff * 2).min(Duration::from_mins(1));
                 continue;
             }
         };
@@ -452,7 +452,7 @@ async fn run_relay(
                     .state
                     .store(EXECUTION_PAUSED, Ordering::SeqCst);
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(60));
+                backoff = (backoff * 2).min(Duration::from_mins(1));
             }
         }
     }
