@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { App } from "./App";
+import { App, parseHandoffSnapshot } from "./App";
 
 const harnessMock = vi.hoisted(() => ({
   authorized: false,
@@ -72,5 +72,13 @@ describe("Crow Agent shell", () => {
     expect(await screen.findByRole("heading", { name: "First verified Testnet arena" })).toBeInTheDocument();
     expect(screen.getByText("No compatible version yet.")).toBeInTheDocument();
     expect(screen.getByLabelText("Private strategy instructions")).toBeInTheDocument();
+  });
+
+  it("accepts only structured fixed-point handoff snapshots", () => {
+    expect(parseHandoffSnapshot("")).toBeNull();
+    expect(parseHandoffSnapshot('{"equity_micro_usdc":1000000,"positions":[{"quantity_e8":-42}]}'))
+      .toEqual({ equity_micro_usdc: 1000000, positions: [{ quantity_e8: -42 }] });
+    expect(() => parseHandoffSnapshot('{"equity":1.25}')).toThrow("handoff_snapshot_invalid");
+    expect(() => parseHandoffSnapshot("[1,2,3]")).toThrow("handoff_snapshot_invalid");
   });
 });

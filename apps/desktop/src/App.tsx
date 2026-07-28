@@ -66,6 +66,25 @@ function arenaModels(arena: PublicArena) {
   return Array.isArray(models) ? models.filter((model): model is string => typeof model === "string") : [];
 }
 
+function fixedPointHandoffValue(value: unknown): boolean {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return true;
+  if (typeof value === "number") return Number.isSafeInteger(value);
+  if (Array.isArray(value)) return value.every(fixedPointHandoffValue);
+  if (typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).every(fixedPointHandoffValue);
+  }
+  return false;
+}
+
+export function parseHandoffSnapshot(raw: string): Record<string, unknown> | null {
+  if (!raw.trim()) return null;
+  const value: unknown = JSON.parse(raw);
+  if (!value || Array.isArray(value) || typeof value !== "object" || !fixedPointHandoffValue(value)) {
+    throw new Error("handoff_snapshot_invalid");
+  }
+  return value as Record<string, unknown>;
+}
+
 export function App() {
   const [view, setView] = useState<View>("overview");
   const [status, setStatus] = useState(initial);
@@ -86,6 +105,7 @@ export function App() {
   );
   const [agentModelId, setAgentModelId] = useState("");
   const [executionAccount, setExecutionAccount] = useState("");
+  const [handoffSnapshot, setHandoffSnapshot] = useState("");
   const [walletSetup, setWalletSetup] = useState<HyperliquidWalletSetup | null>(null);
   const [arenaBusy, setArenaBusy] = useState(false);
 
@@ -189,6 +209,7 @@ export function App() {
     setSelectedArena(arena);
     setArenaSetupStep("agent");
     setWalletSetup(null);
+    setHandoffSnapshot("");
     setArenaBusy(true);
     setNotice(null);
     const models = arenaModels(arena);
@@ -243,18 +264,24 @@ export function App() {
     setArenaBusy(true);
     setNotice(null);
     try {
+      const parsedHandoff = parseHandoffSnapshot(handoffSnapshot);
       await enrollArena(selectedArena.id, version.id, version.modelId);
       const next = await startLocalArena(
         selectedArena.id,
         version.id,
         executionAccount,
+        parsedHandoff,
       );
       setStatus(next);
       setSelectedArena(null);
       setView("overview");
       setNotice("Local arena staged and reconciled in pause. Review the run, then Resume.");
-    } catch {
-      setNotice("Arena launch failed closed. No order was submitted.");
+    } catch (error) {
+      setNotice(
+        error instanceof Error && error.message === "handoff_snapshot_invalid"
+          ? "The handoff snapshot must be a structured object containing fixed-point integers only."
+          : "Arena launch failed closed. No order was submitted.",
+      );
     } finally {
       setArenaBusy(false);
     }
@@ -652,9 +679,21 @@ export function App() {
                   />
                   <small>Used only for account queries and run binding. Never enter a private key.</small>
                 </label>
+                <label className="field-block">
+                  <span>Position-preserving handoff snapshot (optional)</span>
+                  <textarea
+                    aria-label="Position-preserving handoff snapshot"
+                    value={handoffSnapshot}
+                    rows={5}
+                    spellCheck={false}
+                    placeholder='{"protocol":"crow.harness.handoff.v1","equity_micro_usdc":1000000000,"positions":[]}'
+                    onChange={(event) => setHandoffSnapshot(event.target.value)}
+                  />
+                  <small>Required when replacing a hosted runner with open positions. Only structured fixed-point JSON is accepted; venue keys never belong here.</small>
+                </label>
                 <div className="launch-contract">
                   <span>ON LAUNCH</span>
-                  <p>Enroll one wallet entry, verify the signed arena and encrypted version, start the local companion, reconcile positions/fills/funding, and remain paused. Zero orders are permitted until Resume.</p>
+                  <p>Enroll one wallet entry, verify the signed arena and encrypted version, bind any explicit handoff snapshot, start the local companion, reconcile positions/fills/funding, and remain paused. Zero orders are permitted until Resume.</p>
                 </div>
                 <div className="setup-actions">
                   <button type="button" disabled={arenaBusy} onClick={() => setArenaSetupStep("agent")}>Back</button>
