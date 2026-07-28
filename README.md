@@ -17,19 +17,25 @@ events, and inference receipts required to verify arena results.
 
 ## Download the free public alpha
 
-Crow Agent v0.1.4-alpha.8 is a free, testnet-only public alpha. Do not connect
+Crow Agent v0.1.5-alpha.9 is a free, testnet-only public alpha. Do not connect
 it to live capital.
 
-- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.4-alpha.8)
-- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.4-alpha.8/Crow.Agent_0.1.4_universal.dmg)
-- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.4-alpha.8/Crow.Agent_0.1.4_x64-setup.exe)
-- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.4-alpha.8/crow-agent-linux-x86_64.tar.zst)
+- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.5-alpha.9)
+- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.5-alpha.9/Crow.Agent_0.1.5_universal.dmg)
+- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.5-alpha.9/Crow.Agent_0.1.5_x64-setup.exe)
+- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.5-alpha.9/crow-agent-linux-x86_64.tar.zst)
 - [Signed BTC/ETH/SOL historical dataset](https://github.com/crow-compute/crow-agent/releases/tag/dataset-v1)
 
 The desktop alpha is distributed directly, not through the Apple App Store or
 Microsoft Store. It is not signed with Apple Developer ID or Microsoft
 Authenticode, so macOS Gatekeeper or Windows SmartScreen may require an
 explicit manual allow action.
+
+The desktop does not read the OS credential store during startup or background
+polling. Click **Unlock device** when you want to use the local credential
+vault. Because these direct alpha builds are ad-hoc signed, macOS may ask once
+again after an update; denying that request suppresses every later credential
+request for the current app session.
 
 Every download has a detached Minisign signature. The release also includes a
 signed SHA-256 inventory, signed `ReleaseManifestV1`, public verification key,
