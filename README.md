@@ -101,6 +101,12 @@ account values, install `deploy/crow-agentd.service`, and start the service.
 The signed arena manifest is verified before the daemon connects to the venue.
 The unit opens no inbound socket.
 
+For a hosted-runner cutover, set `handoff_snapshot` to a root-readable,
+fixed-point JSON snapshot captured after the hosted run stops and reconciles.
+The first local run binds that snapshot to its backend record and signed event
+chain before any resume. Existing isolated 1× positions are preserved; inherited
+shorts may only be reduced by reduce-only buys and can never be increased.
+
 The live daemon starts or reclaims one bound arena run, renews its lease every
 10 seconds while running or paused, and begins in the paused state. An
 authenticated local or remote resume is required before the first 15-minute

@@ -307,10 +307,16 @@ where
                     available_collateral_micro_usdc: account.withdrawable_micro_usdc,
                     trading_day_start_equity_micro_usdc: risk.trading_day_start_equity_micro_usdc,
                     peak_equity_micro_usdc: risk.peak_equity_micro_usdc,
-                    symbol_position_micro_usdc: account
-                        .positions
-                        .get(symbol)
-                        .map_or(0, |position| position.notional_micro_usdc),
+                    symbol_position_micro_usdc: account.positions.get(symbol).map_or(
+                        0,
+                        |position| {
+                            if position.quantity_e8 < 0 {
+                                -position.notional_micro_usdc
+                            } else {
+                                position.notional_micro_usdc
+                            }
+                        },
+                    ),
                     orders_today: risk.orders_today,
                 },
             )
@@ -560,9 +566,10 @@ fn update_risk_state(state: &mut LiveRiskState, account: &AccountSnapshot, today
 
 fn validate_account_policy(account: &AccountSnapshot) -> Result<(), LiveCycleError> {
     if account.equity_micro_usdc <= 0
-        || account.positions.values().any(|position| {
-            position.quantity_e8 < 0 || !position.isolated || position.leverage != 1
-        })
+        || account
+            .positions
+            .values()
+            .any(|position| !position.isolated || position.leverage != 1)
     {
         return Err(LiveCycleError::AccountPolicy);
     }
@@ -679,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn account_policy_rejects_cross_leverage_and_shorts() {
+    fn account_policy_accepts_inherited_shorts_but_rejects_cross_margin() {
         let position = PositionSnapshot {
             symbol: ALLOWED_SYMBOLS[0].into(),
             quantity_e8: 1,
@@ -689,6 +696,9 @@ mod tests {
             isolated: false,
             leverage: 1,
         };
+        let mut inherited_position = position.clone();
+        inherited_position.isolated = true;
+        inherited_position.quantity_e8 = -1;
         let account = AccountSnapshot {
             venue_time_ms: 1,
             equity_micro_usdc: 1,
@@ -696,6 +706,13 @@ mod tests {
             positions: BTreeMap::from([(ALLOWED_SYMBOLS[0].into(), position)]),
         };
         assert!(validate_account_policy(&account).is_err());
+        let inherited_short = AccountSnapshot {
+            venue_time_ms: 1,
+            equity_micro_usdc: 1,
+            withdrawable_micro_usdc: 1,
+            positions: BTreeMap::from([(ALLOWED_SYMBOLS[0].into(), inherited_position)]),
+        };
+        assert!(validate_account_policy(&inherited_short).is_ok());
     }
 
     #[tokio::test]

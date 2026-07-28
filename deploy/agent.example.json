@@ -5,6 +5,7 @@
   "state_directory": "/var/lib/crow-agent",
   "live_arena": {
     "arena_manifest": "/etc/crow/arena-manifest-v1.json",
+    "handoff_snapshot": "/etc/crow/handoff-snapshot-v1.json",
     "agent_version_id": "00000000-0000-0000-0000-000000000000",
     "execution_account": "0x0000000000000000000000000000000000000000",
     "model_id": "crow-qwen3-5-27b",

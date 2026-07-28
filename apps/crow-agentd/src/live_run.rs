@@ -28,6 +28,8 @@ const RUN_LEASE_PREFIX: &str = "live-run-lease";
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct LiveArenaConfig {
     pub arena_manifest: PathBuf,
+    #[serde(default)]
+    pub handoff_snapshot: Option<PathBuf>,
     pub agent_version_id: Uuid,
     pub execution_account: String,
     pub model_id: String,
@@ -37,6 +39,7 @@ pub(crate) struct LiveArenaConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedLiveArena {
     pub signed: SignedArenaManifestV1,
+    pub handoff_snapshot: Option<Value>,
     pub agent_version_id: Uuid,
     pub execution_account: String,
     pub model_id: String,
@@ -88,8 +91,24 @@ pub(crate) fn prepare(config: LiveArenaConfig) -> Result<PreparedLiveArena, Live
     {
         return Err(LiveRunError::Configuration);
     }
+    let handoff_snapshot = config
+        .handoff_snapshot
+        .map(|path| {
+            serde_json::from_slice::<Value>(
+                &fs::read(path).map_err(|_| LiveRunError::Configuration)?,
+            )
+            .map_err(|_| LiveRunError::Configuration)
+        })
+        .transpose()?;
+    if handoff_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot.is_object() || !fixed_point_value(snapshot))
+    {
+        return Err(LiveRunError::Configuration);
+    }
     Ok(PreparedLiveArena {
         signed,
+        handoff_snapshot,
         agent_version_id: config.agent_version_id,
         execution_account: config.execution_account.to_ascii_lowercase(),
         model_id: config.model_id,
@@ -274,7 +293,7 @@ async fn acquire_run(
                     agent_version_id: config.agent_version_id,
                     execution_account: config.execution_account.clone(),
                     client_release: config.client_release.clone(),
-                    handoff_snapshot: None,
+                    handoff_snapshot: config.handoff_snapshot.clone(),
                 })
                 .await?;
             journal.put_secret(&run_id_key(arena_id), started.run.id.to_string().as_bytes())?;
@@ -314,6 +333,16 @@ async fn initialize_event_chain(
             &Value::Null,
         )
         .await?;
+    if let Some(handoff_snapshot) = &config.handoff_snapshot {
+        writer
+            .append(
+                None,
+                "handoff_snapshot",
+                handoff_snapshot.clone(),
+                &Value::Null,
+            )
+            .await?;
+    }
     writer
         .append(
             None,
@@ -382,6 +411,15 @@ fn valid_execution_account(value: &str) -> bool {
         && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn fixed_point_value(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) => true,
+        Value::Number(number) => number.as_i64().is_some() || number.as_u64().is_some(),
+        Value::Array(values) => values.iter().all(fixed_point_value),
+        Value::Object(values) => values.values().all(fixed_point_value),
+    }
+}
+
 fn unix_milliseconds(value: OffsetDateTime) -> Result<u64, LiveRunError> {
     u64::try_from(value.unix_timestamp_nanos() / 1_000_000).map_err(|_| LiveRunError::State)
 }
@@ -399,5 +437,14 @@ mod tests {
             "0x000000000000000000000000000000000000004z"
         ));
         assert!(!valid_execution_account("0x42"));
+    }
+
+    #[test]
+    fn handoff_snapshot_requires_fixed_point_structured_json() {
+        assert!(fixed_point_value(&json!({
+            "equity_micro_usdc": 1_000_000,
+            "positions": [{"symbol": "BTC", "quantity_e8": -42}]
+        })));
+        assert!(!fixed_point_value(&json!({"equity": 1.25})));
     }
 }

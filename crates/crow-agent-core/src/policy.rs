@@ -134,9 +134,17 @@ pub fn evaluate_proposal(
     if proposal.side == Side::Sell && rules.long_only && !proposal.reduce_only {
         return Err(PolicyError::LongOnly);
     }
-    if proposal.reduce_only
-        && (proposal.side != Side::Sell || portfolio.symbol_position_micro_usdc <= 0)
+    if rules.long_only
+        && portfolio.symbol_position_micro_usdc < 0
+        && !(proposal.side == Side::Buy && proposal.reduce_only)
     {
+        return Err(PolicyError::LongOnly);
+    }
+    let reduces_position = match proposal.side {
+        Side::Buy => portfolio.symbol_position_micro_usdc < 0,
+        Side::Sell => portfolio.symbol_position_micro_usdc > 0,
+    };
+    if proposal.reduce_only && !reduces_position {
         return Err(PolicyError::ReduceOnly);
     }
     if loss_bps(
@@ -181,19 +189,30 @@ pub fn evaluate_proposal(
     if actual_notional > bps_amount(portfolio.equity_micro_usdc, i64::from(rules.max_order_bps))? {
         return Err(PolicyError::OrderSize);
     }
-    if !proposal.reduce_only
-        && portfolio
-            .symbol_position_micro_usdc
-            .checked_add(actual_notional)
-            .ok_or(PolicyError::Overflow)?
-            > bps_amount(
+    if !proposal.reduce_only {
+        let projected_position = match proposal.side {
+            Side::Buy => portfolio
+                .symbol_position_micro_usdc
+                .checked_add(actual_notional),
+            Side::Sell => portfolio
+                .symbol_position_micro_usdc
+                .checked_sub(actual_notional),
+        }
+        .ok_or(PolicyError::Overflow)?;
+        if projected_position.unsigned_abs()
+            > u64::try_from(bps_amount(
                 portfolio.equity_micro_usdc,
                 i64::from(rules.max_position_bps),
-            )?
-    {
-        return Err(PolicyError::PositionSize);
+            )?)
+            .map_err(|_| PolicyError::Overflow)?
+        {
+            return Err(PolicyError::PositionSize);
+        }
     }
-    if proposal.reduce_only && actual_notional > portfolio.symbol_position_micro_usdc {
+    if proposal.reduce_only
+        && u64::try_from(actual_notional).map_err(|_| PolicyError::Overflow)?
+            > portfolio.symbol_position_micro_usdc.unsigned_abs()
+    {
         return Err(PolicyError::ReduceOnly);
     }
     let reserve = bps_amount(
@@ -383,6 +402,46 @@ mod tests {
         assert_eq!(
             evaluate_proposal(&proposal, &context(&rules, &market, &portfolio)),
             Err(PolicyError::ReduceOnly)
+        );
+    }
+
+    #[test]
+    fn inherited_short_can_only_be_reduced_by_a_reduce_only_buy() {
+        let rules = RiskRulesV1::default();
+        let market = MarketState {
+            symbol: "BTC".into(),
+            mark_price_micro_usdc: 60_000_000_000,
+            oracle_price_micro_usdc: 60_000_000_000,
+            spread_bps: 2,
+            book_age_seconds: 1,
+            ask_depth_micro_usdc: 1_000_000_000,
+            bid_depth_micro_usdc: 1_000_000_000,
+            size_decimals: 5,
+            delisted: false,
+        };
+        let portfolio = PortfolioState {
+            equity_micro_usdc: 1_000_000_000,
+            available_collateral_micro_usdc: 900_000_000,
+            trading_day_start_equity_micro_usdc: 1_000_000_000,
+            peak_equity_micro_usdc: 1_000_000_000,
+            symbol_position_micro_usdc: -20_000_000,
+            orders_today: 0,
+        };
+        let reducing = Proposal {
+            symbol: "BTC".into(),
+            side: Side::Buy,
+            notional_bps: 100,
+            limit_price_micro_usdc: market.mark_price_micro_usdc,
+            reduce_only: true,
+        };
+        assert!(evaluate_proposal(&reducing, &context(&rules, &market, &portfolio)).is_ok());
+        let increasing = Proposal {
+            reduce_only: false,
+            ..reducing
+        };
+        assert_eq!(
+            evaluate_proposal(&increasing, &context(&rules, &market, &portfolio)),
+            Err(PolicyError::LongOnly)
         );
     }
 }
