@@ -694,14 +694,25 @@ pub fn run() {
             std::process::exit(1);
         });
     app.run(|handle, event| {
-        if matches!(
-            event,
-            tauri::RunEvent::Ready | tauri::RunEvent::Reopen { .. }
-        ) && let Some(window) = handle.get_webview_window("main")
+        if should_show_main_window(&event)
+            && let Some(window) = handle.get_webview_window("main")
         {
             let _ = window.show();
             let _ = window.unminimize();
             let _ = window.set_focus();
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+fn should_show_main_window(event: &tauri::RunEvent) -> bool {
+    matches!(
+        event,
+        tauri::RunEvent::Ready | tauri::RunEvent::Reopen { .. }
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn should_show_main_window(event: &tauri::RunEvent) -> bool {
+    matches!(event, tauri::RunEvent::Ready)
 }
