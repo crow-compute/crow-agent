@@ -36,7 +36,10 @@ describe("Crow Agent shell", () => {
 
   it("presents the branded local execution command surface", () => {
     render(<App />);
-    expect(screen.getByRole("img", { name: "Crow" })).toBeInTheDocument();
+    const logo = screen.getByRole("img", { name: "Crow" });
+    expect(logo).toHaveClass("brand-logo");
+    expect(logo.getAttribute("src")).toMatch(/crow-logo/);
+    expect(screen.queryByText("LOCAL AGENT")).not.toBeInTheDocument();
     expect(screen.getByText(/Trade from/i)).toBeInTheDocument();
     expect(screen.getByText(/Secrets never enter the WebView/)).toBeInTheDocument();
     expect(screen.getByText(/Crow receives signed structured evidence/)).toBeInTheDocument();

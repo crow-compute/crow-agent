@@ -6,6 +6,8 @@ capability="$repository_root/apps/desktop/src-tauri/capabilities/default.json"
 configuration="$repository_root/apps/desktop/src-tauri/tauri.conf.json"
 styles="$repository_root/apps/desktop/src/styles.css"
 font_directory="$repository_root/apps/desktop/src/assets/fonts"
+logo="$repository_root/apps/desktop/src/assets/crow-logo.png"
+desktop_source="$repository_root/apps/desktop/src/App.tsx"
 
 grep -Fq '"permissions": ["core:default"]' "$capability"
 if grep -Eq 'shell:|fs:|http:' "$capability"; then
@@ -26,6 +28,15 @@ for font in \
 done
 test -s "$font_directory/LICENSE-IBM-PLEX.txt"
 test -s "$font_directory/LICENSE-TEKTUR.txt"
+test -s "$logo"
+test "$(shasum -a 256 "$logo" | awk '{print $1}')" = \
+  "f6a64613eb8c8391e4401185c4d097ff70a44c4f0d32b6392ed53144685f28fc"
+grep -Fq 'import crowLogo from "./assets/crow-logo.png"' "$desktop_source"
+grep -Fq 'className="brand-logo"' "$desktop_source"
+if grep -Fq 'crow-mark.png' "$desktop_source"; then
+  echo "desktop references the superseded symbol-only mark" >&2
+  exit 1
+fi
 test "$(shasum -a 256 "$font_directory/ibm-plex-sans-latin.woff2" | awk '{print $1}')" = \
   "056e4e2459f57a0033c8c9c844ff19d6e42ac8602027803d4345823bcc939818"
 test "$(shasum -a 256 "$font_directory/ibm-plex-mono-400-latin.woff2" | awk '{print $1}')" = \
