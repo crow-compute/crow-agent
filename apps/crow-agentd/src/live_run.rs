@@ -1,8 +1,8 @@
 use crate::ExecutionGate;
 use crow_agent_core::{
-    DurableRunEventWriter, EncryptedJournal, GatewayClient, HarnessApiClient,
+    DeviceEncryptionKey, DurableRunEventWriter, EncryptedJournal, GatewayClient, HarnessApiClient,
     HyperliquidBookStream, HyperliquidVenue, LiveRiskState, StartHarnessRunV1, execute_live_cycle,
-    load_live_risk_state, reconcile_live_state, store_live_risk_state,
+    load_live_risk_state, open_agent_version, reconcile_live_state, store_live_risk_state,
 };
 use crow_agent_protocol::{
     ArenaMode, DeviceIdentity, SignedArenaManifestV1, canonical_json, sha256,
@@ -123,6 +123,8 @@ pub(crate) async fn run_session(
     state_directory: &Path,
     journal_key: [u8; 32],
     api_wallet_key: &Zeroizing<[u8; 32]>,
+    device_id: Uuid,
+    device_encryption_key: &DeviceEncryptionKey,
     access_token: &Zeroizing<String>,
     identity: &DeviceIdentity,
     execution_gate: &ExecutionGate,
@@ -130,12 +132,18 @@ pub(crate) async fn run_session(
 ) -> Result<LiveSessionOutcome, LiveRunError> {
     let manifest = &config.signed.manifest;
     let now = OffsetDateTime::now_utc();
-    if now < manifest.starts_at || now >= manifest.ends_at {
+    if now >= manifest.ends_at {
         return Err(LiveRunError::Configuration);
     }
     let journal_path = state_directory.join("journal.db");
     let mut journal = EncryptedJournal::open(&journal_path, journal_key)?;
     let api = HarnessApiClient::new(api_origin, access_token.as_str())?;
+    let envelope = api.agent_version(config.agent_version_id).await?;
+    let strategy = open_agent_version(&envelope, device_id, device_encryption_key)
+        .map_err(|_| LiveRunError::Configuration)?;
+    if strategy.model_id != config.model_id {
+        return Err(LiveRunError::Configuration);
+    }
     let run_id = acquire_run(config, &journal, &api).await?;
     *active_run.lock().map_err(|_| LiveRunError::State)? = Some(run_id);
     let venue = HyperliquidVenue::connect_testnet(api_wallet_key).await?;
@@ -232,6 +240,7 @@ pub(crate) async fn run_session(
                     manifest,
                     run_id,
                     &config.model_id,
+                    &strategy.system_instructions,
                     &config.execution_account,
                     &venue,
                     snapshot_books,
@@ -378,8 +387,11 @@ fn duration_until_next_cycle(
     manifest: &crow_agent_protocol::ArenaManifestV1,
 ) -> Result<Duration, LiveRunError> {
     let now = OffsetDateTime::now_utc();
-    if now < manifest.starts_at || now >= manifest.ends_at {
+    if now >= manifest.ends_at {
         return Err(LiveRunError::Configuration);
+    }
+    if now < manifest.starts_at {
+        return Duration::try_from(manifest.starts_at - now).map_err(|_| LiveRunError::State);
     }
     let interval = i64::from(manifest.decision_interval_seconds);
     let elapsed = (now - manifest.starts_at).whole_seconds();

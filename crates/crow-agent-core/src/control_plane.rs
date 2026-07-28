@@ -1,4 +1,4 @@
-use crow_agent_protocol::RunEventEnvelopeV1;
+use crow_agent_protocol::{AgentVersionEnvelopeV1, RunEventEnvelopeV1};
 use reqwest::{
     Client, StatusCode,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue},
@@ -90,6 +90,11 @@ struct AppendEventResponse {
     server_receipt: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentVersionListResponse {
+    versions: Vec<AgentVersionEnvelopeV1>,
+}
+
 pub struct HarnessApiClient {
     origin: Url,
     authorization: HeaderValue,
@@ -153,6 +158,23 @@ impl HarnessApiClient {
         })
     }
 
+    pub async fn agent_version(
+        &self,
+        version_id: Uuid,
+    ) -> Result<AgentVersionEnvelopeV1, HarnessApiError> {
+        if version_id == Uuid::nil() {
+            return Err(HarnessApiError::Response);
+        }
+        let response = self.get("/api/v1/harness/agent-versions").await?;
+        let versions = decode_success::<AgentVersionListResponse>(response)
+            .await?
+            .versions;
+        versions
+            .into_iter()
+            .find(|version| version.version_id == version_id)
+            .ok_or(HarnessApiError::Response)
+    }
+
     pub async fn renew_lease(
         &self,
         run_id: Uuid,
@@ -207,6 +229,19 @@ impl HarnessApiClient {
             .header(AUTHORIZATION, self.authorization.clone())
             .header(CONTENT_TYPE, "application/json")
             .json(body)
+            .send()
+            .await?)
+    }
+
+    async fn get(&self, path: &str) -> Result<reqwest::Response, HarnessApiError> {
+        let endpoint = self
+            .origin
+            .join(path)
+            .map_err(|_| HarnessApiError::Origin)?;
+        Ok(self
+            .client
+            .get(endpoint)
+            .header(AUTHORIZATION, self.authorization.clone())
             .send()
             .await?)
     }

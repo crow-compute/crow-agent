@@ -471,6 +471,16 @@ impl HyperliquidVenue {
     }
 }
 
+pub fn hyperliquid_api_wallet_address(
+    api_wallet_key: &[u8; 32],
+) -> Result<String, HyperliquidError> {
+    let encoded_key = Zeroizing::new(format!("0x{}", hex::encode(api_wallet_key)));
+    let signer = encoded_key
+        .parse::<PrivateKeySigner>()
+        .map_err(|_| HyperliquidError::Wallet)?;
+    Ok(signer.address().to_string())
+}
+
 pub struct HyperliquidBookStream {
     info: HttpClient,
     stream: WebSocket,

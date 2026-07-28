@@ -129,6 +129,10 @@ impl InferenceProvider for GatewayClient {
                         "role": "system",
                         "content": "Return one compact JSON object with exactly tool_calls and proposal. Use fixed-point integers only. Never include markdown. tool_calls may use market_snapshot, portfolio_snapshot, or recent_candles. Set proposal to null while requesting tools; otherwise tool_calls must be empty."
                     }),
+                    serde_json::json!({
+                        "role": "system",
+                        "content": request.strategy_instructions
+                    }),
                     serde_json::json!({"role": "user", "content": prompt}),
                 ],
                 tools: Vec::new(),

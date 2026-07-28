@@ -1,5 +1,6 @@
 //! Security-sensitive local execution primitives shared by the daemon and Tauri shell.
 
+pub mod agent_version;
 pub mod backtest;
 pub mod companion;
 pub mod control_plane;
@@ -16,6 +17,10 @@ pub mod runtime;
 pub mod scoring;
 pub mod tls;
 
+pub use agent_version::{
+    AgentVersionError, AgentVersionRecipient, REQUIRED_STRATEGY_TOOLS, StrategyBundleV1,
+    decode_device_encryption_public_key, open_agent_version, seal_agent_version,
+};
 pub use backtest::{
     BacktestEngine, BacktestError, BacktestResult, CandleV1, EquityPoint, ScheduledProposal,
 };
@@ -38,6 +43,7 @@ pub use gateway::{GatewayClient, GatewayError, InferenceRequest, InferenceRespon
 pub use hyperliquid::{
     AccountSnapshot, BookLevel, BookSnapshot, CoreAsset, HyperliquidBookStream, HyperliquidError,
     HyperliquidVenue, MarketSnapshot, PositionSnapshot, VenueSubmission,
+    hyperliquid_api_wallet_address,
 };
 pub use journal::{EncryptedJournal, JournalError};
 pub use live::{DurableRunEventError, DurableRunEventWriter, RunEventSink};

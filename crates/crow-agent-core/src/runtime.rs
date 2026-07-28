@@ -42,6 +42,7 @@ pub struct ModelTurnRequest {
     pub run_id: Uuid,
     pub cycle_id: Uuid,
     pub model_id: String,
+    pub strategy_instructions: String,
     pub cycle_context: Value,
     pub prior_tool_results: Vec<ToolResult>,
 }
@@ -98,6 +99,7 @@ pub struct CycleContext<'a> {
     pub run_id: Uuid,
     pub cycle_id: Uuid,
     pub model_id: &'a str,
+    pub strategy_instructions: &'a str,
     pub markets: &'a BTreeMap<String, MarketState>,
     pub portfolios: &'a BTreeMap<String, PortfolioState>,
     pub cycle_context: Value,
@@ -162,6 +164,11 @@ where
         {
             return Err(RuntimeError::ReceiptBinding);
         }
+        if context.strategy_instructions.trim().is_empty()
+            || context.strategy_instructions.chars().count() > 8_192
+        {
+            return Err(RuntimeError::ReceiptBinding);
+        }
 
         let mut tool_results = Vec::new();
         let mut receipts = Vec::new();
@@ -171,6 +178,7 @@ where
                 run_id: context.run_id,
                 cycle_id: context.cycle_id,
                 model_id: context.model_id.to_owned(),
+                strategy_instructions: context.strategy_instructions.to_owned(),
                 cycle_context: context.cycle_context.clone(),
                 prior_tool_results: tool_results.clone(),
             };
@@ -344,6 +352,7 @@ mod tests {
                 run_id: Uuid::from_u128(10),
                 cycle_id: Uuid::from_u128(11),
                 model_id: ALLOWED_MODELS[0],
+                strategy_instructions: "Prefer verified, policy-compliant holds.",
                 markets: &markets,
                 portfolios: &portfolios,
                 cycle_context: json!({"candle_closed_at": "2026-07-01T00:00:00Z"}),

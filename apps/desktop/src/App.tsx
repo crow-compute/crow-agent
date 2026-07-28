@@ -2,18 +2,26 @@ import { useEffect, useMemo, useState } from "react";
 import {
   beginDeviceAuthorization,
   completeDeviceAuthorization,
+  createAgentVersion,
+  enrollArena,
+  getAgentVersions,
   getAgentStatus,
   getPublicArenas,
   getRemoteState,
+  prepareHyperliquidWallet,
   sendLocalCommand,
   sendRemoteCommand,
+  startLocalArena,
+  type AgentVersionSummary,
   type AgentStatus,
   type DeviceAuthorization,
+  type HyperliquidWalletSetup,
   type PublicArena,
   type RemoteState,
 } from "./tauri";
 
 type View = "overview" | "arenas" | "devices";
+type ArenaSetupStep = "agent" | "venue";
 
 const initial: AgentStatus = {
   protocol: "crow.harness.v1",
@@ -68,6 +76,18 @@ export function App() {
   const [arenas, setArenas] = useState<PublicArena[]>([]);
   const [remoteBusy, setRemoteBusy] = useState("");
   const [localBusy, setLocalBusy] = useState("");
+  const [selectedArena, setSelectedArena] = useState<PublicArena | null>(null);
+  const [arenaSetupStep, setArenaSetupStep] = useState<ArenaSetupStep>("agent");
+  const [agentVersions, setAgentVersions] = useState<AgentVersionSummary[]>([]);
+  const [selectedVersionId, setSelectedVersionId] = useState("");
+  const [agentName, setAgentName] = useState("Measured momentum");
+  const [agentInstructions, setAgentInstructions] = useState(
+    "Trade only when current BTC, ETH, or SOL evidence is internally consistent. Prefer hold over weak conviction. Never exceed the arena policy and reduce inherited risk before adding exposure.",
+  );
+  const [agentModelId, setAgentModelId] = useState("");
+  const [executionAccount, setExecutionAccount] = useState("");
+  const [walletSetup, setWalletSetup] = useState<HyperliquidWalletSetup | null>(null);
+  const [arenaBusy, setArenaBusy] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -162,6 +182,81 @@ export function App() {
       setNotice(`Local ${action} was not accepted.`);
     } finally {
       setLocalBusy("");
+    }
+  }
+
+  async function openArenaSetup(arena: PublicArena) {
+    setSelectedArena(arena);
+    setArenaSetupStep("agent");
+    setWalletSetup(null);
+    setArenaBusy(true);
+    setNotice(null);
+    const models = arenaModels(arena);
+    setAgentModelId(models[0] ?? "");
+    try {
+      const state = await getAgentVersions();
+      const eligible = state.versions.filter((version) => models.includes(version.modelId));
+      setAgentVersions(eligible);
+      setSelectedVersionId(eligible[0]?.id ?? "");
+    } catch {
+      setAgentVersions([]);
+      setNotice("Could not load immutable agent versions.");
+    } finally {
+      setArenaBusy(false);
+    }
+  }
+
+  async function createVersionForArena() {
+    if (!selectedArena || !agentModelId) return;
+    setArenaBusy(true);
+    setNotice(null);
+    try {
+      const version = await createAgentVersion(agentName, agentModelId, agentInstructions);
+      setAgentVersions((current) => [version, ...current]);
+      setSelectedVersionId(version.id);
+      setNotice("Immutable strategy encrypted and wrapped to your approved devices.");
+    } catch {
+      setNotice("The immutable agent version could not be created.");
+    } finally {
+      setArenaBusy(false);
+    }
+  }
+
+  async function continueToVenue() {
+    if (!selectedVersionId) return;
+    setArenaBusy(true);
+    setNotice(null);
+    try {
+      setWalletSetup(await prepareHyperliquidWallet());
+      setArenaSetupStep("venue");
+    } catch {
+      setNotice("The local Hyperliquid API wallet could not be prepared.");
+    } finally {
+      setArenaBusy(false);
+    }
+  }
+
+  async function launchArena() {
+    if (!selectedArena || !selectedVersionId || !walletSetup) return;
+    const version = agentVersions.find((candidate) => candidate.id === selectedVersionId);
+    if (!version) return;
+    setArenaBusy(true);
+    setNotice(null);
+    try {
+      await enrollArena(selectedArena.id, version.id, version.modelId);
+      const next = await startLocalArena(
+        selectedArena.id,
+        version.id,
+        executionAccount,
+      );
+      setStatus(next);
+      setSelectedArena(null);
+      setView("overview");
+      setNotice("Local arena staged and reconciled in pause. Review the run, then Resume.");
+    } catch {
+      setNotice("Arena launch failed closed. No order was submitted.");
+    } finally {
+      setArenaBusy(false);
     }
   }
 
@@ -361,8 +456,16 @@ export function App() {
                     <div><dt>Ends</dt><dd>{formatMoment(arena.endsAt)}</dd></div>
                     <div><dt>Tickets</dt><dd>{arena.ticketsEnabled ? "Enabled" : "Free"}</dd></div>
                   </dl>
-                  <button type="button" disabled={!status.deviceAuthorized || arena.state !== "enrollment"}>
-                    {arena.state === "enrollment" ? "Select agent" : arena.state}
+                  <button
+                    type="button"
+                    disabled={
+                      !status.deviceAuthorized
+                      || !["enrollment", "running"].includes(arena.state)
+                      || Boolean(status.activeRun)
+                    }
+                    onClick={() => void openArenaSetup(arena)}
+                  >
+                    {["enrollment", "running"].includes(arena.state) ? "Select agent" : arena.state}
                   </button>
                 </article>
               )) : (
@@ -443,6 +546,132 @@ export function App() {
           </div>
         ) : null}
       </section>
+
+      {selectedArena ? (
+        <div className="authorization-layer" role="dialog" aria-modal="true" aria-labelledby="arena-setup-title">
+          <section className="arena-setup-card">
+            <button className="dialog-close" type="button" aria-label="Close arena setup" onClick={() => setSelectedArena(null)}>×</button>
+            <div className="setup-progress" aria-label="Arena setup progress">
+              <span className={arenaSetupStep === "agent" ? "active" : "complete"}><b>01</b> AGENT</span>
+              <i />
+              <span className={arenaSetupStep === "venue" ? "active" : ""}><b>02</b> VENUE</span>
+              <i />
+              <span><b>03</b> PAUSED</span>
+            </div>
+            <p className="meta">LOCAL ARENA PROVISIONING</p>
+            <h2 id="arena-setup-title">{arenaName(selectedArena)}</h2>
+            <p className="setup-intro">
+              Strategy plaintext and the venue signing key stay inside this machine. The run starts paused after Crow and Hyperliquid reconciliation.
+            </p>
+
+            {arenaSetupStep === "agent" ? (
+              <div className="setup-body">
+                {agentVersions.length ? (
+                  <label className="field-block">
+                    <span>Immutable version</span>
+                    <select value={selectedVersionId} onChange={(event) => setSelectedVersionId(event.target.value)}>
+                      {agentVersions.map((version) => (
+                        <option value={version.id} key={version.id}>
+                          {version.modelId} · v{version.version} · {shortId(version.configurationSha256)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : (
+                  <div className="setup-callout">
+                    <strong>No compatible version yet.</strong>
+                    <span>Create one locally below. Crow receives ciphertext, metadata, and integrity hashes only.</span>
+                  </div>
+                )}
+
+                <div className="setup-divider"><span>NEW IMMUTABLE VERSION</span></div>
+
+                <div className="field-grid">
+                  <label className="field-block">
+                    <span>Agent name</span>
+                    <input value={agentName} maxLength={80} onChange={(event) => setAgentName(event.target.value)} />
+                  </label>
+                  <label className="field-block">
+                    <span>Model</span>
+                    <select value={agentModelId} onChange={(event) => setAgentModelId(event.target.value)}>
+                      {arenaModels(selectedArena).map((model) => <option value={model} key={model}>{model}</option>)}
+                    </select>
+                  </label>
+                </div>
+                <label className="field-block">
+                  <span>Private strategy instructions</span>
+                  <textarea
+                    aria-label="Private strategy instructions"
+                    value={agentInstructions}
+                    maxLength={8192}
+                    rows={6}
+                    onChange={(event) => setAgentInstructions(event.target.value)}
+                  />
+                  <small>{agentInstructions.length.toLocaleString()} / 8,192 · encrypted before upload</small>
+                </label>
+                <div className="setup-actions">
+                  <button
+                    type="button"
+                    disabled={arenaBusy || !agentName.trim() || !agentInstructions.trim() || !agentModelId}
+                    onClick={() => void createVersionForArena()}
+                  >
+                    Create & encrypt
+                  </button>
+                  <button
+                    className="primary-action"
+                    type="button"
+                    disabled={arenaBusy || !selectedVersionId}
+                    onClick={() => void continueToVenue()}
+                  >
+                    <span>{arenaBusy ? "Preparing…" : "Continue to venue"}</span><b>→</b>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="setup-body">
+                <div className="venue-key-panel">
+                  <span>LOCAL API WALLET ADDRESS</span>
+                  <strong>{walletSetup?.address ?? "Preparing…"}</strong>
+                  <p>Register this public address as an API wallet in the Hyperliquid Testnet page that just opened. The private key is already sealed in your OS credential store.</p>
+                  <button
+                    className="text-action"
+                    type="button"
+                    onClick={() => void continueToVenue()}
+                  >
+                    Reopen Hyperliquid Testnet ↗
+                  </button>
+                </div>
+                <label className="field-block">
+                  <span>Hyperliquid master account</span>
+                  <input
+                    value={executionAccount}
+                    placeholder="0x…"
+                    spellCheck={false}
+                    autoComplete="off"
+                    onChange={(event) => setExecutionAccount(event.target.value)}
+                  />
+                  <small>Used only for account queries and run binding. Never enter a private key.</small>
+                </label>
+                <div className="launch-contract">
+                  <span>ON LAUNCH</span>
+                  <p>Enroll one wallet entry, verify the signed arena and encrypted version, start the local companion, reconcile positions/fills/funding, and remain paused. Zero orders are permitted until Resume.</p>
+                </div>
+                <div className="setup-actions">
+                  <button type="button" disabled={arenaBusy} onClick={() => setArenaSetupStep("agent")}>Back</button>
+                  <button
+                    className="primary-action"
+                    type="button"
+                    disabled={arenaBusy || !/^0x[0-9a-fA-F]{40}$/.test(executionAccount)}
+                    onClick={() => void launchArena()}
+                  >
+                    <span>{arenaBusy ? "Reconciling…" : "I registered it — stage paused"}</span><b>→</b>
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      ) : null}
 
       {authorization ? (
         <div className="authorization-layer" role="dialog" aria-modal="true" aria-labelledby="authorization-title">

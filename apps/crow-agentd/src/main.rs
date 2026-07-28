@@ -19,10 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Read as _,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
     time::Duration,
@@ -51,6 +51,7 @@ const DEVICE_ID_SECRET: &str = "device-id";
 const EXECUTION_RUNNING: u8 = 0;
 const EXECUTION_PAUSED: u8 = 1;
 const EXECUTION_STOPPED: u8 = 2;
+const MAX_DESKTOP_REFRESH_TOKEN_BYTES: usize = 512;
 
 #[derive(Debug, Parser)]
 #[command(name = "crow-agentd", version, about = "User-hosted Crow arena agent")]
@@ -97,6 +98,12 @@ enum Command {
         #[arg(long)]
         ipc_name: String,
     },
+    /// Run a desktop-provisioned arena and authenticated local control socket.
+    DesktopRun {
+        config: PathBuf,
+        #[arg(long)]
+        ipc_name: String,
+    },
     /// Maintain the outbound Crow control connection.
     Run { config: PathBuf },
 }
@@ -111,6 +118,15 @@ struct DaemonConfig {
     state_directory: PathBuf,
     #[serde(default)]
     live_arena: Option<live_run::LiveArenaConfig>,
+}
+
+struct DesktopCredentials {
+    companion_secret: Zeroizing<[u8; 32]>,
+    signing_seed: Zeroizing<[u8; 32]>,
+    encryption_secret: Zeroizing<[u8; 32]>,
+    journal_key: Zeroizing<[u8; 32]>,
+    api_wallet_key: Zeroizing<[u8; 32]>,
+    refresh_token: Zeroizing<String>,
 }
 
 fn production_api_origin() -> String {
@@ -341,6 +357,46 @@ async fn main() -> Result<(), DaemonError> {
         Command::Companion { ipc_name } => {
             run_companion(&ipc_name).await?;
         }
+        Command::DesktopRun { config, ipc_name } => {
+            let config = serde_json::from_slice::<DaemonConfig>(&fs::read(config)?)?;
+            let prepared_live = config
+                .live_arena
+                .clone()
+                .map(live_run::prepare)
+                .transpose()?
+                .ok_or(DaemonError::Manifest)?;
+            let credentials = read_desktop_credentials()?;
+            let identity = DeviceIdentity::from_seed(&credentials.signing_seed);
+            let device_encryption_key =
+                DeviceEncryptionKey::from_secret(*credentials.encryption_secret);
+            fs::create_dir_all(&config.state_directory)?;
+            let journal = EncryptedJournal::open(
+                &config.state_directory.join("journal.db"),
+                *credentials.journal_key,
+            )?;
+            let execution_gate = ExecutionGate::new();
+            let active_run = Arc::new(Mutex::new(None));
+            tokio::select! {
+                result = run_companion_listener(
+                    &ipc_name,
+                    &credentials.companion_secret,
+                    &execution_gate,
+                    &active_run,
+                ) => result?,
+                result = run_relay(
+                    &config,
+                    &identity,
+                    &journal,
+                    *credentials.journal_key,
+                    Zeroizing::new(credentials.refresh_token.to_string()),
+                    &device_encryption_key,
+                    Some(&prepared_live),
+                    Some(&credentials.api_wallet_key),
+                    &execution_gate,
+                    &active_run,
+                ) => result?,
+            }
+        }
         Command::Run { config } => {
             let config = serde_json::from_slice::<DaemonConfig>(&fs::read(config)?)?;
             let prepared_live = config
@@ -351,6 +407,10 @@ async fn main() -> Result<(), DaemonError> {
             let identity = load_identity()?;
             fs::create_dir_all(&config.state_directory)?;
             let journal_key = load_credential_32("journal-key", DaemonError::JournalCredential)?;
+            let device_encryption_key = DeviceEncryptionKey::from_secret(load_credential_32(
+                "device-encryption-secret",
+                DaemonError::EncryptionCredential,
+            )?);
             let journal =
                 EncryptedJournal::open(&config.state_directory.join("journal.db"), journal_key)?;
             let refresh_token = load_refresh_token(&journal)?;
@@ -362,14 +422,19 @@ async fn main() -> Result<(), DaemonError> {
             } else {
                 None
             };
+            let execution_gate = ExecutionGate::new();
+            let active_run = Arc::new(Mutex::new(None));
             Box::pin(run_relay(
                 &config,
                 &identity,
                 &journal,
                 journal_key,
                 refresh_token,
+                &device_encryption_key,
                 prepared_live.as_ref(),
                 api_wallet_key.as_ref(),
+                &execution_gate,
+                &active_run,
             ))
             .await?;
         }
@@ -393,20 +458,35 @@ fn local_socket_name(label: &str) -> Result<Name<'static>, std::io::Error> {
 async fn run_companion(ipc_name: &str) -> Result<(), DaemonError> {
     let mut secret = Zeroizing::new([0_u8; 32]);
     std::io::stdin().lock().read_exact(secret.as_mut())?;
+    let execution_gate = ExecutionGate::new();
+    let active_run = Arc::new(Mutex::new(None));
+    run_companion_listener(ipc_name, &secret, &execution_gate, &active_run).await
+}
+
+async fn run_companion_listener(
+    ipc_name: &str,
+    secret: &[u8; 32],
+    execution_gate: &ExecutionGate,
+    active_run: &Arc<Mutex<Option<Uuid>>>,
+) -> Result<(), DaemonError> {
     let name = local_socket_name(ipc_name)?;
     let listener = ListenerOptions::new()
         .name(name)
         .try_overwrite(true)
         .create_tokio()?;
-    let execution_gate = ExecutionGate::new();
     let mut highest_nonce = 0_u64;
     info!("desktop companion ready on authenticated local IPC");
 
     loop {
         let connection = listener.accept().await?;
-        if let Err(error) =
-            handle_companion_connection(connection, &secret, &mut highest_nonce, &execution_gate)
-                .await
+        if let Err(error) = handle_companion_connection(
+            connection,
+            secret,
+            &mut highest_nonce,
+            execution_gate,
+            active_run,
+        )
+        .await
         {
             warn!(error = %error, "rejected desktop companion request");
         }
@@ -418,6 +498,7 @@ async fn handle_companion_connection(
     secret: &[u8; 32],
     highest_nonce: &mut u64,
     execution_gate: &ExecutionGate,
+    active_run: &Arc<Mutex<Option<Uuid>>>,
 ) -> Result<(), DaemonError> {
     let reader = BufReader::new(&connection);
     let mut reader = reader.take((MAX_COMPANION_MESSAGE_BYTES + 1) as u64);
@@ -427,7 +508,8 @@ async fn handle_companion_connection(
         return Err(DaemonError::RemoteCommand);
     }
     let request = serde_json::from_str::<CompanionRequestV1>(raw.trim_end())?;
-    let response = apply_companion_request(&request, secret, highest_nonce, execution_gate)?;
+    let response =
+        apply_companion_request(&request, secret, highest_nonce, execution_gate, active_run)?;
     let mut encoded = serde_json::to_vec(&response)?;
     encoded.push(b'\n');
     let mut sender = &connection;
@@ -440,6 +522,7 @@ fn apply_companion_request(
     secret: &[u8; 32],
     highest_nonce: &mut u64,
     execution_gate: &ExecutionGate,
+    active_run: &Arc<Mutex<Option<Uuid>>>,
 ) -> Result<CompanionResponseV1, DaemonError> {
     request.verify(secret)?;
     if request.nonce <= *highest_nonce {
@@ -459,7 +542,7 @@ fn apply_companion_request(
         request.nonce,
         accepted,
         execution_gate.label(),
-        None,
+        *active_run.lock().map_err(|_| DaemonError::RemoteCommand)?,
         (!accepted).then(|| "invalid_transition".into()),
     )
     .map_err(DaemonError::from)
@@ -550,22 +633,67 @@ fn load_refresh_token(journal: &EncryptedJournal) -> Result<Zeroizing<String>, D
     Ok(Zeroizing::new(token))
 }
 
+fn read_desktop_credentials() -> Result<DesktopCredentials, DaemonError> {
+    let mut reader = std::io::stdin().lock();
+    read_desktop_credentials_from(&mut reader)
+}
+
+fn read_desktop_credentials_from(
+    reader: &mut impl Read,
+) -> Result<DesktopCredentials, DaemonError> {
+    let companion_secret = read_secret_32(reader)?;
+    let signing_seed = read_secret_32(reader)?;
+    let encryption_secret = read_secret_32(reader)?;
+    let journal_key = read_secret_32(reader)?;
+    let api_wallet_key = read_secret_32(reader)?;
+    let mut length = [0_u8; 2];
+    reader.read_exact(&mut length)?;
+    let length = usize::from(u16::from_be_bytes(length));
+    if length == 0 || length > MAX_DESKTOP_REFRESH_TOKEN_BYTES {
+        return Err(DaemonError::DeviceTokenCredential);
+    }
+    let mut raw = Zeroizing::new(vec![0_u8; length]);
+    reader.read_exact(&mut raw)?;
+    let refresh_token = Zeroizing::new(
+        String::from_utf8(raw.to_vec()).map_err(|_| DaemonError::DeviceTokenCredential)?,
+    );
+    if !refresh_token.starts_with("crow_device_refresh_") {
+        return Err(DaemonError::DeviceTokenCredential);
+    }
+    Ok(DesktopCredentials {
+        companion_secret,
+        signing_seed,
+        encryption_secret,
+        journal_key,
+        api_wallet_key,
+        refresh_token,
+    })
+}
+
+fn read_secret_32(reader: &mut impl Read) -> Result<Zeroizing<[u8; 32]>, DaemonError> {
+    let mut value = Zeroizing::new([0_u8; 32]);
+    reader.read_exact(value.as_mut())?;
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_relay(
     config: &DaemonConfig,
     identity: &DeviceIdentity,
     journal: &EncryptedJournal,
     journal_key: [u8; 32],
     mut refresh_token: Zeroizing<String>,
+    device_encryption_key: &DeviceEncryptionKey,
     live_arena: Option<&live_run::PreparedLiveArena>,
     api_wallet_key: Option<&Zeroizing<[u8; 32]>>,
+    execution_gate: &ExecutionGate,
+    active_run: &Arc<Mutex<Option<Uuid>>>,
 ) -> Result<(), DaemonError> {
     let url = Url::parse(&config.relay_url).map_err(|_| DaemonError::RelayUrl)?;
     if url.scheme() != "wss" {
         return Err(DaemonError::RelayUrl);
     }
     let authorization = DeviceAuthorizationClient::new(&config.api_origin)?;
-    let execution_gate = ExecutionGate::new();
-    let active_run = Arc::new(std::sync::Mutex::new(None));
     let mut backoff = Duration::from_secs(1);
     loop {
         let tokens = match authorization.rotate(&refresh_token, identity).await {
@@ -585,8 +713,8 @@ async fn run_relay(
             journal,
             &tokens.access_token,
             tokens.access_expires_at,
-            &execution_gate,
-            &active_run,
+            execution_gate,
+            active_run,
         );
         let session_result = if let (Some(live_arena), Some(api_wallet_key)) =
             (live_arena, api_wallet_key)
@@ -600,10 +728,12 @@ async fn run_relay(
                     &config.state_directory,
                     journal_key,
                     api_wallet_key,
+                    config.device_id,
+                    device_encryption_key,
                     &tokens.access_token,
                     identity,
-                    &execution_gate,
-                    &active_run,
+                    execution_gate,
+                    active_run,
                 ) => match result {
                     Ok(live_run::LiveSessionOutcome::Stopped) => Ok(()),
                     Err(error) => Err(DaemonError::LiveRun(error)),
@@ -871,18 +1001,55 @@ mod tests {
     fn companion_ipc_authenticates_and_rejects_replay() -> Result<(), Box<dyn std::error::Error>> {
         let secret = [19_u8; 32];
         let gate = ExecutionGate::new();
+        let run_id = Uuid::new_v4();
+        let active_run = Arc::new(Mutex::new(Some(run_id)));
         let mut highest_nonce = 0;
         let request = CompanionRequestV1::sign(&secret, 1, CompanionActionV1::Resume)?;
-        let response = apply_companion_request(&request, &secret, &mut highest_nonce, &gate)?;
+        let response =
+            apply_companion_request(&request, &secret, &mut highest_nonce, &gate, &active_run)?;
         response.verify(&secret, &request)?;
         assert!(response.accepted);
         assert_eq!(response.execution_state, "running");
-        assert!(apply_companion_request(&request, &secret, &mut highest_nonce, &gate).is_err());
+        assert_eq!(response.active_run, Some(run_id));
+        assert!(
+            apply_companion_request(&request, &secret, &mut highest_nonce, &gate, &active_run,)
+                .is_err()
+        );
 
         let mut tampered = CompanionRequestV1::sign(&secret, 2, CompanionActionV1::Pause)?;
         tampered.action = CompanionActionV1::Stop;
-        assert!(apply_companion_request(&tampered, &secret, &mut highest_nonce, &gate).is_err());
+        assert!(
+            apply_companion_request(&tampered, &secret, &mut highest_nonce, &gate, &active_run,)
+                .is_err()
+        );
         assert_eq!(highest_nonce, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_credential_frame_is_bounded_and_preserves_field_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = b"crow_device_refresh_runner";
+        let mut frame = Vec::new();
+        for value in 1_u8..=5 {
+            frame.extend_from_slice(&[value; 32]);
+        }
+        frame.extend_from_slice(&u16::try_from(token.len())?.to_be_bytes());
+        frame.extend_from_slice(token);
+        let credentials = read_desktop_credentials_from(&mut std::io::Cursor::new(frame.clone()))?;
+        assert_eq!(*credentials.companion_secret, [1_u8; 32]);
+        assert_eq!(*credentials.signing_seed, [2_u8; 32]);
+        assert_eq!(*credentials.encryption_secret, [3_u8; 32]);
+        assert_eq!(*credentials.journal_key, [4_u8; 32]);
+        assert_eq!(*credentials.api_wallet_key, [5_u8; 32]);
+        assert_eq!(
+            credentials.refresh_token.as_str(),
+            "crow_device_refresh_runner"
+        );
+
+        frame.truncate(32 * 5);
+        frame.extend_from_slice(&u16::MAX.to_be_bytes());
+        assert!(read_desktop_credentials_from(&mut std::io::Cursor::new(frame)).is_err());
         Ok(())
     }
 }

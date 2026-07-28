@@ -371,6 +371,117 @@ button:disabled { cursor: not-allowed; opacity: .38; }
 .authorization-card .primary-action { width: 100%; }
 .authorization-card > small { display: block; margin-top: 12px; color: var(--muted); font: 500 8px var(--mono); text-align: center; }
 
+.arena-setup-card {
+  position: relative;
+  width: min(100%, 780px);
+  max-height: min(860px, calc(100vh - 48px));
+  overflow: auto;
+  padding: 38px;
+  border: 1px solid var(--line-strong);
+  background: var(--ink-2);
+  box-shadow: 18px 18px 0 rgba(0, 0, 0, .55);
+}
+.arena-setup-card h2 {
+  margin: 8px 0 0;
+  max-width: 660px;
+  font: 600 34px/1 var(--display);
+  letter-spacing: -.035em;
+  text-transform: uppercase;
+}
+.setup-intro {
+  max-width: 650px;
+  margin: 14px 0 26px;
+  color: var(--bone-2);
+  font-size: 13px;
+  line-height: 1.65;
+}
+.setup-progress {
+  display: grid;
+  grid-template-columns: auto 1fr auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+  margin: 0 45px 34px 0;
+}
+.setup-progress span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font: 600 8px var(--mono);
+  letter-spacing: .1em;
+}
+.setup-progress span b { color: var(--muted); font-weight: 600; }
+.setup-progress span.active, .setup-progress span.active b { color: var(--heat); }
+.setup-progress span.complete, .setup-progress span.complete b { color: var(--bone-2); }
+.setup-progress i { height: 1px; background: var(--line-strong); }
+.setup-body { display: grid; gap: 18px; }
+.field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.field-block { display: grid; gap: 8px; }
+.field-block > span, .venue-key-panel > span, .launch-contract > span {
+  color: var(--muted);
+  font: 600 8px var(--mono);
+  letter-spacing: .11em;
+  text-transform: uppercase;
+}
+.field-block input, .field-block select, .field-block textarea {
+  width: 100%;
+  min-height: 43px;
+  padding: 11px 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  outline: 0;
+  background: var(--ink);
+  color: var(--bone);
+  font: 500 11px/1.55 var(--mono);
+}
+.field-block textarea { resize: vertical; min-height: 120px; font-family: var(--sans); }
+.field-block input:focus, .field-block select:focus, .field-block textarea:focus { border-color: var(--heat); }
+.field-block small { color: var(--muted); font: 500 8px/1.5 var(--mono); }
+.setup-callout, .launch-contract {
+  display: grid;
+  gap: 7px;
+  padding: 15px 17px;
+  border-left: 2px solid var(--heat);
+  background: rgba(232, 79, 31, .07);
+}
+.setup-callout strong { font: 600 12px var(--display); text-transform: uppercase; }
+.setup-callout span, .launch-contract p {
+  margin: 0;
+  color: var(--bone-2);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.setup-divider { display: flex; align-items: center; gap: 14px; color: var(--muted); font: 600 7px var(--mono); letter-spacing: .1em; }
+.setup-divider::before, .setup-divider::after { content: ""; height: 1px; flex: 1; background: var(--line); }
+.setup-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 5px; }
+.setup-actions > button, .text-action {
+  min-height: 42px;
+  padding: 0 17px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  background: transparent;
+  color: var(--bone);
+  cursor: pointer;
+  font: 600 8px var(--mono);
+  letter-spacing: .09em;
+  text-transform: uppercase;
+}
+.venue-key-panel {
+  display: grid;
+  gap: 10px;
+  padding: 19px;
+  border: 1px solid var(--heat);
+  background: var(--ink);
+}
+.venue-key-panel strong {
+  overflow-wrap: anywhere;
+  color: var(--heat);
+  font: 600 15px/1.5 var(--mono);
+  user-select: text;
+}
+.venue-key-panel p { margin: 0; color: var(--bone-2); font-size: 11px; line-height: 1.6; }
+.venue-key-panel .text-action { justify-self: start; min-height: 30px; padding: 0; border: 0; color: var(--heat); }
+
 @keyframes route { 0% { transform: translateX(-100%); opacity: 0; } 15% { opacity: 1; } 75% { opacity: 1; } 100% { transform: translateX(500%); opacity: 0; } }
 @keyframes blink { 50% { opacity: .25; } }
 
@@ -417,6 +528,11 @@ button:disabled { cursor: not-allowed; opacity: .38; }
   .remote-run button { flex: 1; }
   .authorization-card { padding: 30px 22px; }
   .authorization-steps { grid-template-columns: 1fr; }
+  .arena-setup-card { padding: 30px 22px; }
+  .setup-progress { grid-template-columns: 1fr; gap: 7px; }
+  .setup-progress i { display: none; }
+  .field-grid { grid-template-columns: 1fr; }
+  .setup-actions { align-items: stretch; flex-direction: column; }
 }
 
 @media (prefers-reduced-motion: reduce) {

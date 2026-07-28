@@ -112,6 +112,13 @@ struct RotateRequest<'a> {
     device_proof: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ForkRequest {
+    protocol: &'static str,
+    nonce: String,
+    device_proof: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceAuthorizationClient {
     origin: Url,
@@ -250,6 +257,44 @@ impl DeviceAuthorizationClient {
                 refresh_token: refresh_token.as_str(),
                 signing_public_key: identity.public_key(),
                 device_proof: identity.sign_bytes(refresh_token.as_bytes()),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<TokenResponse>()
+            .await?;
+        if response.access_token.is_empty() || response.refresh_token.is_empty() {
+            return Err(DeviceAuthorizationError::Response);
+        }
+        Ok(DeviceTokens {
+            device_id: response.device_id,
+            access_token: Zeroizing::new(response.access_token),
+            refresh_token: Zeroizing::new(response.refresh_token),
+            access_expires_at: response.access_expires_at,
+        })
+    }
+
+    pub async fn fork(
+        &self,
+        access_token: &Zeroizing<String>,
+        identity: &DeviceIdentity,
+    ) -> Result<DeviceTokens, DeviceAuthorizationError> {
+        if access_token.is_empty() {
+            return Err(DeviceAuthorizationError::Response);
+        }
+        let endpoint = self
+            .origin
+            .join("/api/v1/harness/device-tokens/fork")
+            .map_err(|_| DeviceAuthorizationError::Origin)?;
+        let nonce = Uuid::new_v4().to_string();
+        let response = self
+            .client
+            .post(endpoint)
+            .bearer_auth(access_token.as_str())
+            .json(&ForkRequest {
+                protocol: HARNESS_PROTOCOL_V1,
+                device_proof: identity.sign_bytes(nonce.as_bytes()),
+                nonce,
             })
             .send()
             .await?
