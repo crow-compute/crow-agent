@@ -4,6 +4,8 @@ import { App, arenaLaunchFailure, parseHandoffSnapshot } from "./App";
 
 const harnessMock = vi.hoisted(() => ({
   authorized: false,
+  daemon: "ready",
+  activeRun: null as string | null,
   arenas: [] as Array<Record<string, unknown>>,
 }));
 
@@ -14,8 +16,8 @@ vi.mock("./tauri", async () => {
     getAgentStatus: async () => ({
       protocol: "crow.harness.v1",
       executionBoundary: "local_device",
-      daemon: "ready",
-      activeRun: null,
+      daemon: harnessMock.daemon,
+      activeRun: harnessMock.activeRun,
       deviceAuthorized: harnessMock.authorized,
     }),
     getPublicArenas: async () => ({ arenas: harnessMock.arenas }),
@@ -27,6 +29,8 @@ vi.mock("./tauri", async () => {
 describe("Crow Agent shell", () => {
   afterEach(() => {
     harnessMock.authorized = false;
+    harnessMock.daemon = "ready";
+    harnessMock.activeRun = null;
     harnessMock.arenas = [];
   });
 
@@ -47,6 +51,15 @@ describe("Crow Agent shell", () => {
     screen.getByRole("button", { name: /Paper arenas/ }).click();
     expect(await screen.findByRole("heading", { name: "PAPER ARENAS" })).toBeInTheDocument();
     expect(screen.getByText("No arena manifest is open.")).toBeInTheDocument();
+  });
+
+  it("does not present an idle paused companion as an active run", async () => {
+    harnessMock.authorized = true;
+    harnessMock.daemon = "paused";
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "Ready when you are" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeDisabled();
   });
 
   it("opens the immutable agent workflow from an enrollable arena", async () => {

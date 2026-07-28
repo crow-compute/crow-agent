@@ -308,7 +308,8 @@ export function App() {
     () => remote.runs.filter((run) => run.status === "running" || run.status === "paused"),
     [remote.runs],
   );
-  const localLive = status.daemon === "running" || status.daemon === "paused";
+  const localLive = Boolean(status.activeRun)
+    && (status.daemon === "running" || status.daemon === "paused");
   const readiness = [
     { label: "Device", value: status.deviceAuthorized ? "Approved" : "Approval required", ready: status.deviceAuthorized },
     { label: "Runtime", value: status.daemon, ready: status.daemon !== "stopped" && status.daemon !== "connecting" },
@@ -432,14 +433,14 @@ export function App() {
                     <>
                       <button
                         type="button"
-                        disabled={status.daemon !== "running" || Boolean(localBusy)}
+                        disabled={!status.activeRun || status.daemon !== "running" || Boolean(localBusy)}
                         onClick={() => void controlLocal("pause")}
                       >
                         Pause
                       </button>
                       <button
                         type="button"
-                        disabled={status.daemon !== "paused" || Boolean(localBusy)}
+                        disabled={!status.activeRun || status.daemon !== "paused" || Boolean(localBusy)}
                         onClick={() => void controlLocal("resume")}
                       >
                         Resume
@@ -447,7 +448,7 @@ export function App() {
                       <button
                         className="danger-action"
                         type="button"
-                        disabled={!localLive || Boolean(localBusy)}
+                        disabled={!status.activeRun || !localLive || Boolean(localBusy)}
                         onClick={() => void controlLocal("stop")}
                       >
                         Stop

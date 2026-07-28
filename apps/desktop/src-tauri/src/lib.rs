@@ -200,6 +200,7 @@ struct DesktopState {
     pending_authorization: Mutex<Option<DeviceAuthorizationSession>>,
     command_nonce: Mutex<()>,
     companion_nonce: Mutex<u64>,
+    companion_request_lock: AsyncMutex<()>,
     companion_credentials: Mutex<Option<Arc<CompanionCredentials>>>,
     companion_credentials_unavailable: AtomicBool,
     companion_child: Mutex<Option<CommandChild>>,
@@ -220,6 +221,7 @@ impl DesktopState {
             pending_authorization: Mutex::new(None),
             command_nonce: Mutex::new(()),
             companion_nonce: Mutex::new(0),
+            companion_request_lock: AsyncMutex::new(()),
             companion_credentials: Mutex::new(None),
             companion_credentials_unavailable: AtomicBool::new(false),
             companion_child: Mutex::new(None),
@@ -283,10 +285,21 @@ impl DesktopState {
     }
 
     async fn device_tokens(&self) -> Result<Arc<DeviceTokens>, DesktopError> {
+        // Gate every background API poll on one cached authorization check so
+        // concurrent startup requests cannot each trigger Keychain UI.
+        if !self.device_authorized() {
+            return Err(DesktopError::NoAuthorization);
+        }
         if self.device_tokens_unavailable.load(Ordering::SeqCst) {
             return Err(DesktopError::Credential);
         }
         let mut slot = self.device_tokens.lock().await;
+        // Requests can pass the first check before one of them acquires this
+        // lock. Recheck after serialization so one denial suppresses queued
+        // and subsequent credential reads.
+        if self.device_tokens_unavailable.load(Ordering::SeqCst) {
+            return Err(DesktopError::Credential);
+        }
         if let Some(tokens) = slot.as_ref()
             && tokens.access_expires_at > OffsetDateTime::now_utc() + time::Duration::minutes(1)
         {
@@ -409,6 +422,12 @@ impl DesktopState {
         &self,
         action: CompanionActionV1,
     ) -> Result<CompanionResponseV1, DesktopError> {
+        // Nonces are ordered by issuance, so the matching IPC requests must
+        // remain ordered through delivery and response verification as well.
+        // The WebView status poll can overlap a user command or authorization
+        // refresh; without this lock, nonce N+1 may reach the daemon before N
+        // and cause the earlier request to fail closed as a replay.
+        let _request_guard = self.companion_request_lock.lock().await;
         let credentials = self.companion_credentials()?;
         let nonce = next_companion_nonce(&self.companion_nonce)?;
         let request = CompanionRequestV1::sign(&credentials.secret, nonce, action)
@@ -984,9 +1003,11 @@ fn store_tokens(tokens: &DeviceTokens) -> Result<(), DesktopError> {
 }
 
 async fn load_or_rotate_desktop_tokens() -> Result<DeviceTokens, DesktopError> {
-    if let (Ok(access_token), Ok(refresh_token), Ok(device_id), Ok(expires_at)) = (
+    // Load the refresh token first and short-circuit when access is denied. A
+    // tuple containing all four reads would evaluate every Keychain request.
+    let refresh_token = Zeroizing::new(load_password(REFRESH_TOKEN_ACCOUNT)?);
+    if let (Ok(access_token), Ok(device_id), Ok(expires_at)) = (
         load_password(ACCESS_TOKEN_ACCOUNT),
-        load_password(REFRESH_TOKEN_ACCOUNT),
         load_password(DEVICE_ID_ACCOUNT),
         load_password(ACCESS_EXPIRES_AT_ACCOUNT),
     ) && let (Ok(device_id), Ok(timestamp)) =
@@ -997,11 +1018,10 @@ async fn load_or_rotate_desktop_tokens() -> Result<DeviceTokens, DesktopError> {
         return Ok(DeviceTokens {
             device_id,
             access_token: Zeroizing::new(access_token),
-            refresh_token: Zeroizing::new(refresh_token),
+            refresh_token,
             access_expires_at,
         });
     }
-    let refresh_token = Zeroizing::new(load_password(REFRESH_TOKEN_ACCOUNT)?);
     if !refresh_token.starts_with("crow_device_refresh_") {
         return Err(DesktopError::Credential);
     }
@@ -1469,5 +1489,20 @@ mod tests {
             next_companion_nonce(&nonce).map_err(|error| error.code()),
             Ok(2)
         );
+    }
+
+    #[tokio::test]
+    async fn denied_authorization_suppresses_background_credential_reads() {
+        let state = DesktopState::new();
+        *state
+            .authorization_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(false);
+
+        assert!(matches!(
+            state.device_tokens().await,
+            Err(DesktopError::NoAuthorization)
+        ));
+        assert!(state.device_tokens.lock().await.is_none());
     }
 }
