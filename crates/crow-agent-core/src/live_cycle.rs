@@ -179,6 +179,78 @@ pub fn store_live_risk_state(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn reconcile_live_state<S, V>(
+    journal: &mut EncryptedJournal,
+    sink: &S,
+    identity: &DeviceIdentity,
+    arena_id: Uuid,
+    run_id: Uuid,
+    execution_account: &str,
+    venue: &V,
+    risk: &mut LiveRiskState,
+) -> Result<String, LiveCycleError>
+where
+    S: RunEventSink,
+    V: LiveVenue,
+{
+    let reconcile_at = unix_milliseconds(OffsetDateTime::now_utc())?;
+    let fills = venue
+        .fills_since(execution_account, risk.last_reconciliation_ms, reconcile_at)
+        .await?;
+    let funding = venue
+        .funding_since(execution_account, risk.last_reconciliation_ms, reconcile_at)
+        .await?;
+    let account = venue.account_snapshot(execution_account).await?;
+    validate_account_policy(&account)?;
+    risk.last_reconciliation_ms = reconcile_at;
+    update_risk_state(risk, &account, OffsetDateTime::now_utc().date());
+
+    let mut writer = DurableRunEventWriter::new(journal, sink, identity, arena_id, run_id);
+    writer
+        .append(
+            None,
+            "fill",
+            json!({"fills": fills, "source": "session_reconciliation"}),
+            &Value::Null,
+        )
+        .await?;
+    writer
+        .append(
+            None,
+            "funding",
+            json!({"funding": funding, "source": "session_reconciliation"}),
+            &Value::Null,
+        )
+        .await?;
+    writer
+        .append(
+            None,
+            "reconciliation",
+            json!({
+                "source": "session_reconciliation",
+                "venue_time_ms": account.venue_time_ms,
+                "positions": account.positions,
+            }),
+            &Value::Null,
+        )
+        .await?;
+    let final_event = writer
+        .append(
+            None,
+            "portfolio_snapshot",
+            json!({
+                "equity_micro_usdc": account.equity_micro_usdc,
+                "venue_time_ms": account.venue_time_ms,
+                "positions": account.positions,
+            }),
+            &Value::Null,
+        )
+        .await?;
+    store_live_risk_state_with_writer(&writer, run_id, risk)?;
+    Ok(final_event.event_sha256)
+}
+
 fn store_live_risk_state_with_writer<S>(
     writer: &DurableRunEventWriter<'_, S>,
     run_id: Uuid,
@@ -506,7 +578,81 @@ mod tests {
     use super::*;
     use crate::PositionSnapshot;
     use crow_agent_protocol::ALLOWED_SYMBOLS;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    #[derive(Debug)]
+    struct ReconciliationVenue {
+        account: AccountSnapshot,
+    }
+
+    #[async_trait]
+    impl LiveVenue for ReconciliationVenue {
+        async fn account_snapshot(
+            &self,
+            _execution_account: &str,
+        ) -> Result<AccountSnapshot, HyperliquidError> {
+            Ok(self.account.clone())
+        }
+
+        async fn market_snapshots(
+            &self,
+            _books: Vec<BookSnapshot>,
+            _now_ms: u64,
+        ) -> Result<BTreeMap<String, MarketSnapshot>, HyperliquidError> {
+            unreachable!("market snapshots are not part of session reconciliation")
+        }
+
+        async fn recent_candles(
+            &self,
+            _start_time_ms: u64,
+            _end_time_ms: u64,
+        ) -> Result<Value, HyperliquidError> {
+            unreachable!("candles are not part of session reconciliation")
+        }
+
+        async fn submit_ioc(
+            &self,
+            _order: &OrderDecision,
+            _client_order_id: &str,
+        ) -> Result<VenueSubmission, HyperliquidError> {
+            unreachable!("orders are not part of session reconciliation")
+        }
+
+        async fn fills_since(
+            &self,
+            _execution_account: &str,
+            start_time_ms: u64,
+            _end_time_ms: u64,
+        ) -> Result<Value, HyperliquidError> {
+            Ok(json!([{"start_time_ms": start_time_ms}]))
+        }
+
+        async fn funding_since(
+            &self,
+            _execution_account: &str,
+            start_time_ms: u64,
+            _end_time_ms: u64,
+        ) -> Result<Value, HyperliquidError> {
+            Ok(json!([{"start_time_ms": start_time_ms}]))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ReconciliationSink {
+        events: Mutex<Vec<crow_agent_protocol::RunEventEnvelopeV1>>,
+    }
+
+    #[async_trait]
+    impl RunEventSink for ReconciliationSink {
+        async fn append_event(
+            &self,
+            event: &crow_agent_protocol::RunEventEnvelopeV1,
+        ) -> Result<String, ()> {
+            self.events.lock().map_err(|_| ())?.push(event.clone());
+            Ok(format!("receipt-{}", event.event_id))
+        }
+    }
 
     #[test]
     fn risk_state_is_encrypted_and_recovers_without_reset() -> Result<(), Box<dyn std::error::Error>>
@@ -550,5 +696,62 @@ mod tests {
             positions: BTreeMap::from([(ALLOWED_SYMBOLS[0].into(), position)]),
         };
         assert!(validate_account_policy(&account).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_reconciliation_closes_an_inflight_order_gap_before_next_cycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let mut journal =
+            EncryptedJournal::open(&directory.path().join("journal.db"), [43_u8; 32])?;
+        let identity = DeviceIdentity::generate();
+        let arena_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let mut risk = LiveRiskState {
+            trading_day: OffsetDateTime::now_utc().date(),
+            trading_day_start_equity_micro_usdc: 1_000_000,
+            peak_equity_micro_usdc: 1_000_000,
+            orders_today: 1,
+            last_reconciliation_ms: 42,
+        };
+        let venue = ReconciliationVenue {
+            account: AccountSnapshot {
+                venue_time_ms: 99,
+                equity_micro_usdc: 1_100_000,
+                withdrawable_micro_usdc: 1_100_000,
+                positions: BTreeMap::new(),
+            },
+        };
+        let sink = ReconciliationSink::default();
+
+        let final_hash = reconcile_live_state(
+            &mut journal,
+            &sink,
+            &identity,
+            arena_id,
+            run_id,
+            "0x0000000000000000000000000000000000000042",
+            &venue,
+            &mut risk,
+        )
+        .await?;
+
+        assert!(risk.last_reconciliation_ms > 42);
+        assert_eq!(risk.peak_equity_micro_usdc, 1_100_000);
+        assert_eq!(load_live_risk_state(&journal, run_id)?, Some(risk));
+        assert_eq!(
+            journal.latest_event_state(run_id)?,
+            Some((4, final_hash.clone()))
+        );
+        let events = sink.events.lock().map_err(|_| "poisoned")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["fill", "funding", "reconciliation", "portfolio_snapshot"]
+        );
+        assert_eq!(events[0].payload["fills"][0]["start_time_ms"], 42);
+        Ok(())
     }
 }

@@ -43,7 +43,7 @@ pub use journal::{EncryptedJournal, JournalError};
 pub use live::{DurableRunEventError, DurableRunEventWriter, RunEventSink};
 pub use live_cycle::{
     LiveCycleError, LiveCycleResult, LiveRiskState, LiveVenue, execute_live_cycle,
-    load_live_risk_state, store_live_risk_state,
+    load_live_risk_state, reconcile_live_state, store_live_risk_state,
 };
 pub use policy::{
     MarketState, OrderDecision, PolicyContext, PolicyError, PortfolioState, Proposal, Side,

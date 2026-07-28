@@ -2,7 +2,7 @@ use crate::ExecutionGate;
 use crow_agent_core::{
     DurableRunEventWriter, EncryptedJournal, GatewayClient, HarnessApiClient,
     HyperliquidBookStream, HyperliquidVenue, LiveRiskState, StartHarnessRunV1, execute_live_cycle,
-    load_live_risk_state, store_live_risk_state,
+    load_live_risk_state, reconcile_live_state, store_live_risk_state,
 };
 use crow_agent_protocol::{
     ArenaMode, DeviceIdentity, SignedArenaManifestV1, canonical_json, sha256,
@@ -139,6 +139,17 @@ pub(crate) async fn run_session(
         store_live_risk_state(&journal, run_id, &state)?;
         state
     };
+    reconcile_live_state(
+        &mut journal,
+        &api,
+        identity,
+        manifest.arena_id,
+        run_id,
+        &config.execution_account,
+        &venue,
+        &mut risk,
+    )
+    .await?;
     let mut stream = HyperliquidBookStream::connect_testnet()?;
     let initial = stream.reconcile().await?;
     let mut books = initial
