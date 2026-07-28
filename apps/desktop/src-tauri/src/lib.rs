@@ -533,7 +533,14 @@ async fn get_agent_status(
 async fn unlock_device_credentials(
     state: State<'_, DesktopState>,
 ) -> Result<AuthorizedDevice, String> {
-    if !credential_exists(REFRESH_TOKEN_ACCOUNT) {
+    let has_refresh_token = read_credential_vault(|vault| {
+        Ok(vault
+            .refresh_token
+            .as_ref()
+            .is_some_and(|value| !value.is_empty()))
+    })
+    .map_err(|error| error.code().to_owned())?;
+    if !has_refresh_token {
         return Err(DesktopError::NoAuthorization.code().to_owned());
     }
     if let Ok(mut status) = state.authorization_status.lock() {
@@ -1544,10 +1551,6 @@ fn load_password(account: &str) -> Result<String, DesktopError> {
 
 fn api_origin() -> String {
     std::env::var("CROW_API_ORIGIN").unwrap_or_else(|_| PRODUCTION_API_ORIGIN.into())
-}
-
-fn credential_exists(account: &str) -> bool {
-    load_password(account).is_ok_and(|value| !value.is_empty())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
