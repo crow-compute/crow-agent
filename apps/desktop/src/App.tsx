@@ -13,6 +13,7 @@ import {
   sendLocalCommand,
   sendRemoteCommand,
   startLocalArena,
+  unlockDeviceCredentials,
   type AgentVersionSummary,
   type AgentStatus,
   type DeviceAuthorization,
@@ -169,6 +170,21 @@ export function App() {
       setAuthorization(await beginDeviceAuthorization("Crow desktop"));
     } catch {
       setNotice("Could not start device authorization.");
+    } finally {
+      setAuthorizationBusy(false);
+    }
+  }
+
+  async function unlockCredentials() {
+    setAuthorizationBusy(true);
+    setNotice(null);
+    try {
+      await unlockDeviceCredentials();
+      setStatus(await getAgentStatus());
+      setRemote(await getRemoteState());
+      setNotice("Local credential vault unlocked for this app session.");
+    } catch {
+      setNotice("No current credential vault was unlocked. Authorize this device to create a new one.");
     } finally {
       setAuthorizationBusy(false);
     }
@@ -422,9 +438,14 @@ export function App() {
 
                 <div className="action-row" role="group" aria-label="Local daemon controls">
                   {!status.deviceAuthorized ? (
-                    <button className="primary-action" type="button" disabled={authorizationBusy} onClick={startAuthorization}>
-                      <span>Authorize device</span><b>↗</b>
-                    </button>
+                    <>
+                      <button className="primary-action" type="button" disabled={authorizationBusy} onClick={unlockCredentials}>
+                        <span>Unlock device</span><b>→</b>
+                      </button>
+                      <button type="button" disabled={authorizationBusy} onClick={startAuthorization}>
+                        Authorize new
+                      </button>
+                    </>
                   ) : (
                     <>
                       <button
@@ -541,9 +562,14 @@ export function App() {
                   <h2>Approve the local device</h2>
                   <p>A short browser flow binds this machine’s public keys to your wallet. Private keys stay in the OS credential store.</p>
                 </div>
-                <button className="primary-action" type="button" disabled={authorizationBusy} onClick={startAuthorization}>
-                  <span>Authorize device</span><b>↗</b>
-                </button>
+                <div className="credential-actions">
+                  <button className="primary-action" type="button" disabled={authorizationBusy} onClick={unlockCredentials}>
+                    <span>Unlock device</span><b>→</b>
+                  </button>
+                  <button type="button" disabled={authorizationBusy} onClick={startAuthorization}>
+                    Authorize new
+                  </button>
+                </div>
               </article>
             ) : (
               <div className="device-list">

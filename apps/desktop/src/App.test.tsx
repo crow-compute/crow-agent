@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App, arenaLaunchFailure, parseHandoffSnapshot } from "./App";
 
@@ -7,6 +7,7 @@ const harnessMock = vi.hoisted(() => ({
   daemon: "ready",
   activeRun: null as string | null,
   arenas: [] as Array<Record<string, unknown>>,
+  unlockCalls: 0,
 }));
 
 vi.mock("./tauri", async () => {
@@ -23,6 +24,10 @@ vi.mock("./tauri", async () => {
     getPublicArenas: async () => ({ arenas: harnessMock.arenas }),
     getRemoteState: async () => ({ devices: [], runs: [] }),
     getAgentVersions: async () => ({ versions: [] }),
+    unlockDeviceCredentials: async () => {
+      harnessMock.unlockCalls += 1;
+      return { deviceId: "device", accessExpiresAt: "2026-07-28T00:00:00Z" };
+    },
   };
 });
 
@@ -32,6 +37,14 @@ describe("Crow Agent shell", () => {
     harnessMock.daemon = "ready";
     harnessMock.activeRun = null;
     harnessMock.arenas = [];
+    harnessMock.unlockCalls = 0;
+  });
+
+  it("touches the credential vault only after an explicit unlock", async () => {
+    render(<App />);
+    expect(harnessMock.unlockCalls).toBe(0);
+    screen.getByRole("button", { name: /Unlock device/ }).click();
+    await waitFor(() => expect(harnessMock.unlockCalls).toBe(1));
   });
 
   it("presents the branded local execution command surface", () => {
@@ -43,7 +56,8 @@ describe("Crow Agent shell", () => {
     expect(screen.getByText(/Trade from/i)).toBeInTheDocument();
     expect(screen.getByText(/Secrets never enter the WebView/)).toBeInTheDocument();
     expect(screen.getByText(/Crow receives signed structured evidence/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Authorize device/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Unlock device/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Authorize new/ })).toBeEnabled();
     expect(screen.getByRole("group", { name: "Local daemon controls" })).toBeInTheDocument();
     expect(screen.getByText("Safety ceiling")).toBeInTheDocument();
     expect(screen.getByText("Isolated 1×")).toBeInTheDocument();

@@ -105,6 +105,10 @@ export async function completeDeviceAuthorization(): Promise<AuthorizedDevice> {
   return invoke<AuthorizedDevice>("complete_device_authorization");
 }
 
+export async function unlockDeviceCredentials(): Promise<AuthorizedDevice> {
+  return invoke<AuthorizedDevice>("unlock_device_credentials");
+}
+
 export async function getRemoteState(): Promise<RemoteState> {
   if (!("__TAURI_INTERNALS__" in window)) return { devices: [], runs: [] };
   return invoke<RemoteState>("get_remote_state");

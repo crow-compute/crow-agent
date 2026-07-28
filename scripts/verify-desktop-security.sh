@@ -8,6 +8,7 @@ styles="$repository_root/apps/desktop/src/styles.css"
 font_directory="$repository_root/apps/desktop/src/assets/fonts"
 logo="$repository_root/apps/desktop/src/assets/crow-logo.png"
 desktop_source="$repository_root/apps/desktop/src/App.tsx"
+desktop_rust_source="$repository_root/apps/desktop/src-tauri/src/lib.rs"
 
 grep -Fq '"permissions": ["core:default"]' "$capability"
 if grep -Eq 'shell:|fs:|http:' "$capability"; then
@@ -33,6 +34,21 @@ test "$(shasum -a 256 "$logo" | awk '{print $1}')" = \
   "f6a64613eb8c8391e4401185c4d097ff70a44c4f0d32b6392ed53144685f28fc"
 grep -Fq 'import crowLogo from "./assets/crow-logo.png"' "$desktop_source"
 grep -Fq 'className="brand-logo"' "$desktop_source"
+grep -Fq 'const CREDENTIAL_VAULT_ACCOUNT: &str = "desktop-credential-vault-v1";' \
+  "$desktop_rust_source"
+grep -Fq 'authorization_status: Mutex::new(Some(false))' "$desktop_rust_source"
+grep -Fq '"unlock_device_credentials"' \
+  "$repository_root/apps/desktop/src/tauri.ts"
+if test "$(grep -c 'Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_VAULT_ACCOUNT)' \
+  "$desktop_rust_source")" -ne 2; then
+  echo "desktop must access exactly one OS credential-store account" >&2
+  exit 1
+fi
+if grep 'Entry::new(CREDENTIAL_SERVICE' "$desktop_rust_source" |
+  grep -Fv 'CREDENTIAL_VAULT_ACCOUNT' >/dev/null; then
+  echo "desktop accesses a legacy per-secret credential-store account" >&2
+  exit 1
+fi
 if grep -Fq 'crow-mark.png' "$desktop_source"; then
   echo "desktop references the superseded symbol-only mark" >&2
   exit 1
