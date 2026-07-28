@@ -20,7 +20,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -58,7 +58,7 @@ const COMPANION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 const MAX_DESKTOP_REFRESH_TOKEN_BYTES: usize = 512;
 const CREDENTIAL_VAULT_VERSION: u8 = 1;
 
-#[derive(Debug, Default, Serialize, Deserialize, Zeroize)]
+#[derive(Default, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 struct DesktopCredentialVaultV1 {
     version: u8,
@@ -72,6 +72,30 @@ struct DesktopCredentialVaultV1 {
     companion_secret: Option<String>,
     journal_key: Option<String>,
     hyperliquid_api_wallet_key: Option<String>,
+}
+
+impl fmt::Debug for DesktopCredentialVaultV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopCredentialVaultV1")
+            .field("version", &self.version)
+            .field("signing_seed_present", &self.signing_seed.is_some())
+            .field(
+                "encryption_secret_present",
+                &self.encryption_secret.is_some(),
+            )
+            .field("access_token_present", &self.access_token.is_some())
+            .field("refresh_token_present", &self.refresh_token.is_some())
+            .field("device_id_present", &self.device_id.is_some())
+            .field("controller_nonce", &self.controller_nonce)
+            .field("companion_secret_present", &self.companion_secret.is_some())
+            .field("journal_key_present", &self.journal_key.is_some())
+            .field(
+                "hyperliquid_api_wallet_key_present",
+                &self.hyperliquid_api_wallet_key.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1614,5 +1638,19 @@ mod tests {
             Err(DesktopError::NoAuthorization)
         ));
         assert!(state.device_tokens.lock().await.is_none());
+    }
+
+    #[test]
+    fn credential_vault_debug_redacts_every_secret() {
+        let mut vault = DesktopCredentialVaultV1::default();
+        vault.version = CREDENTIAL_VAULT_VERSION;
+        vault.signing_seed = Some("signing-sentinel".into());
+        vault.refresh_token = Some("refresh-sentinel".into());
+        vault.hyperliquid_api_wallet_key = Some("wallet-sentinel".into());
+        let debug = format!("{vault:?}");
+        assert!(!debug.contains("signing-sentinel"));
+        assert!(!debug.contains("refresh-sentinel"));
+        assert!(!debug.contains("wallet-sentinel"));
+        assert!(debug.contains("signing_seed_present: true"));
     }
 }
