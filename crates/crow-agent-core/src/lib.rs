@@ -1,6 +1,7 @@
 //! Security-sensitive local execution primitives shared by the daemon and Tauri shell.
 
 pub mod backtest;
+pub mod companion;
 pub mod crypto;
 pub mod dataset;
 pub mod device_auth;
@@ -13,6 +14,10 @@ pub mod scoring;
 
 pub use backtest::{
     BacktestEngine, BacktestError, BacktestResult, CandleV1, EquityPoint, ScheduledProposal,
+};
+pub use companion::{
+    CompanionActionV1, CompanionIpcError, CompanionRequestV1, CompanionResponseV1,
+    MAX_COMPANION_MESSAGE_BYTES,
 };
 pub use crypto::{BundleCiphertext, DeviceEncryptionKey, WrappedBundleKey};
 pub use dataset::{DatasetError, DatasetPackage, read_verified_dataset, write_signed_dataset};

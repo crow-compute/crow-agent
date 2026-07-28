@@ -35,6 +35,16 @@ persisted before the next relay session. The journal key, Ed25519 seed, X25519
 secret, and Hyperliquid Testnet API-wallet key are separate
 `LoadCredentialEncrypted` inputs.
 
+The macOS and Windows desktop application embeds the same `crow-agentd`
+binary as a background companion. Rust starts it directly from the signed app
+bundle and passes a separate 32-byte IPC key through the child's stdin. The key
+is generated locally, stored in the OS credential store, and never enters the
+React WebView. Status and pause/resume/stop requests use bounded canonical JSON
+messages authenticated with HMAC-SHA256 over a cross-platform local
+socket/named pipe. Nonces persist in the credential store so replayed commands
+remain invalid across controller restarts. Closing the desktop window hides it
+without terminating the app or companion.
+
 For a headless host, generate the three device credentials locally with
 `openssl rand 32 | systemd-creds encrypt --name=<credential> - <destination>`.
 Capture the 32-byte Hyperliquid Testnet API-wallet key through a hidden prompt
@@ -90,6 +100,10 @@ embedded in `tauri.conf.json`; its private key exists only as the protected
 `TAURI_SIGNING_PRIVATE_KEY` release-environment secret. The attest job verifies
 each downloaded macOS and Windows updater artifact against that public key
 before signing the cross-platform release manifest.
+
+The WebView capability remains `core:default` only: it receives no generic
+shell, filesystem, or HTTP permissions. Bundled companion execution is invoked
+only by trusted Rust code.
 
 Local release evidence can be reproduced with:
 

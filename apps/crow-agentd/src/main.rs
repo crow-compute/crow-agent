@@ -1,18 +1,24 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use crow_agent_core::{
-    BacktestEngine, DeviceAuthorizationClient, DeviceAuthorizationError, DeviceEncryptionKey,
-    EncryptedJournal, ScheduledProposal, read_verified_dataset,
+    BacktestEngine, CompanionActionV1, CompanionIpcError, CompanionRequestV1, CompanionResponseV1,
+    DeviceAuthorizationClient, DeviceAuthorizationError, DeviceEncryptionKey, EncryptedJournal,
+    MAX_COMPANION_MESSAGE_BYTES, ScheduledProposal, read_verified_dataset,
 };
 use crow_agent_protocol::{
     DatasetManifestV1, DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1,
     SignedArenaManifestV1, canonical_json, sha256,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
+use interprocess::local_socket::{
+    GenericFilePath, GenericNamespaced, ListenerOptions, Name,
+    tokio::{Stream as LocalSocketStream, prelude::*},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -22,6 +28,7 @@ use std::{
 };
 use thiserror::Error;
 use time::OffsetDateTime;
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{
@@ -82,6 +89,11 @@ enum Command {
         duration_seconds: u64,
         #[arg(long, default_value_t = 900)]
         interval_seconds: u64,
+    },
+    /// Run as the desktop application's authenticated background companion.
+    Companion {
+        #[arg(long)]
+        ipc_name: String,
     },
     /// Maintain the outbound Crow control connection.
     Run { config: PathBuf },
@@ -212,6 +224,8 @@ enum DaemonError {
     AuthorizationExpired,
     #[error("remote command is invalid")]
     RemoteCommand,
+    #[error("desktop companion authentication failed")]
+    Companion(#[from] CompanionIpcError),
     #[error("headless component soak failed")]
     Soak(#[from] soak::SoakError),
 }
@@ -309,6 +323,9 @@ async fn main() -> Result<(), DaemonError> {
             .await?;
             println!("{}", serde_json::to_string(&result)?);
         }
+        Command::Companion { ipc_name } => {
+            run_companion(&ipc_name).await?;
+        }
         Command::Run { config } => {
             let config = serde_json::from_slice::<DaemonConfig>(&fs::read(config)?)?;
             let identity = load_identity()?;
@@ -321,6 +338,94 @@ async fn main() -> Result<(), DaemonError> {
         }
     }
     Ok(())
+}
+
+fn local_socket_name(label: &str) -> Result<Name<'static>, std::io::Error> {
+    if GenericNamespaced::is_supported() {
+        label
+            .to_ns_name::<GenericNamespaced>()
+            .map(Name::into_owned)
+    } else {
+        std::env::temp_dir()
+            .join(format!("{label}.sock"))
+            .to_fs_name::<GenericFilePath>()
+            .map(Name::into_owned)
+    }
+}
+
+async fn run_companion(ipc_name: &str) -> Result<(), DaemonError> {
+    let mut secret = Zeroizing::new([0_u8; 32]);
+    std::io::stdin().lock().read_exact(secret.as_mut())?;
+    let name = local_socket_name(ipc_name)?;
+    let listener = ListenerOptions::new()
+        .name(name)
+        .try_overwrite(true)
+        .create_tokio()?;
+    let execution_gate = ExecutionGate::new();
+    let mut highest_nonce = 0_u64;
+    info!("desktop companion ready on authenticated local IPC");
+
+    loop {
+        let connection = listener.accept().await?;
+        if let Err(error) =
+            handle_companion_connection(connection, &secret, &mut highest_nonce, &execution_gate)
+                .await
+        {
+            warn!(error = %error, "rejected desktop companion request");
+        }
+    }
+}
+
+async fn handle_companion_connection(
+    connection: LocalSocketStream,
+    secret: &[u8; 32],
+    highest_nonce: &mut u64,
+    execution_gate: &ExecutionGate,
+) -> Result<(), DaemonError> {
+    let reader = BufReader::new(&connection);
+    let mut reader = reader.take((MAX_COMPANION_MESSAGE_BYTES + 1) as u64);
+    let mut raw = String::new();
+    let bytes_read = reader.read_line(&mut raw).await?;
+    if bytes_read == 0 || bytes_read > MAX_COMPANION_MESSAGE_BYTES {
+        return Err(DaemonError::RemoteCommand);
+    }
+    let request = serde_json::from_str::<CompanionRequestV1>(raw.trim_end())?;
+    let response = apply_companion_request(&request, secret, highest_nonce, execution_gate)?;
+    let mut encoded = serde_json::to_vec(&response)?;
+    encoded.push(b'\n');
+    let mut sender = &connection;
+    sender.write_all(&encoded).await?;
+    Ok(())
+}
+
+fn apply_companion_request(
+    request: &CompanionRequestV1,
+    secret: &[u8; 32],
+    highest_nonce: &mut u64,
+    execution_gate: &ExecutionGate,
+) -> Result<CompanionResponseV1, DaemonError> {
+    request.verify(secret)?;
+    if request.nonce <= *highest_nonce {
+        return Err(DaemonError::RemoteCommand);
+    }
+    *highest_nonce = request.nonce;
+
+    let accepted = match request.action {
+        CompanionActionV1::Status => true,
+        CompanionActionV1::Pause => execution_gate.apply(RemoteAction::Pause),
+        CompanionActionV1::Resume => execution_gate.apply(RemoteAction::Resume),
+        CompanionActionV1::Stop => execution_gate.apply(RemoteAction::Stop),
+    };
+    CompanionResponseV1::sign(
+        secret,
+        request.request_id,
+        request.nonce,
+        accepted,
+        execution_gate.label(),
+        None,
+        (!accepted).then(|| "invalid_transition".into()),
+    )
+    .map_err(DaemonError::from)
 }
 
 async fn authorize_device(
@@ -672,6 +777,25 @@ mod tests {
             .is_err()
         );
         assert_eq!(restarted_gate.label(), "paused");
+        Ok(())
+    }
+
+    #[test]
+    fn companion_ipc_authenticates_and_rejects_replay() -> Result<(), Box<dyn std::error::Error>> {
+        let secret = [19_u8; 32];
+        let gate = ExecutionGate::new();
+        let mut highest_nonce = 0;
+        let request = CompanionRequestV1::sign(&secret, 1, CompanionActionV1::Resume)?;
+        let response = apply_companion_request(&request, &secret, &mut highest_nonce, &gate)?;
+        response.verify(&secret, &request)?;
+        assert!(response.accepted);
+        assert_eq!(response.execution_state, "running");
+        assert!(apply_companion_request(&request, &secret, &mut highest_nonce, &gate).is_err());
+
+        let mut tampered = CompanionRequestV1::sign(&secret, 2, CompanionActionV1::Pause)?;
+        tampered.action = CompanionActionV1::Stop;
+        assert!(apply_companion_request(&tampered, &secret, &mut highest_nonce, &gate).is_err());
+        assert_eq!(highest_nonce, 1);
         Ok(())
     }
 }

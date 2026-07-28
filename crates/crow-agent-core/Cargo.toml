@@ -19,6 +19,7 @@ ed25519-dalek.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 hkdf.workspace = true
+hmac.workspace = true
 hypersdk.workspace = true
 parquet.workspace = true
 rand_core.workspace = true

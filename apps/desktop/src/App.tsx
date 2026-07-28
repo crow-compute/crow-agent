@@ -4,6 +4,7 @@ import {
   completeDeviceAuthorization,
   getAgentStatus,
   getRemoteState,
+  sendLocalCommand,
   sendRemoteCommand,
   type AgentStatus,
   type DeviceAuthorization,
@@ -25,12 +26,16 @@ export function App() {
   const [authorizationBusy, setAuthorizationBusy] = useState(false);
   const [remote, setRemote] = useState<RemoteState>({ devices: [], runs: [] });
   const [remoteBusy, setRemoteBusy] = useState("");
+  const [localBusy, setLocalBusy] = useState("");
 
   useEffect(() => {
-    void getAgentStatus().then((next) => {
+    const refresh = () => void getAgentStatus().then((next) => {
       setStatus(next);
       if (next.deviceAuthorized) void getRemoteState().then(setRemote).catch(() => undefined);
     });
+    refresh();
+    const interval = window.setInterval(refresh, 2_000);
+    return () => window.clearInterval(interval);
   }, []);
 
   async function startAuthorization() {
@@ -82,6 +87,18 @@ export function App() {
     }
   }
 
+  async function controlLocal(action: "pause" | "resume" | "stop") {
+    setLocalBusy(action);
+    setAuthorizationError(null);
+    try {
+      setStatus(await sendLocalCommand(action));
+    } catch {
+      setAuthorizationError(`Local ${action} was not accepted.`);
+    } finally {
+      setLocalBusy("");
+    }
+  }
+
   const activeRemoteRuns = remote.runs.filter(
     (run) => run.status === "running" || run.status === "paused",
   );
@@ -113,6 +130,32 @@ export function App() {
           <p className="label">Runtime</p>
           <h2>Local daemon</h2>
           <p>Background execution continues independently of this window.</p>
+          <div className="local-controls" role="group" aria-label="Local daemon controls">
+            <button
+              type="button"
+              disabled={status.daemon !== "running" || Boolean(localBusy)}
+              onClick={() => void controlLocal("pause")}
+            >
+              Pause
+            </button>
+            <button
+              type="button"
+              disabled={status.daemon !== "paused" || Boolean(localBusy)}
+              onClick={() => void controlLocal("resume")}
+            >
+              Resume
+            </button>
+            <button
+              type="button"
+              disabled={
+                (status.daemon !== "running" && status.daemon !== "paused") ||
+                Boolean(localBusy)
+              }
+              onClick={() => void controlLocal("stop")}
+            >
+              Stop
+            </button>
+          </div>
           {authorization ? (
             <div className="authorization">
               <span>Enter this code in the browser</span>

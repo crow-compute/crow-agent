@@ -90,6 +90,15 @@ article button:disabled { opacity: 0.62; }
 }
 .authorization button { margin-top: 4px; }
 .error { color: #fca5a5; font-size: 13px; margin: 10px 0 0; }
+.local-controls {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0 18px;
+}
+.local-controls button {
+  flex: 1;
+  margin: 0;
+}
 
 .remote-runs {
   display: grid;

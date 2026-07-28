@@ -7,6 +7,7 @@
 /apps/desktop/src-tauri/gen/
 /apps/desktop/src-tauri/icons/android/
 /apps/desktop/src-tauri/icons/ios/
+/apps/desktop/src-tauri/binaries/
 /release/
 *.tsbuildinfo
 /apps/desktop/vite.config.js

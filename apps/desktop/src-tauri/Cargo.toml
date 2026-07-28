@@ -19,12 +19,16 @@ tauri-build = { version = "2.5.1", features = [] }
 base64.workspace = true
 crow-agent-core = { version = "=0.1.0", path = "../../../crates/crow-agent-core" }
 crow-agent-protocol = { version = "=0.1.0", path = "../../../crates/crow-agent-protocol" }
+hex.workspace = true
+interprocess.workspace = true
 keyring.workspace = true
 open.workspace = true
+rand_core.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.9.3", features = [] }
+tauri-plugin-shell = "=2.3.5"
 time.workspace = true
 tokio.workspace = true
 uuid.workspace = true

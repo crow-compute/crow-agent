@@ -54,6 +54,12 @@ export async function getAgentStatus(): Promise<AgentStatus> {
   return invoke<AgentStatus>("get_agent_status");
 }
 
+export async function sendLocalCommand(
+  action: "pause" | "resume" | "stop",
+): Promise<AgentStatus> {
+  return invoke<AgentStatus>("send_local_command", { action });
+}
+
 export async function beginDeviceAuthorization(
   deviceLabel: string,
 ): Promise<DeviceAuthorization> {

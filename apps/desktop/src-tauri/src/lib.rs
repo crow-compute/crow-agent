@@ -1,16 +1,29 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use crow_agent_core::{
-    DeviceAuthorizationClient, DeviceAuthorizationError, DeviceAuthorizationSession,
-    DeviceEncryptionKey, DeviceTokens,
+    CompanionActionV1, CompanionRequestV1, CompanionResponseV1, DeviceAuthorizationClient,
+    DeviceAuthorizationError, DeviceAuthorizationSession, DeviceEncryptionKey, DeviceTokens,
+    MAX_COMPANION_MESSAGE_BYTES,
 };
-use crow_agent_protocol::{DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1};
+use crow_agent_protocol::{
+    DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1, sha256,
+};
+use interprocess::local_socket::{
+    GenericFilePath, GenericNamespaced, Name,
+    tokio::{Stream as LocalSocketStream, prelude::*},
+};
 use keyring::{Entry, Error as KeyringError};
+use rand_core::{OsRng, RngCore as _};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::sync::Mutex;
-use tauri::State;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use tauri::{Manager as _, State};
+use tauri_plugin_shell::{ShellExt as _, process::CommandChild};
 use time::OffsetDateTime;
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -21,14 +34,17 @@ const ACCESS_TOKEN_ACCOUNT: &str = "device-access-token";
 const REFRESH_TOKEN_ACCOUNT: &str = "device-refresh-token";
 const DEVICE_ID_ACCOUNT: &str = "device-id";
 const CONTROLLER_NONCE_ACCOUNT: &str = "controller-nonce";
+const COMPANION_SECRET_ACCOUNT: &str = "companion-ipc-secret";
+const COMPANION_NONCE_ACCOUNT: &str = "companion-ipc-nonce";
 const PRODUCTION_API_ORIGIN: &str = "https://api.crowcompute.ai";
+const COMPANION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentStatus {
     protocol: &'static str,
     execution_boundary: &'static str,
-    daemon: &'static str,
+    daemon: String,
     active_run: Option<String>,
     device_authorized: bool,
 }
@@ -94,6 +110,7 @@ enum DesktopError {
     Browser,
     Network,
     RemoteCommand,
+    Companion,
 }
 
 impl DesktopError {
@@ -105,25 +122,132 @@ impl DesktopError {
             Self::Browser => "browser_open_failed",
             Self::Network => "device_api_unavailable",
             Self::RemoteCommand => "remote_command_rejected",
+            Self::Companion => "local_companion_unavailable",
         }
     }
 }
 
-#[derive(Default)]
 struct DesktopState {
     pending_authorization: Mutex<Option<DeviceAuthorizationSession>>,
     command_nonce: Mutex<()>,
+    companion_nonce: Mutex<()>,
+    companion_secret: Zeroizing<[u8; 32]>,
+    companion_ipc_name: String,
+    companion_child: Mutex<Option<CommandChild>>,
+    companion_spawned: AtomicBool,
+}
+
+impl DesktopState {
+    fn new() -> Result<Self, DesktopError> {
+        let secret = load_or_create_companion_secret()?;
+        let digest = sha256(secret.as_ref());
+        Ok(Self {
+            pending_authorization: Mutex::new(None),
+            command_nonce: Mutex::new(()),
+            companion_nonce: Mutex::new(()),
+            companion_secret: secret,
+            companion_ipc_name: format!("crow-agent-{}", hex::encode(&digest[..12])),
+            companion_child: Mutex::new(None),
+            companion_spawned: AtomicBool::new(false),
+        })
+    }
+
+    fn launch_companion(&self, app: &tauri::AppHandle) -> Result<(), DesktopError> {
+        if self.companion_spawned.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let Ok(command) = app.shell().sidecar("crow-agentd") else {
+            self.companion_spawned.store(false, Ordering::SeqCst);
+            return Err(DesktopError::Companion);
+        };
+        let Ok((mut events, mut child)) = command
+            .args(["companion", "--ipc-name", &self.companion_ipc_name])
+            .spawn()
+        else {
+            self.companion_spawned.store(false, Ordering::SeqCst);
+            return Err(DesktopError::Companion);
+        };
+        if child.write(self.companion_secret.as_ref()).is_err() {
+            let _ = child.kill();
+            self.companion_spawned.store(false, Ordering::SeqCst);
+            return Err(DesktopError::Companion);
+        }
+        let Ok(mut slot) = self.companion_child.lock() else {
+            let _ = child.kill();
+            self.companion_spawned.store(false, Ordering::SeqCst);
+            return Err(DesktopError::Companion);
+        };
+        *slot = Some(child);
+        tauri::async_runtime::spawn(async move { while events.recv().await.is_some() {} });
+        Ok(())
+    }
+
+    async fn companion_request(
+        &self,
+        action: CompanionActionV1,
+    ) -> Result<CompanionResponseV1, DesktopError> {
+        let nonce = {
+            let _guard = self
+                .companion_nonce
+                .lock()
+                .map_err(|_| DesktopError::Companion)?;
+            next_persisted_nonce(COMPANION_NONCE_ACCOUNT)?
+        };
+        let request = CompanionRequestV1::sign(&self.companion_secret, nonce, action)
+            .map_err(|_| DesktopError::Companion)?;
+        tokio::time::timeout(
+            COMPANION_TIMEOUT,
+            send_companion_request(&self.companion_ipc_name, &self.companion_secret, &request),
+        )
+        .await
+        .map_err(|_| DesktopError::Companion)?
+    }
 }
 
 #[tauri::command]
-fn get_agent_status() -> AgentStatus {
-    AgentStatus {
+async fn get_agent_status(state: State<'_, DesktopState>) -> Result<AgentStatus, String> {
+    let response = state
+        .companion_request(CompanionActionV1::Status)
+        .await
+        .ok();
+    Ok(AgentStatus {
         protocol: HARNESS_PROTOCOL_V1,
         execution_boundary: "local_device",
-        daemon: "stopped",
-        active_run: None,
+        daemon: response
+            .as_ref()
+            .map_or_else(|| "stopped".into(), |value| value.execution_state.clone()),
+        active_run: response
+            .and_then(|value| value.active_run)
+            .map(|run_id| run_id.to_string()),
         device_authorized: credential_exists(REFRESH_TOKEN_ACCOUNT),
+    })
+}
+
+#[tauri::command]
+async fn send_local_command(
+    action: String,
+    state: State<'_, DesktopState>,
+) -> Result<AgentStatus, String> {
+    let action = match action.as_str() {
+        "pause" => CompanionActionV1::Pause,
+        "resume" => CompanionActionV1::Resume,
+        "stop" => CompanionActionV1::Stop,
+        _ => return Err(DesktopError::Companion.code().into()),
+    };
+    let response = state
+        .companion_request(action)
+        .await
+        .map_err(|error| error.code().to_owned())?;
+    if !response.accepted {
+        return Err(DesktopError::Companion.code().into());
     }
+    Ok(AgentStatus {
+        protocol: HARNESS_PROTOCOL_V1,
+        execution_boundary: "local_device",
+        daemon: response.execution_state,
+        active_run: response.active_run.map(|run_id| run_id.to_string()),
+        device_authorized: credential_exists(REFRESH_TOKEN_ACCOUNT),
+    })
 }
 
 #[tauri::command]
@@ -398,13 +522,90 @@ async fn device_api<T: DeserializeOwned>(
 }
 
 fn next_controller_nonce() -> Result<u64, DesktopError> {
-    let previous = load_password(CONTROLLER_NONCE_ACCOUNT)
+    next_persisted_nonce(CONTROLLER_NONCE_ACCOUNT)
+}
+
+fn next_persisted_nonce(account: &str) -> Result<u64, DesktopError> {
+    let previous = load_password(account)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let next = previous.checked_add(1).ok_or(DesktopError::RemoteCommand)?;
-    store_password(CONTROLLER_NONCE_ACCOUNT, &next.to_string())?;
+    store_password(account, &next.to_string())?;
     Ok(next)
+}
+
+fn load_or_create_companion_secret() -> Result<Zeroizing<[u8; 32]>, DesktopError> {
+    let entry = Entry::new(CREDENTIAL_SERVICE, COMPANION_SECRET_ACCOUNT)
+        .map_err(|_| DesktopError::Credential)?;
+    match entry.get_secret() {
+        Ok(stored) => {
+            let stored = Zeroizing::new(stored);
+            let secret: [u8; 32] = stored
+                .as_slice()
+                .try_into()
+                .map_err(|_| DesktopError::Credential)?;
+            Ok(Zeroizing::new(secret))
+        }
+        Err(KeyringError::NoEntry) => {
+            let mut secret = Zeroizing::new([0_u8; 32]);
+            OsRng.fill_bytes(secret.as_mut());
+            entry
+                .set_secret(secret.as_ref())
+                .map_err(|_| DesktopError::Credential)?;
+            Ok(secret)
+        }
+        Err(_) => Err(DesktopError::Credential),
+    }
+}
+
+fn local_socket_name(label: &str) -> Result<Name<'static>, DesktopError> {
+    if GenericNamespaced::is_supported() {
+        label
+            .to_ns_name::<GenericNamespaced>()
+            .map(Name::into_owned)
+            .map_err(|_| DesktopError::Companion)
+    } else {
+        std::env::temp_dir()
+            .join(format!("{label}.sock"))
+            .to_fs_name::<GenericFilePath>()
+            .map(Name::into_owned)
+            .map_err(|_| DesktopError::Companion)
+    }
+}
+
+async fn send_companion_request(
+    ipc_name: &str,
+    secret: &[u8; 32],
+    request: &CompanionRequestV1,
+) -> Result<CompanionResponseV1, DesktopError> {
+    let name = local_socket_name(ipc_name)?;
+    let connection = LocalSocketStream::connect(name)
+        .await
+        .map_err(|_| DesktopError::Companion)?;
+    let mut encoded = serde_json::to_vec(request).map_err(|_| DesktopError::Companion)?;
+    encoded.push(b'\n');
+    let mut sender = &connection;
+    sender
+        .write_all(&encoded)
+        .await
+        .map_err(|_| DesktopError::Companion)?;
+    let reader = BufReader::new(&connection);
+    let mut reader = reader.take((MAX_COMPANION_MESSAGE_BYTES + 1) as u64);
+    let mut raw = String::new();
+    let bytes_read = reader
+        .read_line(&mut raw)
+        .await
+        .map_err(|_| DesktopError::Companion)?;
+    if bytes_read == 0 || bytes_read > MAX_COMPANION_MESSAGE_BYTES {
+        return Err(DesktopError::Companion);
+    }
+    let response = serde_json::from_str::<CompanionResponseV1>(raw.trim_end())
+        .map_err(|_| DesktopError::Companion)?;
+    response
+        .verify(secret, request)
+        .map_err(|_| DesktopError::Companion)?;
+    Ok(response)
 }
 
 fn load_password(account: &str) -> Result<String, DesktopError> {
@@ -431,10 +632,36 @@ fn credential_exists(account: &str) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let state = DesktopState::new().unwrap_or_else(|error| {
+        eprintln!(
+            "Crow Agent credential initialization failed: {}",
+            error.code()
+        );
+        std::process::exit(1);
+    });
     tauri::Builder::default()
-        .manage(DesktopState::default())
+        .plugin(tauri_plugin_shell::init())
+        .manage(state)
+        .setup(|app| {
+            let state = app.state::<DesktopState>();
+            if tauri::async_runtime::block_on(state.companion_request(CompanionActionV1::Status))
+                .is_err()
+            {
+                state
+                    .launch_companion(app.handle())
+                    .map_err(|error| error.code().to_owned())?;
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_agent_status,
+            send_local_command,
             begin_device_authorization,
             complete_device_authorization,
             get_remote_state,
