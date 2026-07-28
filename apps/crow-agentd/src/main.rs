@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 use crow_agent_core::{
     BacktestEngine, CompanionActionV1, CompanionIpcError, CompanionRequestV1, CompanionResponseV1,
     DeviceAuthorizationClient, DeviceAuthorizationError, DeviceEncryptionKey, EncryptedJournal,
-    MAX_COMPANION_MESSAGE_BYTES, ScheduledProposal, read_verified_dataset,
+    MAX_COMPANION_MESSAGE_BYTES, ScheduledProposal, TlsProviderError, install_tls_crypto_provider,
+    read_verified_dataset,
 };
 use crow_agent_protocol::{
     DatasetManifestV1, DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1,
@@ -228,11 +229,14 @@ enum DaemonError {
     Companion(#[from] CompanionIpcError),
     #[error("headless component soak failed")]
     Soak(#[from] soak::SoakError),
+    #[error("TLS provider initialization failed")]
+    TlsProvider(#[from] TlsProviderError),
 }
 
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), DaemonError> {
+    install_tls_crypto_provider()?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

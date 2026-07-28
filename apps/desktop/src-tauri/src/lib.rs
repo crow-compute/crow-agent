@@ -653,6 +653,10 @@ fn credential_exists(account: &str) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Err(error) = crow_agent_core::install_tls_crypto_provider() {
+        eprintln!("Crow Agent TLS initialization failed: {error}");
+        std::process::exit(1);
+    }
     let state = DesktopState::new().unwrap_or_else(|error| {
         eprintln!(
             "Crow Agent credential initialization failed: {}",

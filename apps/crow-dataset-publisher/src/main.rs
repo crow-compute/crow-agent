@@ -1,6 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
-use crow_agent_core::{CandleV1, DatasetError, InstrumentV1, write_signed_dataset};
+use crow_agent_core::{
+    CandleV1, DatasetError, InstrumentV1, TlsProviderError, install_tls_crypto_provider,
+    write_signed_dataset,
+};
 use crow_agent_core::{DATASET_MANIFEST_FILE, read_verified_dataset};
 use crow_agent_protocol::DatasetManifestV1;
 use ed25519_dalek::SigningKey;
@@ -80,6 +83,8 @@ enum PublisherError {
     Io(#[from] std::io::Error),
     #[error("dataset manifest JSON is invalid")]
     Json(#[from] serde_json::Error),
+    #[error("TLS provider initialization failed")]
+    TlsProvider(#[from] TlsProviderError),
 }
 
 #[derive(Debug, Serialize)]
@@ -565,6 +570,7 @@ fn verify(dataset_directory: &Path, expected_public_key_file: &Path) -> Result<(
 
 #[tokio::main]
 async fn main() -> Result<(), PublisherError> {
+    install_tls_crypto_provider()?;
     match Cli::parse().command {
         Command::Publish {
             output,
