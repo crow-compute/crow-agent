@@ -15,6 +15,42 @@ The venue API-wallet key and raw strategy transcript remain on the user's
 device. Crow receives only encrypted strategy bundles, signed structured run
 events, and inference receipts required to verify arena results.
 
+## Download the free public alpha
+
+Crow Agent v0.1.0-alpha.1 is a free, testnet-only public alpha. Do not connect
+it to live capital.
+
+- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.0-alpha.1)
+- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.0-alpha.1/Crow.Agent_0.1.0_universal.dmg)
+- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.0-alpha.1/Crow.Agent_0.1.0_x64-setup.exe)
+- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.0-alpha.1/crow-agent-linux-x86_64.tar.zst)
+- [Signed BTC/ETH/SOL historical dataset](https://github.com/crow-compute/crow-agent/releases/tag/dataset-v1)
+
+The desktop alpha is distributed directly, not through the Apple App Store or
+Microsoft Store. It is not signed with Apple Developer ID or Microsoft
+Authenticode, so macOS Gatekeeper or Windows SmartScreen may require an
+explicit manual allow action.
+
+Every download has a detached Minisign signature. The release also includes a
+signed SHA-256 inventory, signed `ReleaseManifestV1`, public verification key,
+SPDX SBOM, and Grype report. Verify the evidence with:
+
+```bash
+minisign -Vm release-manifest-v1.json \
+  -x release-manifest-v1.json.minisig \
+  -p crow-compute-release-v1.pub
+```
+
+On Ubuntu, extract and install the package as root. The installer creates the
+non-login `crow-agent` system user and installs the correct hardened systemd
+unit, but deliberately does not start the service before credentials and
+`/etc/crow/agent.json` exist:
+
+```bash
+tar --zstd -xf crow-agent-linux-x86_64.tar.zst
+sudo ./crow-agent-linux-x86_64/install.sh
+```
+
 ## Development
 
 ```bash
@@ -130,13 +166,12 @@ source publicly readable does not grant an open-source license.
 Release workflows build the macOS universal desktop, Windows x86-64 desktop,
 and Linux x86-64 daemon. The attest job refuses a release with a high or
 critical Grype finding and emits an SPDX SBOM, SHA-256 checksums, a
-`ReleaseManifestV1`, and detached Minisign signatures. Private-alpha desktop
-installers are distributed directly without Apple Developer ID notarization or
-Windows Authenticode. Users should therefore expect Gatekeeper or SmartScreen
-publisher warnings and must opt in manually. Public/general-availability
-distribution requires a separate product decision, native platform-signing
-credentials supplied only through the protected release environment, and a
-native platform-signing gate.
+`ReleaseManifestV1`, and detached Minisign signatures. Free public-alpha
+desktop installers are distributed directly without Apple Developer ID
+notarization or Windows Authenticode. Users should therefore expect Gatekeeper
+or SmartScreen publisher warnings and must opt in manually. App Store, Windows
+Store, and general-availability distribution remain separate product decisions
+and may impose native platform-signing requirements.
 
 Desktop builds also produce Tauri updater signatures. The public updater key is
 embedded in `tauri.conf.json`; its private key exists only as the protected
