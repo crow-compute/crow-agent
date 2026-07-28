@@ -11,6 +11,7 @@ pub mod journal;
 pub mod policy;
 pub mod runtime;
 pub mod scoring;
+pub mod tls;
 
 pub use backtest::{
     BacktestEngine, BacktestError, BacktestResult, CandleV1, EquityPoint, ScheduledProposal,
@@ -41,3 +42,4 @@ pub use runtime::{
     LocalTool, ModelTurn, ModelTurnRequest, RuntimeError, ToolCall, ToolResult,
 };
 pub use scoring::{PerformanceMetrics, RunScoreInput, ScoredRun, performance_metrics, score_runs};
+pub use tls::{TlsProviderError, install_tls_crypto_provider};
