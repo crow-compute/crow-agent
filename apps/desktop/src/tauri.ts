@@ -41,6 +41,20 @@ export type RemoteState = {
   runs: RemoteRun[];
 };
 
+export type PublicArena = {
+  id: string;
+  mode: string;
+  manifest: Record<string, unknown>;
+  state: string;
+  startsAt: string;
+  endsAt: string;
+  ticketsEnabled: boolean;
+};
+
+export type PublicArenaState = {
+  arenas: PublicArena[];
+};
+
 const fallbackStatus: AgentStatus = {
   protocol: "crow.harness.v1",
   executionBoundary: "local_device",
@@ -73,6 +87,11 @@ export async function completeDeviceAuthorization(): Promise<AuthorizedDevice> {
 export async function getRemoteState(): Promise<RemoteState> {
   if (!("__TAURI_INTERNALS__" in window)) return { devices: [], runs: [] };
   return invoke<RemoteState>("get_remote_state");
+}
+
+export async function getPublicArenas(): Promise<PublicArenaState> {
+  if (!("__TAURI_INTERNALS__" in window)) return { arenas: [] };
+  return invoke<PublicArenaState>("get_public_arenas");
 }
 
 export async function sendRemoteCommand(

@@ -1,15 +1,19 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   beginDeviceAuthorization,
   completeDeviceAuthorization,
   getAgentStatus,
+  getPublicArenas,
   getRemoteState,
   sendLocalCommand,
   sendRemoteCommand,
   type AgentStatus,
   type DeviceAuthorization,
+  type PublicArena,
   type RemoteState,
 } from "./tauri";
+
+type View = "overview" | "arenas" | "devices";
 
 const initial: AgentStatus = {
   protocol: "crow.harness.v1",
@@ -19,32 +23,91 @@ const initial: AgentStatus = {
   deviceAuthorized: false,
 };
 
+const safetyRules = [
+  ["Leverage", "Isolated 1×"],
+  ["Order cap", "2% equity"],
+  ["Position cap", "10% equity"],
+  ["Daily loss", "2% stop"],
+  ["Drawdown", "10% stop"],
+  ["Cadence", "15 minutes"],
+];
+
+function shortId(value: string) {
+  return `${value.slice(0, 7)}…${value.slice(-5)}`;
+}
+
+function formatMoment(value: string | null) {
+  if (!value) return "Never connected";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "Unknown";
+  return parsed.toLocaleString([], {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function arenaName(arena: PublicArena) {
+  const name = arena.manifest.name;
+  return typeof name === "string" && name.trim() ? name : `${arena.mode.replaceAll("_", " ")} arena`;
+}
+
+function arenaModels(arena: PublicArena) {
+  const models = arena.manifest.eligible_models;
+  return Array.isArray(models) ? models.filter((model): model is string => typeof model === "string") : [];
+}
+
 export function App() {
+  const [view, setView] = useState<View>("overview");
   const [status, setStatus] = useState(initial);
   const [authorization, setAuthorization] = useState<DeviceAuthorization | null>(null);
-  const [authorizationError, setAuthorizationError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [authorizationBusy, setAuthorizationBusy] = useState(false);
   const [remote, setRemote] = useState<RemoteState>({ devices: [], runs: [] });
+  const [arenas, setArenas] = useState<PublicArena[]>([]);
   const [remoteBusy, setRemoteBusy] = useState("");
   const [localBusy, setLocalBusy] = useState("");
 
   useEffect(() => {
-    const refresh = () => void getAgentStatus().then((next) => {
-      setStatus(next);
-      if (next.deviceAuthorized) void getRemoteState().then(setRemote).catch(() => undefined);
-    });
-    refresh();
+    let active = true;
+    const refresh = async () => {
+      try {
+        const next = await getAgentStatus();
+        if (!active) return;
+        setStatus(next);
+        if (next.deviceAuthorized) {
+          const state = await getRemoteState();
+          if (active) setRemote(state);
+        }
+      } catch {
+        if (active) setStatus((current) => ({ ...current, daemon: "stopped" }));
+      }
+    };
+    const loadArenas = async () => {
+      try {
+        const next = await getPublicArenas();
+        if (active) setArenas(next.arenas);
+      } catch {
+        if (active) setNotice("Arena catalog is temporarily unavailable.");
+      }
+    };
+    void refresh();
+    void loadArenas();
     const interval = window.setInterval(refresh, 2_000);
-    return () => window.clearInterval(interval);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
   }, []);
 
   async function startAuthorization() {
     setAuthorizationBusy(true);
-    setAuthorizationError(null);
+    setNotice(null);
     try {
       setAuthorization(await beginDeviceAuthorization("Crow desktop"));
     } catch {
-      setAuthorizationError("Could not start device authorization.");
+      setNotice("Could not start device authorization.");
     } finally {
       setAuthorizationBusy(false);
     }
@@ -52,14 +115,15 @@ export function App() {
 
   async function finishAuthorization() {
     setAuthorizationBusy(true);
-    setAuthorizationError(null);
+    setNotice(null);
     try {
       await completeDeviceAuthorization();
       setAuthorization(null);
       setStatus(await getAgentStatus());
       setRemote(await getRemoteState());
+      setNotice("Device approved. Signing and encryption keys remain local.");
     } catch (error) {
-      setAuthorizationError(
+      setNotice(
         error === "device_authorization_pending"
           ? "Wallet approval is still pending."
           : "Could not complete device authorization.",
@@ -76,12 +140,13 @@ export function App() {
   ) {
     const operation = `${runId}:${action}`;
     setRemoteBusy(operation);
-    setAuthorizationError(null);
+    setNotice(null);
     try {
       await sendRemoteCommand(deviceId, runId, action);
       setRemote(await getRemoteState());
+      setNotice(`Remote ${action} accepted by Crow relay.`);
     } catch {
-      setAuthorizationError(`Remote ${action} was not accepted.`);
+      setNotice(`Remote ${action} was not accepted.`);
     } finally {
       setRemoteBusy("");
     }
@@ -89,156 +154,315 @@ export function App() {
 
   async function controlLocal(action: "pause" | "resume" | "stop") {
     setLocalBusy(action);
-    setAuthorizationError(null);
+    setNotice(null);
     try {
       setStatus(await sendLocalCommand(action));
+      setNotice(`Local run ${action} accepted.`);
     } catch {
-      setAuthorizationError(`Local ${action} was not accepted.`);
+      setNotice(`Local ${action} was not accepted.`);
     } finally {
       setLocalBusy("");
     }
   }
 
-  const activeRemoteRuns = remote.runs.filter(
-    (run) => run.status === "running" || run.status === "paused",
+  const activeRemoteRuns = useMemo(
+    () => remote.runs.filter((run) => run.status === "running" || run.status === "paused"),
+    [remote.runs],
   );
+  const localLive = status.daemon === "running" || status.daemon === "paused";
+  const readiness = [
+    { label: "Device", value: status.deviceAuthorized ? "Approved" : "Approval required", ready: status.deviceAuthorized },
+    { label: "Runtime", value: status.daemon, ready: status.daemon !== "stopped" && status.daemon !== "connecting" },
+    { label: "Arena", value: status.activeRun ? shortId(status.activeRun) : "No active run", ready: Boolean(status.activeRun) },
+  ];
 
   return (
-    <main className="shell">
-      <header>
-        <div>
-          <p className="eyebrow">Crow Compute / private alpha</p>
-          <h1>Agent Control</h1>
+    <main className="app-shell">
+      <aside className="rail">
+        <div className="brand-lockup" aria-label="Crow Local Agent">
+          <span className="brand-mark" aria-hidden="true">C</span>
+          <span>
+            <strong>CROW</strong>
+            <small>LOCAL AGENT</small>
+          </span>
         </div>
-        <span className={`status status-${status.daemon}`}>{status.daemon}</span>
-      </header>
 
-      <section className="hero">
-        <div>
-          <p className="label">Execution boundary</p>
-          <strong>Keys and strategy stay on this device.</strong>
-          <p>
-            Crow verifies signed decisions, receipts, orders, and fills. The webview
-            never receives trading credentials.
-          </p>
-        </div>
-        <code>{status.protocol}</code>
-      </section>
+        <nav aria-label="Agent navigation">
+          {([
+            ["overview", "01", "Command"],
+            ["arenas", "02", "Paper arenas"],
+            ["devices", "03", "Devices"],
+          ] as const).map(([target, index, label]) => (
+            <button
+              type="button"
+              className={view === target ? "nav-item active" : "nav-item"}
+              aria-current={view === target ? "page" : undefined}
+              onClick={() => setView(target)}
+              key={target}
+            >
+              <span>{index}</span>
+              {label}
+            </button>
+          ))}
+        </nav>
 
-      <section className="grid">
-        <article>
-          <p className="label">Runtime</p>
-          <h2>Local daemon</h2>
-          <p>Closing minimizes this controller; background execution continues.</p>
-          <div className="local-controls" role="group" aria-label="Local daemon controls">
-            <button
-              type="button"
-              disabled={status.daemon !== "running" || Boolean(localBusy)}
-              onClick={() => void controlLocal("pause")}
-            >
-              Pause
-            </button>
-            <button
-              type="button"
-              disabled={status.daemon !== "paused" || Boolean(localBusy)}
-              onClick={() => void controlLocal("resume")}
-            >
-              Resume
-            </button>
-            <button
-              type="button"
-              disabled={
-                (status.daemon !== "running" && status.daemon !== "paused") ||
-                Boolean(localBusy)
-              }
-              onClick={() => void controlLocal("stop")}
-            >
-              Stop
-            </button>
+        <div className="rail-boundary">
+          <span className="boundary-icon" aria-hidden="true">◇</span>
+          <div>
+            <strong>LOCAL CUSTODY</strong>
+            <small>Secrets never enter the WebView or Crow storage.</small>
           </div>
-          {authorization ? (
-            <div className="authorization">
-              <span>Enter this code in the browser</span>
-              <strong>{authorization.userCode}</strong>
-              <button type="button" disabled={authorizationBusy} onClick={finishAuthorization}>
-                I approved this device
-              </button>
-            </div>
-          ) : (
-            <button
-              type="button"
-              disabled={authorizationBusy || status.deviceAuthorized}
-              onClick={startAuthorization}
-            >
-              {status.deviceAuthorized ? "Device authorized" : "Authorize device"}
-            </button>
-          )}
-          {authorizationError ? <p className="error">{authorizationError}</p> : null}
-        </article>
-        <article>
-          <p className="label">Arena</p>
-          <h2>No active run</h2>
-          <p>BTC, ETH, and SOL · 15-minute decisions · isolated 1×.</p>
-          <button type="button" disabled>Browse arenas</button>
-        </article>
-        <article>
-          <p className="label">Remote host</p>
-          <h2>{remote.devices.length} approved device{remote.devices.length === 1 ? "" : "s"}</h2>
-          <p>Commands travel through Crow&apos;s outbound-only relay. No inbound port is opened.</p>
-          <button
-            type="button"
-            disabled={!status.deviceAuthorized || remoteBusy === "refresh"}
-            onClick={() => {
-              setRemoteBusy("refresh");
-              void getRemoteState()
-                .then(setRemote)
-                .catch(() => setAuthorizationError("Could not refresh remote devices."))
-                .finally(() => setRemoteBusy(""));
-            }}
-          >
-            Refresh devices
-          </button>
-        </article>
-      </section>
+        </div>
 
-      {activeRemoteRuns.length ? (
-        <section className="remote-runs" aria-label="Active remote runs">
-          <p className="label">Remote lifecycle control</p>
-          {activeRemoteRuns.map((run) => {
-            const device = remote.devices.find((candidate) => candidate.id === run.deviceId);
-            return (
-              <article key={run.id}>
-                <div>
-                  <strong>{device?.deviceLabel || "Approved device"}</strong>
-                  <span>{run.status} · release {run.clientRelease}</span>
+        <p className="protocol-label">{status.protocol}<br />alpha / testnet only</p>
+      </aside>
+
+      <section className="workspace">
+        <header className="topbar">
+          <div>
+            <span className="section-index">{view === "overview" ? "01" : view === "arenas" ? "02" : "03"}</span>
+            <span>{view === "overview" ? "COMMAND" : view === "arenas" ? "PAPER ARENAS" : "DEVICES"}</span>
+          </div>
+          <div className="runtime-chip">
+            <i className={`state-dot state-${status.daemon}`} />
+            DAEMON {status.daemon}
+          </div>
+        </header>
+
+        {notice ? (
+          <div className="notice" role="status">
+            <span>System</span>
+            <p>{notice}</p>
+            <button type="button" aria-label="Dismiss message" onClick={() => setNotice(null)}>×</button>
+          </div>
+        ) : null}
+
+        {view === "overview" ? (
+          <div className="view command-view">
+            <section className="command-hero">
+              <div>
+                <p className="kicker"><span /> USER-HOSTED EXECUTION</p>
+                <h1>TRADE FROM<br />YOUR MACHINE.<br /><em>PROVE EVERY CYCLE.</em></h1>
+              </div>
+              <div className="hero-note">
+                <span>THE BOUNDARY</span>
+                <p>Your model loop, strategy, and venue key run here. Crow receives signed structured evidence—not your private transcript.</p>
+              </div>
+            </section>
+
+            <section className="readiness-grid" aria-label="Harness readiness">
+              {readiness.map((item) => (
+                <article className="readiness-item" key={item.label}>
+                  <span>{item.label}</span>
+                  <strong><i className={item.ready ? "ready" : ""} />{item.value}</strong>
+                </article>
+              ))}
+            </section>
+
+            <section className="console-grid">
+              <article className="runtime-panel">
+                <div className="panel-heading">
+                  <div>
+                    <p className="meta">LOCAL RUNTIME</p>
+                    <h2>{localLive ? "Run in progress" : "Ready when you are"}</h2>
+                  </div>
+                  <span className="machine-state">{status.daemon}</span>
                 </div>
-                <div>
-                  <button
-                    type="button"
-                    disabled={run.status !== "running" || Boolean(remoteBusy)}
-                    onClick={() => void controlRemote(run.deviceId, run.id, "pause")}
-                  >
-                    Pause
-                  </button>
-                  <button
-                    type="button"
-                    disabled={run.status !== "paused" || Boolean(remoteBusy)}
-                    onClick={() => void controlRemote(run.deviceId, run.id, "resume")}
-                  >
-                    Resume
-                  </button>
-                  <button
-                    type="button"
-                    disabled={Boolean(remoteBusy)}
-                    onClick={() => void controlRemote(run.deviceId, run.id, "stop")}
-                  >
-                    Stop
-                  </button>
+
+                <div className="route-visual" aria-hidden="true">
+                  <span className="route-node">MODEL</span>
+                  <i className={localLive ? "route-line active" : "route-line"} />
+                  <span className="route-node heat">POLICY</span>
+                  <i className={localLive ? "route-line active delay" : "route-line"} />
+                  <span className="route-node">VENUE</span>
+                </div>
+
+                <dl className="runtime-facts">
+                  <div><dt>Execution</dt><dd>Local companion</dd></div>
+                  <div><dt>Network</dt><dd>Outbound relay only</dd></div>
+                  <div><dt>Universe</dt><dd>BTC · ETH · SOL</dd></div>
+                  <div><dt>Active run</dt><dd>{status.activeRun ? shortId(status.activeRun) : "—"}</dd></div>
+                </dl>
+
+                <div className="action-row" role="group" aria-label="Local daemon controls">
+                  {!status.deviceAuthorized ? (
+                    <button className="primary-action" type="button" disabled={authorizationBusy} onClick={startAuthorization}>
+                      <span>Authorize device</span><b>↗</b>
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        disabled={status.daemon !== "running" || Boolean(localBusy)}
+                        onClick={() => void controlLocal("pause")}
+                      >
+                        Pause
+                      </button>
+                      <button
+                        type="button"
+                        disabled={status.daemon !== "paused" || Boolean(localBusy)}
+                        onClick={() => void controlLocal("resume")}
+                      >
+                        Resume
+                      </button>
+                      <button
+                        className="danger-action"
+                        type="button"
+                        disabled={!localLive || Boolean(localBusy)}
+                        onClick={() => void controlLocal("stop")}
+                      >
+                        Stop
+                      </button>
+                    </>
+                  )}
                 </div>
               </article>
-            );
-          })}
-        </section>
+
+              <article className="policy-panel">
+                <div className="panel-heading">
+                  <div>
+                    <p className="meta">HARD POLICY</p>
+                    <h2>Safety ceiling</h2>
+                  </div>
+                  <span className="policy-lock">LOCKED</span>
+                </div>
+                <p className="panel-copy">Arena rules can tighten these limits. They can never loosen them.</p>
+                <div className="rules">
+                  {safetyRules.map(([label, value]) => (
+                    <div key={label}><span>{label}</span><strong>{value}</strong></div>
+                  ))}
+                </div>
+              </article>
+            </section>
+          </div>
+        ) : null}
+
+        {view === "arenas" ? (
+          <div className="view">
+            <section className="view-heading">
+              <div>
+                <p className="kicker"><span /> VERIFIED TESTNET COMPETITION</p>
+                <h1>PAPER ARENAS</h1>
+              </div>
+              <p>Deterministic history or actual Hyperliquid Testnet execution. Every eligible result carries a complete signed event chain.</p>
+            </section>
+
+            <div className="arena-list">
+              {arenas.length ? arenas.map((arena, index) => (
+                <article className="arena-card" key={arena.id}>
+                  <div className="arena-number">{String(index + 1).padStart(2, "0")}</div>
+                  <div className="arena-main">
+                    <p className="meta">{arena.mode.replaceAll("_", " ")} / {arena.state}</p>
+                    <h2>{arenaName(arena)}</h2>
+                    <p>{arenaModels(arena).join(" · ") || "Eligible Crow models published in manifest"}</p>
+                  </div>
+                  <dl>
+                    <div><dt>Starts</dt><dd>{formatMoment(arena.startsAt)}</dd></div>
+                    <div><dt>Ends</dt><dd>{formatMoment(arena.endsAt)}</dd></div>
+                    <div><dt>Tickets</dt><dd>{arena.ticketsEnabled ? "Enabled" : "Free"}</dd></div>
+                  </dl>
+                  <button type="button" disabled={!status.deviceAuthorized || arena.state !== "enrollment"}>
+                    {arena.state === "enrollment" ? "Select agent" : arena.state}
+                  </button>
+                </article>
+              )) : (
+                <article className="empty-state">
+                  <span className="empty-glyph">00</span>
+                  <div>
+                    <p className="meta">CATALOG CLEAR</p>
+                    <h2>No arena manifest is open.</h2>
+                    <p>The first free Hyperliquid Testnet arena will appear here after its immutable schedule, models, and scoring rules are published.</p>
+                  </div>
+                </article>
+              )}
+            </div>
+          </div>
+        ) : null}
+
+        {view === "devices" ? (
+          <div className="view">
+            <section className="view-heading">
+              <div>
+                <p className="kicker"><span /> OUTBOUND-ONLY CONTROL</p>
+                <h1>DEVICES</h1>
+              </div>
+              <p>Desktop and Linux hosts establish their own Crow connection. Remote control never requires an inbound server port.</p>
+            </section>
+
+            {!status.deviceAuthorized ? (
+              <article className="authorize-card">
+                <span className="empty-glyph">◇</span>
+                <div>
+                  <p className="meta">THIS MACHINE</p>
+                  <h2>Approve the local device</h2>
+                  <p>A short browser flow binds this machine’s public keys to your wallet. Private keys stay in the OS credential store.</p>
+                </div>
+                <button className="primary-action" type="button" disabled={authorizationBusy} onClick={startAuthorization}>
+                  <span>Authorize device</span><b>↗</b>
+                </button>
+              </article>
+            ) : (
+              <div className="device-list">
+                {remote.devices.map((device) => {
+                  const runs = activeRemoteRuns.filter((run) => run.deviceId === device.id);
+                  return (
+                    <article className="device-card" key={device.id}>
+                      <div className="device-title">
+                        <i className={device.state === "active" ? "ready" : ""} />
+                        <div>
+                          <h2>{device.deviceLabel}</h2>
+                          <p>{device.platform} · {shortId(device.id)}</p>
+                        </div>
+                        <span>{device.state}</span>
+                      </div>
+                      <p className="last-seen">Last seen {formatMoment(device.lastSeenAt)}</p>
+                      {runs.map((run) => (
+                        <div className="remote-run" key={run.id}>
+                          <div>
+                            <span>RUN {shortId(run.id)}</span>
+                            <strong>{run.status} · {run.clientRelease}</strong>
+                          </div>
+                          <div role="group" aria-label={`Controls for ${device.deviceLabel}`}>
+                            <button type="button" disabled={run.status !== "running" || Boolean(remoteBusy)} onClick={() => void controlRemote(run.deviceId, run.id, "pause")}>Pause</button>
+                            <button type="button" disabled={run.status !== "paused" || Boolean(remoteBusy)} onClick={() => void controlRemote(run.deviceId, run.id, "resume")}>Resume</button>
+                            <button className="danger-action" type="button" disabled={Boolean(remoteBusy)} onClick={() => void controlRemote(run.deviceId, run.id, "stop")}>Stop</button>
+                          </div>
+                        </div>
+                      ))}
+                    </article>
+                  );
+                })}
+                {!remote.devices.length ? (
+                  <article className="empty-state compact">
+                    <span className="empty-glyph">00</span>
+                    <div><p className="meta">INVENTORY</p><h2>No approved devices returned.</h2><p>Refresh occurs automatically every two seconds.</p></div>
+                  </article>
+                ) : null}
+              </div>
+            )}
+          </div>
+        ) : null}
+      </section>
+
+      {authorization ? (
+        <div className="authorization-layer" role="dialog" aria-modal="true" aria-labelledby="authorization-title">
+          <section className="authorization-card">
+            <button className="dialog-close" type="button" aria-label="Close authorization" onClick={() => setAuthorization(null)}>×</button>
+            <p className="meta">WALLET AUTHORIZATION</p>
+            <h2 id="authorization-title">Approve this machine.</h2>
+            <p>The browser is open. Confirm that it shows this one-time code, then sign with your Crow wallet.</p>
+            <strong className="user-code">{authorization.userCode}</strong>
+            <div className="authorization-steps">
+              <span><b>01</b> Match the code</span>
+              <span><b>02</b> Sign in browser</span>
+              <span><b>03</b> Return here</span>
+            </div>
+            <button className="primary-action" type="button" disabled={authorizationBusy} onClick={finishAuthorization}>
+              <span>{authorizationBusy ? "Checking approval…" : "I approved this device"}</span><b>→</b>
+            </button>
+            <small>Expires {formatMoment(authorization.expiresAt)}</small>
+          </section>
+        </div>
       ) : null}
     </main>
   );

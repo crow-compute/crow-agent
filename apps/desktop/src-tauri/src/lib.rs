@@ -97,6 +97,24 @@ struct RemoteState {
     runs: Vec<RemoteRun>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+struct PublicArena {
+    id: String,
+    mode: String,
+    manifest: Value,
+    state: String,
+    starts_at: String,
+    ends_at: String,
+    tickets_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicArenaState {
+    arenas: Vec<PublicArena>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteCommandResult {
@@ -372,6 +390,33 @@ async fn get_remote_state() -> Result<RemoteState, String> {
     )
     .map_err(|_| DesktopError::Network.code().to_owned())?;
     Ok(RemoteState { devices, runs })
+}
+
+#[tauri::command]
+async fn get_public_arenas() -> Result<PublicArenaState, String> {
+    let endpoint = Url::parse(&api_origin())
+        .and_then(|origin| origin.join("/api/v1/harness/arenas"))
+        .map_err(|_| DesktopError::Network.code().to_owned())?;
+    let response = reqwest::Client::builder()
+        .https_only(endpoint.scheme() == "https")
+        .build()
+        .map_err(|_| DesktopError::Network.code().to_owned())?
+        .get(endpoint)
+        .send()
+        .await
+        .map_err(|_| DesktopError::Network.code().to_owned())?;
+    if response.status() != StatusCode::OK {
+        return Err(DesktopError::Network.code().to_owned());
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|_| DesktopError::Network.code().to_owned())?;
+    let arenas = serde_json::from_value::<Vec<PublicArena>>(
+        payload.get("arenas").cloned().unwrap_or_else(|| json!([])),
+    )
+    .map_err(|_| DesktopError::Network.code().to_owned())?;
+    Ok(PublicArenaState { arenas })
 }
 
 #[tauri::command]
@@ -690,6 +735,7 @@ pub fn run() {
             begin_device_authorization,
             complete_device_authorization,
             get_remote_state,
+            get_public_arenas,
             send_remote_command
         ])
         .build(tauri::generate_context!())

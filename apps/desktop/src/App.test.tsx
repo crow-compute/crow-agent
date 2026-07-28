@@ -3,13 +3,21 @@ import { describe, expect, it } from "vitest";
 import { App } from "./App";
 
 describe("Crow Agent shell", () => {
-  it("states the local credential boundary", () => {
+  it("presents the branded local execution command surface", () => {
     render(<App />);
-    expect(screen.getByText("Keys and strategy stay on this device.")).toBeInTheDocument();
-    expect(screen.getByText(/approved devices?/)).toBeInTheDocument();
-    expect(screen.getByText(/outbound-only relay/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Authorize device" })).toBeEnabled();
+    expect(screen.getByText(/Trade from/i)).toBeInTheDocument();
+    expect(screen.getByText(/Secrets never enter the WebView/)).toBeInTheDocument();
+    expect(screen.getByText(/Crow receives signed structured evidence/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Authorize device/ })).toBeEnabled();
     expect(screen.getByRole("group", { name: "Local daemon controls" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Pause" })).toBeDisabled();
+    expect(screen.getByText("Safety ceiling")).toBeInTheDocument();
+    expect(screen.getByText("Isolated 1×")).toBeInTheDocument();
+  });
+
+  it("navigates to the real arena catalog empty state", async () => {
+    render(<App />);
+    screen.getByRole("button", { name: /Paper arenas/ }).click();
+    expect(await screen.findByRole("heading", { name: "PAPER ARENAS" })).toBeInTheDocument();
+    expect(screen.getByText("No arena manifest is open.")).toBeInTheDocument();
   });
 });
