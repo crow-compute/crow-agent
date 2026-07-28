@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { App } from "./App";
+import { App, arenaLaunchFailure, parseHandoffSnapshot } from "./App";
 
 const harnessMock = vi.hoisted(() => ({
   authorized: false,
@@ -32,6 +32,7 @@ describe("Crow Agent shell", () => {
 
   it("presents the branded local execution command surface", () => {
     render(<App />);
+    expect(screen.getByRole("img", { name: "Crow" })).toBeInTheDocument();
     expect(screen.getByText(/Trade from/i)).toBeInTheDocument();
     expect(screen.getByText(/Secrets never enter the WebView/)).toBeInTheDocument();
     expect(screen.getByText(/Crow receives signed structured evidence/)).toBeInTheDocument();
@@ -72,5 +73,21 @@ describe("Crow Agent shell", () => {
     expect(await screen.findByRole("heading", { name: "First verified Testnet arena" })).toBeInTheDocument();
     expect(screen.getByText("No compatible version yet.")).toBeInTheDocument();
     expect(screen.getByLabelText("Private strategy instructions")).toBeInTheDocument();
+  });
+
+  it("accepts only structured fixed-point handoff snapshots", () => {
+    expect(parseHandoffSnapshot("")).toBeNull();
+    expect(parseHandoffSnapshot('{"equity_micro_usdc":1000000,"positions":[{"quantity_e8":-42}]}'))
+      .toEqual({ equity_micro_usdc: 1000000, positions: [{ quantity_e8: -42 }] });
+    expect(() => parseHandoffSnapshot('{"equity":1.25}')).toThrow("handoff_snapshot_invalid");
+    expect(() => parseHandoffSnapshot("[1,2,3]")).toThrow("handoff_snapshot_invalid");
+  });
+
+  it("renders bounded launch diagnostics without leaking raw errors", () => {
+    expect(arenaLaunchFailure("device_authorization_failed")).toMatch(/Reauthorize/);
+    expect(arenaLaunchFailure(new Error("agent_version_invalid"))).toMatch(/encrypted agent version/);
+    expect(arenaLaunchFailure("unexpected secret-shaped detail")).toBe(
+      "Arena launch failed closed. No order was submitted.",
+    );
   });
 });
