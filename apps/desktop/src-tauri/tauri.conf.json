@@ -30,6 +30,10 @@
     "createUpdaterArtifacts": true,
     "copyright": "Copyright © 2026 Crow Compute",
     "shortDescription": "User-hosted Crow trading agent and paper-arena controller"
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVBNEE2MzhGQkRENzI3NDcKUldSSEo5ZTlqMk5LNmx0NGNiRUZWQmZOMmdDUFZjNmNXaHJCZXZ1R0tsbHBNV0liQ1B0dDdkOTgK"
+    }
   }
 }
-

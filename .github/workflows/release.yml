@@ -28,6 +28,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             tauri_args: --target x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
+    environment: release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -43,8 +44,10 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - run: npm ci
+        if: runner.os != 'Linux'
         working-directory: apps/desktop
       - run: npm run tauri build -- ${{ matrix.tauri_args }}
+        if: runner.os != 'Linux'
         working-directory: apps/desktop
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -62,6 +65,22 @@ jobs:
           ./scripts/package-linux.sh \
             target/x86_64-unknown-linux-gnu/release/crow-agentd \
             target/x86_64-unknown-linux-gnu/release/crow-agent-linux-x86_64.tar.zst
+      - name: Require macOS updater signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          test "$(find target/universal-apple-darwin/release/bundle \
+            -type f -name '*.sig' | wc -l | tr -d ' ')" -ge 1
+      - name: Require Windows updater signature
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $signatures = Get-ChildItem `
+            target/x86_64-pc-windows-msvc/release/bundle `
+            -Recurse -File -Filter *.sig
+          if ($signatures.Count -lt 1) {
+            throw "No Windows updater signature was produced"
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
@@ -152,6 +171,14 @@ jobs:
           MINISIGN_SECRET_KEY_PATH: ${{ runner.temp }}/release.minisign.key
           RELEASE_SIGNER: crow-compute-release-v1
         run: |
+          updater_public_key=$(jq -r '.plugins.updater.pubkey' \
+            apps/desktop/src-tauri/tauri.conf.json)
+          ./scripts/verify-tauri-updater-evidence.sh \
+            release/artifacts/macos-universal \
+            "$updater_public_key"
+          ./scripts/verify-tauri-updater-evidence.sh \
+            release/artifacts/windows-x86_64 \
+            "$updater_public_key"
           ./scripts/build-release-evidence.sh release/artifacts release/evidence
           ./scripts/test-release-evidence.sh \
             release/evidence \

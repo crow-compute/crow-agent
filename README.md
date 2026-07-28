@@ -85,6 +85,12 @@ critical Grype finding and emits an SPDX SBOM, SHA-256 checksums, a
 notarization credentials are supplied only by the repository's protected
 release environment.
 
+Desktop builds also produce Tauri updater signatures. The public updater key is
+embedded in `tauri.conf.json`; its private key exists only as the protected
+`TAURI_SIGNING_PRIVATE_KEY` release-environment secret. The attest job verifies
+each downloaded macOS and Windows updater artifact against that public key
+before signing the cross-platform release manifest.
+
 Local release evidence can be reproduced with:
 
 ```bash
