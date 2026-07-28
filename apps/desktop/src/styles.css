@@ -86,16 +86,14 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
   background: rgba(8, 8, 8, .94);
 }
 
-.brand-lockup { display: flex; align-items: center; gap: 12px; }
-.brand-mark {
-  width: 54px;
-  height: auto;
+.brand-lockup { display: flex; align-items: center; min-height: 76px; }
+.brand-logo {
+  width: auto;
+  height: 58px;
   display: block;
   object-fit: contain;
 }
-.brand-lockup > span:last-child { display: grid; gap: 3px; }
-.brand-lockup strong { font: 600 20px/.9 var(--display); letter-spacing: .06em; }
-.brand-lockup small, .protocol-label {
+.protocol-label {
   color: var(--muted);
   font: 600 8px/1.5 var(--mono);
   letter-spacing: .12em;
@@ -524,9 +522,9 @@ button:disabled { cursor: not-allowed; opacity: .38; }
 @media (max-width: 980px) {
   .app-shell { grid-template-columns: 78px minmax(0, 1fr); }
   .rail { padding: 22px 14px; }
-  .brand-lockup > span:last-child, .nav-item:not(.active)::after, .nav-item { font-size: 0; }
+  .nav-item:not(.active)::after, .nav-item { font-size: 0; }
   .brand-lockup { justify-content: center; }
-  .brand-mark { width: 42px; }
+  .brand-logo { width: auto; height: 48px; }
   .rail nav { margin: 55px -14px 0; }
   .nav-item { justify-content: center; padding: 0; }
   .nav-item span { width: auto; font-size: 9px; }
@@ -541,6 +539,7 @@ button:disabled { cursor: not-allowed; opacity: .38; }
 @media (max-width: 680px) {
   .app-shell { display: block; }
   .rail { position: static; width: 100%; height: 66px; padding: 10px 14px; flex-direction: row; align-items: center; border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand-lockup { min-height: 0; }
   .rail nav { margin: 0 0 0 auto; display: flex; }
   .nav-item { width: 46px; min-height: 44px; }
   .rail-boundary { display: none; }
