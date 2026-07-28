@@ -23,7 +23,7 @@ if [[ -z "$release_signer" ]]; then
   echo "RELEASE_SIGNER is required" >&2
   exit 78
 fi
-for tool_name in git jq shasum minisign syft grype; do
+for tool_name in cargo git jq shasum minisign syft grype; do
   if ! command -v "$tool_name" >/dev/null 2>&1; then
     echo "required tool is unavailable: $tool_name" >&2
     exit 69
@@ -33,7 +33,7 @@ done
 mkdir -p "$output_directory"
 source_commit=$(git rev-parse HEAD)
 source_committed_at=$(git show -s --format=%cI HEAD)
-release_version=${RELEASE_VERSION:-$(git describe --tags --always)}
+release_version=$(./scripts/release-version.sh)
 checksum_file="$output_directory/SHA256SUMS"
 sbom_file="$output_directory/release.spdx.json"
 scan_file="$output_directory/grype.json"
