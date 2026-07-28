@@ -1,6 +1,11 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { App, arenaLaunchFailure, parseHandoffSnapshot } from "./App";
+import {
+  App,
+  arenaLaunchFailure,
+  credentialUnlockFailure,
+  parseHandoffSnapshot,
+} from "./App";
 
 const harnessMock = vi.hoisted(() => ({
   authorized: false,
@@ -118,6 +123,18 @@ describe("Crow Agent shell", () => {
     expect(arenaLaunchFailure(new Error("agent_version_invalid"))).toMatch(/encrypted agent version/);
     expect(arenaLaunchFailure("unexpected secret-shaped detail")).toBe(
       "Arena launch failed closed. No order was submitted.",
+    );
+  });
+
+  it("explains that a denied credential unlock will not retry", () => {
+    expect(credentialUnlockFailure("credential_store_unavailable")).toMatch(
+      /No more requests will be made this session/,
+    );
+    expect(credentialUnlockFailure("device_authorization_not_started")).toMatch(
+      /Authorize new/,
+    );
+    expect(credentialUnlockFailure("unexpected secret-shaped detail")).toBe(
+      "The local credential vault could not be unlocked. No background retry will run.",
     );
   });
 });

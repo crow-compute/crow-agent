@@ -107,6 +107,18 @@ export function arenaLaunchFailure(error: unknown) {
   }
 }
 
+export function credentialUnlockFailure(error: unknown) {
+  const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+  switch (code) {
+    case "device_authorization_not_started":
+      return "No current credential vault exists. Authorize new to create one.";
+    case "credential_store_unavailable":
+      return "Credential access was denied. No more requests will be made this session. Fully quit and reopen Crow Agent when you want to retry.";
+    default:
+      return "The local credential vault could not be unlocked. No background retry will run.";
+  }
+}
+
 export function App() {
   const [view, setView] = useState<View>("overview");
   const [status, setStatus] = useState(initial);
@@ -183,8 +195,8 @@ export function App() {
       setStatus(await getAgentStatus());
       setRemote(await getRemoteState());
       setNotice("Local credential vault unlocked for this app session.");
-    } catch {
-      setNotice("No current credential vault was unlocked. Authorize this device to create a new one.");
+    } catch (error) {
+      setNotice(credentialUnlockFailure(error));
     } finally {
       setAuthorizationBusy(false);
     }
