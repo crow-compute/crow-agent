@@ -327,7 +327,7 @@ export function App() {
   const localLive = Boolean(status.activeRun)
     && (status.daemon === "running" || status.daemon === "paused");
   const readiness = [
-    { label: "Device", value: status.deviceAuthorized ? "Approved" : "Approval required", ready: status.deviceAuthorized },
+    { label: "Device", value: status.deviceAuthorized ? "Approved" : "Unlock required", ready: status.deviceAuthorized },
     { label: "Runtime", value: status.daemon, ready: status.daemon !== "stopped" && status.daemon !== "connecting" },
     { label: "Arena", value: status.activeRun ? shortId(status.activeRun) : "No active run", ready: Boolean(status.activeRun) },
   ];
@@ -559,8 +559,8 @@ export function App() {
                 <span className="empty-glyph">◇</span>
                 <div>
                   <p className="meta">THIS MACHINE</p>
-                  <h2>Approve the local device</h2>
-                  <p>A short browser flow binds this machine’s public keys to your wallet. Private keys stay in the OS credential store.</p>
+                  <h2>Unlock or approve this device</h2>
+                  <p>The vault stays closed until you click Unlock. A direct alpha update may trigger one macOS prompt; denying it suppresses every later request for this session. Authorize new starts the wallet flow.</p>
                 </div>
                 <div className="credential-actions">
                   <button className="primary-action" type="button" disabled={authorizationBusy} onClick={unlockCredentials}>
