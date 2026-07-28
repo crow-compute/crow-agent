@@ -12,6 +12,7 @@ minisign -Vm "$evidence_directory/release-manifest-v1.json" -p "$public_key_file
 minisign -Vm "$evidence_directory/SHA256SUMS" -p "$public_key_file"
 jq -e '
   .protocol == "crow.harness.v1" and
+  (.version | test("^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$")) and
   (.source_commit | length == 40) and
   (.source_committed_at | length > 0) and
   (.targets | length > 0) and
