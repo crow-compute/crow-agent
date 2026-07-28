@@ -412,6 +412,8 @@ fn portfolio_equity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crow_agent_protocol::{canonical_json, sha256};
+    use std::error::Error;
 
     #[test]
     fn proposal_executes_only_on_next_open() -> Result<(), BacktestError> {
@@ -515,6 +517,91 @@ mod tests {
         assert!(result.funding_micro_usdc > 0);
         assert_eq!(result.equity_curve.len(), 3);
         assert!(result.ending_equity_micro_usdc < 1_000_000_000);
+        Ok(())
+    }
+
+    #[test]
+    fn synchronized_backtest_matches_cross_platform_golden_digest() -> Result<(), Box<dyn Error>> {
+        let engine = BacktestEngine::new(
+            RiskRulesV1::default(),
+            ExecutionAssumptionsV1 {
+                half_spread_bps: 2,
+                slippage_bps: 3,
+                taker_fee_bps: 5,
+            },
+        );
+        let mut candles = Vec::new();
+        for interval in 0..6_i64 {
+            for (symbol, price, decimals) in [
+                ("BTC", 60_000_000_000 + interval * 100_000_000, 5),
+                ("ETH", 3_000_000_000 + interval * 10_000_000, 4),
+                ("SOL", 150_000_000 + interval * 1_000_000, 2),
+            ] {
+                candles.push(CandleV1 {
+                    symbol: symbol.into(),
+                    open_time_ms: interval * 900_000,
+                    close_time_ms: interval * 900_000 + 899_999,
+                    open_micro_usdc: price,
+                    high_micro_usdc: price + 1_000_000,
+                    low_micro_usdc: price - 1_000_000,
+                    close_micro_usdc: price + 500_000,
+                    volume_e8: 100_000_000 + interval,
+                    funding_micros_per_usdc: (interval + 1) * 2,
+                    size_decimals: decimals,
+                });
+            }
+        }
+        let result = engine.run_synchronized_proposals(
+            &candles,
+            &[
+                ScheduledProposal {
+                    decision_open_time_ms: 0,
+                    proposal: Proposal {
+                        symbol: "BTC".into(),
+                        side: Side::Buy,
+                        notional_bps: 100,
+                        limit_price_micro_usdc: 70_000_000_000,
+                        reduce_only: false,
+                    },
+                },
+                ScheduledProposal {
+                    decision_open_time_ms: 900_000,
+                    proposal: Proposal {
+                        symbol: "ETH".into(),
+                        side: Side::Buy,
+                        notional_bps: 100,
+                        limit_price_micro_usdc: 4_000_000_000,
+                        reduce_only: false,
+                    },
+                },
+                ScheduledProposal {
+                    decision_open_time_ms: 1_800_000,
+                    proposal: Proposal {
+                        symbol: "SOL".into(),
+                        side: Side::Buy,
+                        notional_bps: 300,
+                        limit_price_micro_usdc: 200_000_000,
+                        reduce_only: false,
+                    },
+                },
+                ScheduledProposal {
+                    decision_open_time_ms: 2_700_000,
+                    proposal: Proposal {
+                        symbol: "BTC".into(),
+                        side: Side::Sell,
+                        notional_bps: 50,
+                        limit_price_micro_usdc: 1,
+                        reduce_only: true,
+                    },
+                },
+            ],
+            1_000_000_000,
+        )?;
+        let digest = hex::encode(sha256(&canonical_json(&result)?));
+        assert_eq!(
+            digest, "67580b3c870a429b5aee61a01007809ac3862c2c5484d6ee36f9ec14e28cd77d",
+            "fixed-point replay changed; update only after reviewing the arena semantics"
+        );
         Ok(())
     }
 }

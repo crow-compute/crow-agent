@@ -182,6 +182,9 @@ pub async fn run(
         report.last_event_sha256 = event.event_sha256;
         report.updated_at = format_time(OffsetDateTime::now_utc());
         write_report(report_path, &report)?;
+        // Keep a completed checkpoint observable to supervisors even when the
+        // cycle work itself overruns the next scheduled boundary.
+        tokio::task::yield_now().await;
     }
     sleep_until(expected_end_at).await;
     report.status = "complete".into();

@@ -311,6 +311,10 @@ mod tests {
             candles()
         );
         let first_hash = package.manifest.package_sha256;
+        assert_eq!(
+            first_hash, "5121842cd832614ffefefffe3fb00ee186a4a48b3c661a0d531513082cbcbbd0",
+            "signed dataset bytes changed; update only after reviewing the package format"
+        );
         let second =
             write_signed_dataset(directory.path(), Uuid::from_u128(7), 1, &candles(), &signer)?;
         assert_eq!(first_hash, second.manifest.package_sha256);
