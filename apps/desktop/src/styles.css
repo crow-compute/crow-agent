@@ -1,18 +1,58 @@
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("./assets/fonts/ibm-plex-sans-latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("./assets/fonts/ibm-plex-mono-400-latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("./assets/fonts/ibm-plex-mono-500-latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("./assets/fonts/ibm-plex-mono-600-latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Tektur";
+  src: url("./assets/fonts/tektur-latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 500 700;
+  font-display: swap;
+}
+
 :root {
   font-family: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
-  color: #f1ece3;
-  background: #090a0a;
+  color: #e7e1d3;
+  background: #080808;
   font-synthesis: none;
-  --ink: #090a0a;
-  --ink-2: #111211;
-  --ink-3: #191a18;
-  --bone: #f1ece3;
-  --bone-2: #c8c1b5;
-  --muted: #817d75;
-  --heat: #e84f1f;
-  --heat-hot: #ff6530;
-  --line: rgba(241, 236, 227, 0.14);
-  --line-strong: rgba(241, 236, 227, 0.3);
+  --ink: #080808;
+  --ink-2: #10100f;
+  --ink-3: #181816;
+  --bone: #e7e1d3;
+  --bone-2: #c8c1b3;
+  --muted: #88847b;
+  --heat: #ff4d00;
+  --heat-hot: #ff6a24;
+  --line: rgba(231, 225, 211, 0.14);
+  --line-strong: rgba(231, 225, 211, 0.28);
   --display: "Tektur", "Arial Narrow", "Helvetica Neue", sans-serif;
   --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
 }
@@ -29,8 +69,8 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
   display: grid;
   grid-template-columns: 224px minmax(0, 1fr);
   background:
-    linear-gradient(rgba(241, 236, 227, .025) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(241, 236, 227, .025) 1px, transparent 1px),
+    linear-gradient(rgba(231, 225, 211, .025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(231, 225, 211, .025) 1px, transparent 1px),
     var(--ink);
   background-size: 36px 36px;
 }
@@ -43,7 +83,7 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--line);
-  background: rgba(9, 10, 10, .94);
+  background: rgba(8, 8, 8, .94);
 }
 
 .brand-lockup { display: flex; align-items: center; gap: 12px; }
@@ -80,8 +120,8 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
   text-transform: uppercase;
 }
 .nav-item span { width: 18px; color: #4d4e49; font-size: 8px; }
-.nav-item:hover { color: var(--bone); background: rgba(241, 236, 227, .035); }
-.nav-item.active { border-left-color: var(--heat); color: var(--bone); background: rgba(232, 79, 31, .08); }
+.nav-item:hover { color: var(--bone); background: rgba(231, 225, 211, .035); }
+.nav-item.active { border-left-color: var(--heat); color: var(--bone); background: rgba(255, 77, 0, .08); }
 .nav-item.active span { color: var(--heat); }
 
 .rail-boundary {
@@ -106,7 +146,7 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--line);
-  background: rgba(9, 10, 10, .82);
+  background: rgba(8, 8, 8, .82);
   backdrop-filter: blur(12px);
 }
 .topbar > div:first-child {
@@ -134,7 +174,7 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
 }
 .state-running, .state-ready, .readiness-item i.ready, .device-title i.ready {
   background: var(--heat);
-  box-shadow: 0 0 10px rgba(232, 79, 31, .75);
+  box-shadow: 0 0 10px rgba(255, 77, 0, .75);
 }
 .state-paused { background: #e9a832; }
 .state-connecting { animation: blink 1s steps(2, end) infinite; }
@@ -147,7 +187,7 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
   align-items: center;
   gap: 16px;
   border-bottom: 1px solid var(--heat);
-  background: rgba(232, 79, 31, .11);
+  background: rgba(255, 77, 0, .11);
 }
 .notice span { color: var(--heat); font: 600 8px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
 .notice p { margin: 0; color: var(--bone-2); font-size: 12px; }
@@ -200,14 +240,14 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
   align-content: center;
   gap: 9px;
   border-right: 1px solid var(--line);
-  background: rgba(17, 18, 17, .72);
+  background: rgba(16, 16, 15, .72);
 }
 .readiness-item:last-child { border-right: 0; }
 .readiness-item > span { color: var(--muted); font: 600 8px var(--mono); letter-spacing: .12em; text-transform: uppercase; }
 .readiness-item strong { display: flex; align-items: center; gap: 9px; font: 500 12px var(--mono); text-transform: capitalize; }
 
 .console-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(310px, .7fr); gap: 1px; background: var(--line); border: 1px solid var(--line); }
-.runtime-panel, .policy-panel { min-width: 0; padding: 28px; background: rgba(17, 18, 17, .96); }
+.runtime-panel, .policy-panel { min-width: 0; padding: 28px; background: rgba(16, 16, 15, .96); }
 .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .panel-heading h2, .arena-card h2, .empty-state h2, .authorize-card h2, .device-card h2, .authorization-card h2 {
   margin: 7px 0 0;
@@ -216,7 +256,7 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
   text-transform: uppercase;
 }
 .machine-state, .policy-lock { min-height: 25px; padding: 0 9px; border: 1px solid var(--line-strong); }
-.policy-lock { color: var(--heat); border-color: rgba(232, 79, 31, .5); }
+.policy-lock { color: var(--heat); border-color: rgba(255, 77, 0, .5); }
 
 .route-visual { height: 126px; display: flex; align-items: center; padding: 12px 0; }
 .route-node {
@@ -438,7 +478,7 @@ button:disabled { cursor: not-allowed; opacity: .38; }
   gap: 7px;
   padding: 15px 17px;
   border-left: 2px solid var(--heat);
-  background: rgba(232, 79, 31, .07);
+  background: rgba(255, 77, 0, .07);
 }
 .setup-callout strong { font: 600 12px var(--display); text-transform: uppercase; }
 .setup-callout span, .launch-contract p {
