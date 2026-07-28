@@ -79,15 +79,37 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $sidecar = Get-ChildItem `
-            target/x86_64-pc-windows-msvc/release/bundle `
-            -Recurse -File -Filter crow-agentd.exe
+          $bundleRoot = "target/x86_64-pc-windows-msvc/release/bundle"
+          $msi = @(
+            Get-ChildItem $bundleRoot -Recurse -File -Filter *.msi
+          )
+          if ($msi.Count -ne 1) {
+            throw "Expected exactly one Windows MSI bundle"
+          }
+          $extractRoot = Join-Path $env:RUNNER_TEMP "crow-agent-msi"
+          New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+          $extract = Start-Process `
+            -FilePath msiexec.exe `
+            -ArgumentList @(
+              "/a",
+              "`"$($msi[0].FullName)`"",
+              "/qn",
+              "TARGETDIR=`"$extractRoot`""
+            ) `
+            -Wait `
+            -PassThru
+          if ($extract.ExitCode -ne 0) {
+            throw "MSI administrative extraction failed: $($extract.ExitCode)"
+          }
+          $sidecar = @(
+            Get-ChildItem $extractRoot -Recurse -File -Filter crow-agentd.exe
+          )
           if ($sidecar.Count -lt 1) {
             throw "The Windows desktop bundle does not contain crow-agentd.exe"
           }
-          $signatures = Get-ChildItem `
-            target/x86_64-pc-windows-msvc/release/bundle `
-            -Recurse -File -Filter *.sig
+          $signatures = @(
+            Get-ChildItem $bundleRoot -Recurse -File -Filter *.sig
+          )
           if ($signatures.Count -lt 1) {
             throw "No Windows updater signature was produced"
           }
