@@ -1,6 +1,7 @@
 # Crow Agent
 
-Private user-hosted trading agent and verified paper-arena harness.
+Publicly readable, source-available user-hosted trading agent and verified
+paper-arena harness.
 
 The repository is intentionally separate from the GPU provider agent. It
 contains:
@@ -85,6 +86,8 @@ cycle. This component gate complements—rather than replaces—the staging soak
 that uses an authorized Crow device and actual Hyperliquid Testnet account.
 
 OpenProphet is a noncommercial project and no OpenProphet source is included.
+This repository remains proprietary and all rights are reserved; making the
+source publicly readable does not grant an open-source license.
 
 ## Releases
 
