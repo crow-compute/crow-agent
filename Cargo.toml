@@ -4,12 +4,14 @@ members = [
   "crates/crow-agent-protocol",
   "crates/crow-agent-core",
   "apps/crow-agentd",
+  "apps/crow-dataset-publisher",
   "apps/desktop/src-tauri",
 ]
 default-members = [
   "crates/crow-agent-protocol",
   "crates/crow-agent-core",
   "apps/crow-agentd",
+  "apps/crow-dataset-publisher",
 ]
 
 [workspace.package]

@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const HARNESS_PROTOCOL_V1: &str = "crow.harness.v1";
+pub const DATASET_SOURCE_V1: &str = "hyperliquid-mainnet-info-v1";
 pub const ALLOWED_SYMBOLS: [&str; 3] = ["BTC", "ETH", "SOL"];
 pub const ALLOWED_MODELS: [&str; 3] = [
     "crow-qwen3-5-27b",
@@ -299,6 +300,7 @@ pub struct DatasetFileV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetManifestV1 {
     pub protocol: String,
+    pub source: String,
     pub dataset_id: Uuid,
     pub version: u32,
     pub interval_seconds: u32,
@@ -316,6 +318,7 @@ pub struct DatasetManifestV1 {
 #[derive(Debug, Serialize)]
 struct UnsignedDatasetManifest<'a> {
     protocol: &'a str,
+    source: &'a str,
     dataset_id: Uuid,
     version: u32,
     interval_seconds: u32,
@@ -343,6 +346,7 @@ impl DatasetManifestV1 {
         let signer_public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
         let mut manifest = Self {
             protocol: HARNESS_PROTOCOL_V1.into(),
+            source: DATASET_SOURCE_V1.into(),
             dataset_id,
             version,
             interval_seconds: 900,
@@ -368,6 +372,7 @@ impl DatasetManifestV1 {
 
     fn validate(&self) -> Result<(), ProtocolError> {
         if self.protocol != HARNESS_PROTOCOL_V1
+            || self.source != DATASET_SOURCE_V1
             || self.version == 0
             || self.interval_seconds != 900
             || self.symbols != ALLOWED_SYMBOLS.map(str::to_owned)
@@ -392,6 +397,7 @@ impl DatasetManifestV1 {
     fn unsigned(&self) -> UnsignedDatasetManifest<'_> {
         UnsignedDatasetManifest {
             protocol: &self.protocol,
+            source: &self.source,
             dataset_id: self.dataset_id,
             version: self.version,
             interval_seconds: self.interval_seconds,

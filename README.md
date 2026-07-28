@@ -93,11 +93,33 @@ replay and signed Parquet package against immutable SHA-256 golden values:
 - backtest result:
   `67580b3c870a429b5aee61a01007809ac3862c2c5484d6ee36f9ec14e28cd77d`
 - signed dataset bytes:
-  `5121842cd832614ffefefffe3fb00ee186a4a48b3c661a0d531513082cbcbbd0`
+  `afc8195514729823fdb3ba1d372cdcfb8c4721baa0f6d4291c7dd3ff3c07d207`
 
 Changing either digest requires an explicit review of the arena execution or
 dataset-package semantics. A platform-specific serialization or arithmetic
 difference fails CI.
+
+Production historical packages are built by the protected
+`signed-historical-dataset` workflow from Hyperliquid's public mainnet info API.
+The publisher accepts only hour-aligned completed windows with at most 5,000
+15-minute candles per symbol, requires a complete BTC/ETH/SOL series and one
+funding record per symbol per hour, and refuses delisted or incomplete
+instrument metadata. Prices use micro-USDC fixed point, volumes use 1e8 units,
+and funding rates use 1e12 units so the replay path never parses floating-point
+values.
+
+Each release contains deterministic zstd-compressed `candles.parquet` and
+`instruments.parquet` files plus `dataset-manifest-v1.json`. The manifest binds
+both file hashes, the `hyperliquid-mainnet-info-v1` source, the immutable window
+and version, and the dedicated dataset signer. Its pinned public key is
+`deploy/crow-dataset-release-v1.pub`. Verify an extracted package with:
+
+```bash
+cargo run --release --locked -p crow-dataset-publisher -- \
+  verify \
+  --dataset-directory /path/to/extracted-dataset \
+  --expected-public-key-file deploy/crow-dataset-release-v1.pub
+```
 
 OpenProphet is a noncommercial project and no OpenProphet source is included.
 This repository remains proprietary and all rights are reserved; making the
