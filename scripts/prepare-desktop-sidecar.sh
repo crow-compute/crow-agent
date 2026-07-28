@@ -19,11 +19,20 @@ if [[ "$target" == "universal-apple-darwin" ]]; then
     --release \
     --target x86_64-apple-darwin \
     -p crow-agentd
+  cp \
+    "$repository_root/target/aarch64-apple-darwin/release/crow-agentd" \
+    "$binary_directory/crow-agentd-aarch64-apple-darwin"
+  cp \
+    "$repository_root/target/x86_64-apple-darwin/release/crow-agentd" \
+    "$binary_directory/crow-agentd-x86_64-apple-darwin"
   lipo -create \
     "$repository_root/target/aarch64-apple-darwin/release/crow-agentd" \
     "$repository_root/target/x86_64-apple-darwin/release/crow-agentd" \
     -output "$binary_directory/crow-agentd-universal-apple-darwin"
-  chmod 0755 "$binary_directory/crow-agentd-universal-apple-darwin"
+  chmod 0755 \
+    "$binary_directory/crow-agentd-aarch64-apple-darwin" \
+    "$binary_directory/crow-agentd-x86_64-apple-darwin" \
+    "$binary_directory/crow-agentd-universal-apple-darwin"
   exit 0
 fi
 
