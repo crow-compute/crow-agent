@@ -587,6 +587,12 @@ async fn relay_session(
         tokio::select! {
             () = &mut rotation => {
                 info!("rotating device token between control messages");
+                if let Err(error) = connection.close(None).await {
+                    warn!(error = %error, "relay close handshake failed during token rotation");
+                }
+                // Give the relay handler time to release distributed device
+                // ownership before the next scoped token reconnects.
+                tokio::time::sleep(Duration::from_millis(250)).await;
                 return Ok(());
             }
             _ = heartbeat.tick() => {
