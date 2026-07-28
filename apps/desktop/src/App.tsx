@@ -13,6 +13,7 @@ import {
   sendLocalCommand,
   sendRemoteCommand,
   startLocalArena,
+  unlockDeviceCredentials,
   type AgentVersionSummary,
   type AgentStatus,
   type DeviceAuthorization,
@@ -174,6 +175,21 @@ export function App() {
     }
   }
 
+  async function unlockCredentials() {
+    setAuthorizationBusy(true);
+    setNotice(null);
+    try {
+      await unlockDeviceCredentials();
+      setStatus(await getAgentStatus());
+      setRemote(await getRemoteState());
+      setNotice("Local credential vault unlocked for this app session.");
+    } catch {
+      setNotice("No current credential vault was unlocked. Authorize this device to create a new one.");
+    } finally {
+      setAuthorizationBusy(false);
+    }
+  }
+
   async function finishAuthorization() {
     setAuthorizationBusy(true);
     setNotice(null);
@@ -311,7 +327,7 @@ export function App() {
   const localLive = Boolean(status.activeRun)
     && (status.daemon === "running" || status.daemon === "paused");
   const readiness = [
-    { label: "Device", value: status.deviceAuthorized ? "Approved" : "Approval required", ready: status.deviceAuthorized },
+    { label: "Device", value: status.deviceAuthorized ? "Approved" : "Unlock required", ready: status.deviceAuthorized },
     { label: "Runtime", value: status.daemon, ready: status.daemon !== "stopped" && status.daemon !== "connecting" },
     { label: "Arena", value: status.activeRun ? shortId(status.activeRun) : "No active run", ready: Boolean(status.activeRun) },
   ];
@@ -422,9 +438,14 @@ export function App() {
 
                 <div className="action-row" role="group" aria-label="Local daemon controls">
                   {!status.deviceAuthorized ? (
-                    <button className="primary-action" type="button" disabled={authorizationBusy} onClick={startAuthorization}>
-                      <span>Authorize device</span><b>↗</b>
-                    </button>
+                    <>
+                      <button className="primary-action" type="button" disabled={authorizationBusy} onClick={unlockCredentials}>
+                        <span>Unlock device</span><b>→</b>
+                      </button>
+                      <button type="button" disabled={authorizationBusy} onClick={startAuthorization}>
+                        Authorize new
+                      </button>
+                    </>
                   ) : (
                     <>
                       <button
@@ -538,12 +559,17 @@ export function App() {
                 <span className="empty-glyph">◇</span>
                 <div>
                   <p className="meta">THIS MACHINE</p>
-                  <h2>Approve the local device</h2>
-                  <p>A short browser flow binds this machine’s public keys to your wallet. Private keys stay in the OS credential store.</p>
+                  <h2>Unlock or approve this device</h2>
+                  <p>The vault stays closed until you click Unlock. A direct alpha update may trigger one macOS prompt; denying it suppresses every later request for this session. Authorize new starts the wallet flow.</p>
                 </div>
-                <button className="primary-action" type="button" disabled={authorizationBusy} onClick={startAuthorization}>
-                  <span>Authorize device</span><b>↗</b>
-                </button>
+                <div className="credential-actions">
+                  <button className="primary-action" type="button" disabled={authorizationBusy} onClick={unlockCredentials}>
+                    <span>Unlock device</span><b>→</b>
+                  </button>
+                  <button type="button" disabled={authorizationBusy} onClick={startAuthorization}>
+                    Authorize new
+                  </button>
+                </div>
               </article>
             ) : (
               <div className="device-list">

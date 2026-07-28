@@ -20,10 +20,10 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -37,9 +37,10 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const CREDENTIAL_SERVICE: &str = "ai.crowcompute.agent";
+const CREDENTIAL_VAULT_ACCOUNT: &str = "desktop-credential-vault-v1";
 const SIGNING_SEED_ACCOUNT: &str = "device-signing-seed";
 const ENCRYPTION_SECRET_ACCOUNT: &str = "device-encryption-secret";
 const ACCESS_TOKEN_ACCOUNT: &str = "device-access-token";
@@ -55,6 +56,55 @@ const PRODUCTION_RELAY_URL: &str = "wss://api.crowcompute.ai/harness/v1/connect"
 const HYPERLIQUID_TESTNET_API_URL: &str = "https://app.hyperliquid-testnet.xyz/API";
 const COMPANION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_DESKTOP_REFRESH_TOKEN_BYTES: usize = 512;
+const CREDENTIAL_VAULT_VERSION: u8 = 1;
+
+#[derive(Default, Serialize, Deserialize, Zeroize)]
+#[zeroize(drop)]
+struct DesktopCredentialVaultV1 {
+    version: u8,
+    signing_seed: Option<String>,
+    encryption_secret: Option<String>,
+    access_token: Option<String>,
+    access_expires_at: Option<i64>,
+    refresh_token: Option<String>,
+    device_id: Option<String>,
+    controller_nonce: u64,
+    companion_secret: Option<String>,
+    journal_key: Option<String>,
+    hyperliquid_api_wallet_key: Option<String>,
+}
+
+impl fmt::Debug for DesktopCredentialVaultV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopCredentialVaultV1")
+            .field("version", &self.version)
+            .field("signing_seed_present", &self.signing_seed.is_some())
+            .field(
+                "encryption_secret_present",
+                &self.encryption_secret.is_some(),
+            )
+            .field("access_token_present", &self.access_token.is_some())
+            .field("refresh_token_present", &self.refresh_token.is_some())
+            .field("device_id_present", &self.device_id.is_some())
+            .field("controller_nonce", &self.controller_nonce)
+            .field("companion_secret_present", &self.companion_secret.is_some())
+            .field("journal_key_present", &self.journal_key.is_some())
+            .field(
+                "hyperliquid_api_wallet_key_present",
+                &self.hyperliquid_api_wallet_key.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default)]
+struct CredentialVaultState {
+    value: Option<DesktopCredentialVaultV1>,
+    unavailable: bool,
+}
+
+static CREDENTIAL_VAULT: OnceLock<Mutex<CredentialVaultState>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -226,7 +276,11 @@ impl DesktopState {
             companion_credentials_unavailable: AtomicBool::new(false),
             companion_child: Mutex::new(None),
             companion_spawned: Arc::new(AtomicBool::new(false)),
-            authorization_status: Mutex::new(None),
+            // Never touch the OS credential store during startup or background
+            // polling. Direct-distribution alpha binaries are ad-hoc signed,
+            // so macOS may require approval after an update. Credential access
+            // is deliberately unlocked only by an explicit user action.
+            authorization_status: Mutex::new(Some(false)),
             device_tokens: AsyncMutex::new(None),
             device_tokens_unavailable: AtomicBool::new(false),
         }
@@ -264,15 +318,10 @@ impl DesktopState {
     }
 
     fn device_authorized(&self) -> bool {
-        let Ok(mut status) = self.authorization_status.lock() else {
+        let Ok(status) = self.authorization_status.lock() else {
             return false;
         };
-        if let Some(authorized) = *status {
-            return authorized;
-        }
-        let authorized = credential_exists(REFRESH_TOKEN_ACCOUNT);
-        *status = Some(authorized);
-        authorized
+        status.unwrap_or(false)
     }
 
     async fn cache_device_tokens(&self, tokens: DeviceTokens) {
@@ -478,6 +527,33 @@ async fn get_agent_status(
             .map(|run_id| run_id.to_string()),
         device_authorized,
     })
+}
+
+#[tauri::command]
+async fn unlock_device_credentials(
+    state: State<'_, DesktopState>,
+) -> Result<AuthorizedDevice, String> {
+    if !credential_exists(REFRESH_TOKEN_ACCOUNT) {
+        return Err(DesktopError::NoAuthorization.code().to_owned());
+    }
+    if let Ok(mut status) = state.authorization_status.lock() {
+        *status = Some(true);
+    }
+    state
+        .device_tokens_unavailable
+        .store(false, Ordering::SeqCst);
+    match state.device_tokens().await {
+        Ok(tokens) => Ok(AuthorizedDevice {
+            device_id: tokens.device_id.to_string(),
+            access_expires_at: tokens.access_expires_at,
+        }),
+        Err(error) => {
+            if let Ok(mut status) = state.authorization_status.lock() {
+                *status = Some(false);
+            }
+            Err(error.code().to_owned())
+        }
+    }
 }
 
 #[tauri::command]
@@ -943,63 +1019,136 @@ async fn send_remote_command(
     })
 }
 
-fn load_or_create_identity() -> Result<DeviceIdentity, DesktopError> {
-    let entry = Entry::new(CREDENTIAL_SERVICE, SIGNING_SEED_ACCOUNT)
-        .map_err(|_| DesktopError::Credential)?;
-    match entry.get_secret() {
-        Ok(stored) => {
-            let stored = Zeroizing::new(stored);
-            let seed: [u8; 32] = stored
-                .as_slice()
-                .try_into()
-                .map_err(|_| DesktopError::Credential)?;
-            let seed = Zeroizing::new(seed);
-            Ok(DeviceIdentity::from_seed(&seed))
+fn credential_vault() -> &'static Mutex<CredentialVaultState> {
+    CREDENTIAL_VAULT.get_or_init(|| Mutex::new(CredentialVaultState::default()))
+}
+
+fn load_credential_vault(state: &mut CredentialVaultState) -> Result<(), DesktopError> {
+    if state.unavailable {
+        return Err(DesktopError::Credential);
+    }
+    if state.value.is_some() {
+        return Ok(());
+    }
+    let Ok(entry) = Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_VAULT_ACCOUNT) else {
+        state.unavailable = true;
+        return Err(DesktopError::Credential);
+    };
+    let value = match entry.get_secret() {
+        Ok(encoded) => {
+            let encoded = Zeroizing::new(encoded);
+            let Ok(value) = serde_json::from_slice::<DesktopCredentialVaultV1>(&encoded) else {
+                state.unavailable = true;
+                return Err(DesktopError::Credential);
+            };
+            if value.version != CREDENTIAL_VAULT_VERSION {
+                state.unavailable = true;
+                return Err(DesktopError::Credential);
+            }
+            value
         }
         Err(KeyringError::NoEntry) => {
-            let identity = DeviceIdentity::generate();
-            let seed = Zeroizing::new(identity.seed());
-            entry
-                .set_secret(seed.as_ref())
-                .map_err(|_| DesktopError::Credential)?;
-            Ok(identity)
+            let mut value = DesktopCredentialVaultV1::default();
+            value.version = CREDENTIAL_VAULT_VERSION;
+            value
         }
-        Err(_) => Err(DesktopError::Credential),
+        Err(_) => {
+            state.unavailable = true;
+            return Err(DesktopError::Credential);
+        }
+    };
+    state.value = Some(value);
+    Ok(())
+}
+
+fn persist_credential_vault(state: &mut CredentialVaultState) -> Result<(), DesktopError> {
+    let Some(value) = state.value.as_ref() else {
+        return Err(DesktopError::Credential);
+    };
+    let encoded = Zeroizing::new(serde_json::to_vec(value).map_err(|_| DesktopError::Credential)?);
+    let result = Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_VAULT_ACCOUNT)
+        .and_then(|entry| entry.set_secret(encoded.as_ref()));
+    if result.is_err() {
+        state.unavailable = true;
+        return Err(DesktopError::Credential);
     }
+    Ok(())
+}
+
+fn read_credential_vault<R>(
+    operation: impl FnOnce(&DesktopCredentialVaultV1) -> Result<R, DesktopError>,
+) -> Result<R, DesktopError> {
+    let mut state = credential_vault()
+        .lock()
+        .map_err(|_| DesktopError::Credential)?;
+    load_credential_vault(&mut state)?;
+    let value = state.value.as_ref().ok_or(DesktopError::Credential)?;
+    operation(value)
+}
+
+fn update_credential_vault<R>(
+    operation: impl FnOnce(&mut DesktopCredentialVaultV1) -> Result<R, DesktopError>,
+) -> Result<R, DesktopError> {
+    let mut state = credential_vault()
+        .lock()
+        .map_err(|_| DesktopError::Credential)?;
+    load_credential_vault(&mut state)?;
+    let value = state.value.as_mut().ok_or(DesktopError::Credential)?;
+    let result = operation(value)?;
+    persist_credential_vault(&mut state)?;
+    Ok(result)
+}
+
+fn decode_vault_secret(value: &str) -> Result<Zeroizing<[u8; 32]>, DesktopError> {
+    let decoded = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| DesktopError::Credential)?,
+    );
+    let secret = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| DesktopError::Credential)?;
+    Ok(Zeroizing::new(secret))
+}
+
+fn load_or_create_identity() -> Result<DeviceIdentity, DesktopError> {
+    if let Some(encoded) = read_credential_vault(|vault| Ok(vault.signing_seed.clone()))? {
+        let seed = decode_vault_secret(&encoded)?;
+        return Ok(DeviceIdentity::from_seed(&seed));
+    }
+    let identity = DeviceIdentity::generate();
+    let seed = Zeroizing::new(identity.seed());
+    update_credential_vault(|vault| {
+        vault.signing_seed = Some(URL_SAFE_NO_PAD.encode(seed.as_ref()));
+        Ok(())
+    })?;
+    Ok(identity)
 }
 
 fn load_or_create_encryption_key() -> Result<DeviceEncryptionKey, DesktopError> {
-    let entry = Entry::new(CREDENTIAL_SERVICE, ENCRYPTION_SECRET_ACCOUNT)
-        .map_err(|_| DesktopError::Credential)?;
-    match entry.get_secret() {
-        Ok(stored) => {
-            let stored = Zeroizing::new(stored);
-            let secret: [u8; 32] = stored
-                .as_slice()
-                .try_into()
-                .map_err(|_| DesktopError::Credential)?;
-            Ok(DeviceEncryptionKey::from_secret(secret))
-        }
-        Err(KeyringError::NoEntry) => {
-            let encryption_key = DeviceEncryptionKey::generate();
-            let secret = encryption_key.secret_bytes();
-            entry
-                .set_secret(secret.as_ref())
-                .map_err(|_| DesktopError::Credential)?;
-            Ok(encryption_key)
-        }
-        Err(_) => Err(DesktopError::Credential),
+    if let Some(encoded) = read_credential_vault(|vault| Ok(vault.encryption_secret.clone()))? {
+        return Ok(DeviceEncryptionKey::from_secret(*decode_vault_secret(
+            &encoded,
+        )?));
     }
+    let encryption_key = DeviceEncryptionKey::generate();
+    let secret = encryption_key.secret_bytes();
+    update_credential_vault(|vault| {
+        vault.encryption_secret = Some(URL_SAFE_NO_PAD.encode(secret.as_ref()));
+        Ok(())
+    })?;
+    Ok(encryption_key)
 }
 
 fn store_tokens(tokens: &DeviceTokens) -> Result<(), DesktopError> {
-    store_password(ACCESS_TOKEN_ACCOUNT, tokens.access_token.as_str())?;
-    store_password(
-        ACCESS_EXPIRES_AT_ACCOUNT,
-        &tokens.access_expires_at.unix_timestamp().to_string(),
-    )?;
-    store_password(REFRESH_TOKEN_ACCOUNT, tokens.refresh_token.as_str())?;
-    store_password(DEVICE_ID_ACCOUNT, &tokens.device_id.to_string())
+    update_credential_vault(|vault| {
+        vault.access_token = Some(tokens.access_token.to_string());
+        vault.access_expires_at = Some(tokens.access_expires_at.unix_timestamp());
+        vault.refresh_token = Some(tokens.refresh_token.to_string());
+        vault.device_id = Some(tokens.device_id.to_string());
+        Ok(())
+    })
 }
 
 async fn load_or_rotate_desktop_tokens() -> Result<DeviceTokens, DesktopError> {
@@ -1171,33 +1320,73 @@ fn agent_version_summary(envelope: &AgentVersionEnvelopeV1) -> AgentVersionSumma
 }
 
 fn load_or_create_hyperliquid_api_wallet_key() -> Result<Zeroizing<[u8; 32]>, DesktopError> {
-    let entry = Entry::new(CREDENTIAL_SERVICE, HYPERLIQUID_API_WALLET_ACCOUNT)
-        .map_err(|_| DesktopError::Credential)?;
-    match entry.get_secret() {
-        Ok(stored) => {
-            let stored = Zeroizing::new(stored);
-            let key: [u8; 32] = stored
-                .as_slice()
-                .try_into()
-                .map_err(|_| DesktopError::Venue)?;
-            hyperliquid_api_wallet_address(&key).map_err(|_| DesktopError::Venue)?;
-            Ok(Zeroizing::new(key))
-        }
-        Err(KeyringError::NoEntry) => {
-            for _ in 0..64 {
-                let mut key = Zeroizing::new([0_u8; 32]);
-                OsRng.fill_bytes(key.as_mut());
-                if hyperliquid_api_wallet_address(&key).is_ok() {
-                    entry
-                        .set_secret(key.as_ref())
-                        .map_err(|_| DesktopError::Credential)?;
-                    return Ok(key);
-                }
-            }
-            Err(DesktopError::Venue)
-        }
-        Err(_) => Err(DesktopError::Credential),
+    if let Some(encoded) =
+        read_credential_vault(|vault| Ok(vault.hyperliquid_api_wallet_key.clone()))?
+    {
+        let key = decode_vault_secret(&encoded)?;
+        hyperliquid_api_wallet_address(&key).map_err(|_| DesktopError::Venue)?;
+        return Ok(key);
     }
+    for _ in 0..64 {
+        let mut key = Zeroizing::new([0_u8; 32]);
+        OsRng.fill_bytes(key.as_mut());
+        if hyperliquid_api_wallet_address(&key).is_ok() {
+            update_credential_vault(|vault| {
+                vault.hyperliquid_api_wallet_key = Some(URL_SAFE_NO_PAD.encode(key.as_ref()));
+                Ok(())
+            })?;
+            return Ok(key);
+        }
+    }
+    Err(DesktopError::Venue)
+}
+
+fn vault_secret_for_account(vault: &DesktopCredentialVaultV1, account: &str) -> Option<String> {
+    match account {
+        SIGNING_SEED_ACCOUNT => vault.signing_seed.clone(),
+        ENCRYPTION_SECRET_ACCOUNT => vault.encryption_secret.clone(),
+        COMPANION_SECRET_ACCOUNT => vault.companion_secret.clone(),
+        JOURNAL_KEY_ACCOUNT => vault.journal_key.clone(),
+        HYPERLIQUID_API_WALLET_ACCOUNT => vault.hyperliquid_api_wallet_key.clone(),
+        _ => None,
+    }
+}
+
+fn set_vault_secret_for_account(
+    vault: &mut DesktopCredentialVaultV1,
+    account: &str,
+    encoded: String,
+) -> Result<(), DesktopError> {
+    match account {
+        SIGNING_SEED_ACCOUNT => vault.signing_seed = Some(encoded),
+        ENCRYPTION_SECRET_ACCOUNT => vault.encryption_secret = Some(encoded),
+        COMPANION_SECRET_ACCOUNT => vault.companion_secret = Some(encoded),
+        JOURNAL_KEY_ACCOUNT => vault.journal_key = Some(encoded),
+        HYPERLIQUID_API_WALLET_ACCOUNT => vault.hyperliquid_api_wallet_key = Some(encoded),
+        _ => return Err(DesktopError::Credential),
+    }
+    Ok(())
+}
+
+fn load_secret_32(account: &str) -> Result<Zeroizing<[u8; 32]>, DesktopError> {
+    let encoded = read_credential_vault(|vault| {
+        vault_secret_for_account(vault, account).ok_or(DesktopError::Credential)
+    })?;
+    decode_vault_secret(&encoded)
+}
+
+fn load_or_create_secret_32(account: &str) -> Result<Zeroizing<[u8; 32]>, DesktopError> {
+    if let Some(encoded) =
+        read_credential_vault(|vault| Ok(vault_secret_for_account(vault, account)))?
+    {
+        return decode_vault_secret(&encoded);
+    }
+    let mut value = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(value.as_mut());
+    update_credential_vault(|vault| {
+        set_vault_secret_for_account(vault, account, URL_SAFE_NO_PAD.encode(value.as_ref()))
+    })?;
+    Ok(value)
 }
 
 fn desktop_runtime_directory(app: &tauri::AppHandle) -> Result<PathBuf, DesktopError> {
@@ -1256,42 +1445,6 @@ fn desktop_credential_frame(
     Ok(frame)
 }
 
-fn load_secret_32(account: &str) -> Result<Zeroizing<[u8; 32]>, DesktopError> {
-    let raw = Zeroizing::new(
-        Entry::new(CREDENTIAL_SERVICE, account)
-            .and_then(|entry| entry.get_secret())
-            .map_err(|_| DesktopError::Credential)?,
-    );
-    let value: [u8; 32] = raw
-        .as_slice()
-        .try_into()
-        .map_err(|_| DesktopError::Credential)?;
-    Ok(Zeroizing::new(value))
-}
-
-fn load_or_create_secret_32(account: &str) -> Result<Zeroizing<[u8; 32]>, DesktopError> {
-    let entry = Entry::new(CREDENTIAL_SERVICE, account).map_err(|_| DesktopError::Credential)?;
-    match entry.get_secret() {
-        Ok(raw) => {
-            let raw = Zeroizing::new(raw);
-            let value: [u8; 32] = raw
-                .as_slice()
-                .try_into()
-                .map_err(|_| DesktopError::Credential)?;
-            Ok(Zeroizing::new(value))
-        }
-        Err(KeyringError::NoEntry) => {
-            let mut value = Zeroizing::new([0_u8; 32]);
-            OsRng.fill_bytes(value.as_mut());
-            entry
-                .set_secret(value.as_ref())
-                .map_err(|_| DesktopError::Credential)?;
-            Ok(value)
-        }
-        Err(_) => Err(DesktopError::Credential),
-    }
-}
-
 fn valid_execution_account(value: &str) -> bool {
     value.len() == 42
         && value.starts_with("0x")
@@ -1309,37 +1462,21 @@ fn next_companion_nonce(nonce: &Mutex<u64>) -> Result<u64, DesktopError> {
 }
 
 fn next_persisted_nonce(account: &str) -> Result<u64, DesktopError> {
-    let previous = load_password(account)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let next = previous.checked_add(1).ok_or(DesktopError::RemoteCommand)?;
-    store_password(account, &next.to_string())?;
-    Ok(next)
+    if account != CONTROLLER_NONCE_ACCOUNT {
+        return Err(DesktopError::RemoteCommand);
+    }
+    update_credential_vault(|vault| {
+        let next = vault
+            .controller_nonce
+            .checked_add(1)
+            .ok_or(DesktopError::RemoteCommand)?;
+        vault.controller_nonce = next;
+        Ok(next)
+    })
 }
 
 fn load_or_create_companion_secret() -> Result<Zeroizing<[u8; 32]>, DesktopError> {
-    let entry = Entry::new(CREDENTIAL_SERVICE, COMPANION_SECRET_ACCOUNT)
-        .map_err(|_| DesktopError::Credential)?;
-    match entry.get_secret() {
-        Ok(stored) => {
-            let stored = Zeroizing::new(stored);
-            let secret: [u8; 32] = stored
-                .as_slice()
-                .try_into()
-                .map_err(|_| DesktopError::Credential)?;
-            Ok(Zeroizing::new(secret))
-        }
-        Err(KeyringError::NoEntry) => {
-            let mut secret = Zeroizing::new([0_u8; 32]);
-            OsRng.fill_bytes(secret.as_mut());
-            entry
-                .set_secret(secret.as_ref())
-                .map_err(|_| DesktopError::Credential)?;
-            Ok(secret)
-        }
-        Err(_) => Err(DesktopError::Credential),
-    }
+    load_or_create_secret_32(COMPANION_SECRET_ACCOUNT)
 }
 
 fn local_socket_name(label: &str) -> Result<Name<'static>, DesktopError> {
@@ -1392,25 +1529,25 @@ async fn send_companion_request(
 }
 
 fn load_password(account: &str) -> Result<String, DesktopError> {
-    Entry::new(CREDENTIAL_SERVICE, account)
-        .and_then(|entry| entry.get_password())
-        .map_err(|_| DesktopError::Credential)
+    read_credential_vault(|vault| {
+        let value = match account {
+            ACCESS_TOKEN_ACCOUNT => vault.access_token.clone(),
+            ACCESS_EXPIRES_AT_ACCOUNT => vault.access_expires_at.map(|value| value.to_string()),
+            REFRESH_TOKEN_ACCOUNT => vault.refresh_token.clone(),
+            DEVICE_ID_ACCOUNT => vault.device_id.clone(),
+            CONTROLLER_NONCE_ACCOUNT => Some(vault.controller_nonce.to_string()),
+            _ => None,
+        };
+        value.ok_or(DesktopError::Credential)
+    })
 }
 
 fn api_origin() -> String {
     std::env::var("CROW_API_ORIGIN").unwrap_or_else(|_| PRODUCTION_API_ORIGIN.into())
 }
 
-fn store_password(account: &str, value: &str) -> Result<(), DesktopError> {
-    Entry::new(CREDENTIAL_SERVICE, account)
-        .and_then(|entry| entry.set_password(value))
-        .map_err(|_| DesktopError::Credential)
-}
-
 fn credential_exists(account: &str) -> bool {
-    Entry::new(CREDENTIAL_SERVICE, account)
-        .and_then(|entry| entry.get_password())
-        .is_ok_and(|value| !value.is_empty())
+    load_password(account).is_ok_and(|value| !value.is_empty())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1433,6 +1570,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_agent_status,
+            unlock_device_credentials,
             send_local_command,
             begin_device_authorization,
             complete_device_authorization,
@@ -1492,17 +1630,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_authorization_suppresses_background_credential_reads() {
+    async fn startup_polling_stays_locked_without_credential_reads() {
         let state = DesktopState::new();
-        *state
-            .authorization_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(false);
-
+        assert!(!state.device_authorized());
         assert!(matches!(
             state.device_tokens().await,
             Err(DesktopError::NoAuthorization)
         ));
         assert!(state.device_tokens.lock().await.is_none());
+    }
+
+    #[test]
+    fn credential_vault_debug_redacts_every_secret() {
+        let mut vault = DesktopCredentialVaultV1::default();
+        vault.version = CREDENTIAL_VAULT_VERSION;
+        vault.signing_seed = Some("signing-sentinel".into());
+        vault.refresh_token = Some("refresh-sentinel".into());
+        vault.hyperliquid_api_wallet_key = Some("wallet-sentinel".into());
+        let debug = format!("{vault:?}");
+        assert!(!debug.contains("signing-sentinel"));
+        assert!(!debug.contains("refresh-sentinel"));
+        assert!(!debug.contains("wallet-sentinel"));
+        assert!(debug.contains("signing_seed_present: true"));
     }
 }

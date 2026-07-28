@@ -289,7 +289,7 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
 .runtime-facts dd, .arena-card dd { margin: 0; color: var(--bone-2); font: 500 10px var(--mono); }
 
 .action-row { display: flex; gap: 8px; margin-top: 20px; }
-.action-row button, .arena-card button, .remote-run button, .primary-action {
+.action-row button, .arena-card button, .remote-run button, .primary-action, .credential-actions button {
   min-height: 42px;
   padding: 0 17px;
   border: 1px solid var(--line-strong);
@@ -365,6 +365,9 @@ button:disabled { cursor: not-allowed; opacity: .38; }
 .empty-state p, .authorize-card p { margin: 12px 0 0; }
 
 .authorize-card { grid-template-columns: 80px minmax(0, 1fr) auto; }
+.credential-actions { display: grid; gap: 8px; min-width: 150px; }
+.credential-actions button:not(.primary-action) { border: 1px solid var(--line-strong); background: transparent; color: var(--bone-2); }
+.credential-actions button:not(.primary-action):hover:not(:disabled) { border-color: var(--bone); color: var(--bone); }
 .device-card { padding: 25px; border: 1px solid var(--line); background: var(--ink-2); }
 .device-title { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 13px; }
 .device-title h2 { margin: 0; }
