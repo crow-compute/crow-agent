@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { App, parseHandoffSnapshot } from "./App";
+import { App, arenaLaunchFailure, parseHandoffSnapshot } from "./App";
 
 const harnessMock = vi.hoisted(() => ({
   authorized: false,
@@ -80,5 +80,13 @@ describe("Crow Agent shell", () => {
       .toEqual({ equity_micro_usdc: 1000000, positions: [{ quantity_e8: -42 }] });
     expect(() => parseHandoffSnapshot('{"equity":1.25}')).toThrow("handoff_snapshot_invalid");
     expect(() => parseHandoffSnapshot("[1,2,3]")).toThrow("handoff_snapshot_invalid");
+  });
+
+  it("renders bounded launch diagnostics without leaking raw errors", () => {
+    expect(arenaLaunchFailure("device_authorization_failed")).toMatch(/Reauthorize/);
+    expect(arenaLaunchFailure(new Error("agent_version_invalid"))).toMatch(/encrypted agent version/);
+    expect(arenaLaunchFailure("unexpected secret-shaped detail")).toBe(
+      "Arena launch failed closed. No order was submitted.",
+    );
   });
 });

@@ -85,6 +85,26 @@ export function parseHandoffSnapshot(raw: string): Record<string, unknown> | nul
   return value as Record<string, unknown>;
 }
 
+export function arenaLaunchFailure(error: unknown) {
+  const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+  switch (code) {
+    case "handoff_snapshot_invalid":
+      return "The handoff snapshot must be a structured object containing fixed-point integers only.";
+    case "device_authorization_failed":
+      return "The local device token could not be forked for the runner. Reauthorize this device and retry.";
+    case "agent_version_invalid":
+      return "The encrypted agent version could not be opened by this device or is not eligible for the arena.";
+    case "arena_operation_failed":
+      return "Crow rejected the enrollment or immutable arena prerequisite. No order was submitted.";
+    case "local_companion_unavailable":
+      return "The signed local companion did not reach a paused reconciled run. No order was submitted.";
+    case "hyperliquid_api_wallet_unavailable":
+      return "The Hyperliquid execution account or local API wallet is unavailable.";
+    default:
+      return "Arena launch failed closed. No order was submitted.";
+  }
+}
+
 export function App() {
   const [view, setView] = useState<View>("overview");
   const [status, setStatus] = useState(initial);
@@ -277,11 +297,7 @@ export function App() {
       setView("overview");
       setNotice("Local arena staged and reconciled in pause. Review the run, then Resume.");
     } catch (error) {
-      setNotice(
-        error instanceof Error && error.message === "handoff_snapshot_invalid"
-          ? "The handoff snapshot must be a structured object containing fixed-point integers only."
-          : "Arena launch failed closed. No order was submitted.",
-      );
+      setNotice(arenaLaunchFailure(error));
     } finally {
       setArenaBusy(false);
     }
