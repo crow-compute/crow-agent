@@ -91,9 +91,13 @@ OpenProphet is a noncommercial project and no OpenProphet source is included.
 Release workflows build the macOS universal desktop, Windows x86-64 desktop,
 and Linux x86-64 daemon. The attest job refuses a release with a high or
 critical Grype finding and emits an SPDX SBOM, SHA-256 checksums, a
-`ReleaseManifestV1`, and detached Minisign signatures. Code-signing and
-notarization credentials are supplied only by the repository's protected
-release environment.
+`ReleaseManifestV1`, and detached Minisign signatures. Private-alpha desktop
+installers are distributed directly without Apple Developer ID notarization or
+Windows Authenticode. Users should therefore expect Gatekeeper or SmartScreen
+publisher warnings and must opt in manually. Public/general-availability
+distribution requires a separate product decision, native platform-signing
+credentials supplied only through the protected release environment, and a
+native platform-signing gate.
 
 Desktop builds also produce Tauri updater signatures. The public updater key is
 embedded in `tauri.conf.json`; its private key exists only as the protected
