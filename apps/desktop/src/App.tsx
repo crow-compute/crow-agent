@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import crowMark from "./assets/crow-mark.png";
 import {
   beginDeviceAuthorization,
   completeDeviceAuthorization,
@@ -317,8 +318,8 @@ export function App() {
   return (
     <main className="app-shell">
       <aside className="rail">
-        <div className="brand-lockup" aria-label="Crow Local Agent">
-          <span className="brand-mark" aria-hidden="true">C</span>
+        <div className="brand-lockup">
+          <img className="brand-mark" src={crowMark} alt="Crow" />
           <span>
             <strong>CROW</strong>
             <small>LOCAL AGENT</small>

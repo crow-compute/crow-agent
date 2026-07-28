@@ -34,6 +34,7 @@ use tauri_plugin_shell::{
 };
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -47,7 +48,6 @@ const REFRESH_TOKEN_ACCOUNT: &str = "device-refresh-token";
 const DEVICE_ID_ACCOUNT: &str = "device-id";
 const CONTROLLER_NONCE_ACCOUNT: &str = "controller-nonce";
 const COMPANION_SECRET_ACCOUNT: &str = "companion-ipc-secret";
-const COMPANION_NONCE_ACCOUNT: &str = "companion-ipc-nonce";
 const JOURNAL_KEY_ACCOUNT: &str = "journal-key";
 const HYPERLIQUID_API_WALLET_ACCOUNT: &str = "hyperliquid-api-wallet-key";
 const PRODUCTION_API_ORIGIN: &str = "https://api.crowcompute.ai";
@@ -199,10 +199,14 @@ impl DesktopError {
 struct DesktopState {
     pending_authorization: Mutex<Option<DeviceAuthorizationSession>>,
     command_nonce: Mutex<()>,
-    companion_nonce: Mutex<()>,
+    companion_nonce: Mutex<u64>,
     companion_credentials: Mutex<Option<Arc<CompanionCredentials>>>,
+    companion_credentials_unavailable: AtomicBool,
     companion_child: Mutex<Option<CommandChild>>,
     companion_spawned: Arc<AtomicBool>,
+    authorization_status: Mutex<Option<bool>>,
+    device_tokens: AsyncMutex<Option<Arc<DeviceTokens>>>,
+    device_tokens_unavailable: AtomicBool,
 }
 
 struct CompanionCredentials {
@@ -215,14 +219,24 @@ impl DesktopState {
         Self {
             pending_authorization: Mutex::new(None),
             command_nonce: Mutex::new(()),
-            companion_nonce: Mutex::new(()),
+            companion_nonce: Mutex::new(0),
             companion_credentials: Mutex::new(None),
+            companion_credentials_unavailable: AtomicBool::new(false),
             companion_child: Mutex::new(None),
             companion_spawned: Arc::new(AtomicBool::new(false)),
+            authorization_status: Mutex::new(None),
+            device_tokens: AsyncMutex::new(None),
+            device_tokens_unavailable: AtomicBool::new(false),
         }
     }
 
     fn companion_credentials(&self) -> Result<Arc<CompanionCredentials>, DesktopError> {
+        if self
+            .companion_credentials_unavailable
+            .load(Ordering::SeqCst)
+        {
+            return Err(DesktopError::Credential);
+        }
         let mut slot = self
             .companion_credentials
             .lock()
@@ -230,7 +244,14 @@ impl DesktopState {
         if let Some(credentials) = slot.as_ref() {
             return Ok(Arc::clone(credentials));
         }
-        let secret = load_or_create_companion_secret()?;
+        let secret = match load_or_create_companion_secret() {
+            Ok(secret) => secret,
+            Err(error) => {
+                self.companion_credentials_unavailable
+                    .store(true, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
         let digest = sha256(secret.as_ref());
         let credentials = Arc::new(CompanionCredentials {
             secret,
@@ -238,6 +259,52 @@ impl DesktopState {
         });
         *slot = Some(Arc::clone(&credentials));
         Ok(credentials)
+    }
+
+    fn device_authorized(&self) -> bool {
+        let Ok(mut status) = self.authorization_status.lock() else {
+            return false;
+        };
+        if let Some(authorized) = *status {
+            return authorized;
+        }
+        let authorized = credential_exists(REFRESH_TOKEN_ACCOUNT);
+        *status = Some(authorized);
+        authorized
+    }
+
+    async fn cache_device_tokens(&self, tokens: DeviceTokens) {
+        self.device_tokens_unavailable
+            .store(false, Ordering::SeqCst);
+        if let Ok(mut status) = self.authorization_status.lock() {
+            *status = Some(true);
+        }
+        *self.device_tokens.lock().await = Some(Arc::new(tokens));
+    }
+
+    async fn device_tokens(&self) -> Result<Arc<DeviceTokens>, DesktopError> {
+        if self.device_tokens_unavailable.load(Ordering::SeqCst) {
+            return Err(DesktopError::Credential);
+        }
+        let mut slot = self.device_tokens.lock().await;
+        if let Some(tokens) = slot.as_ref()
+            && tokens.access_expires_at > OffsetDateTime::now_utc() + time::Duration::minutes(1)
+        {
+            return Ok(Arc::clone(tokens));
+        }
+        match load_or_rotate_desktop_tokens().await {
+            Ok(tokens) => {
+                let tokens = Arc::new(tokens);
+                *slot = Some(Arc::clone(&tokens));
+                Ok(tokens)
+            }
+            Err(error) => {
+                if matches!(error, DesktopError::Credential) {
+                    self.device_tokens_unavailable.store(true, Ordering::SeqCst);
+                }
+                Err(error)
+            }
+        }
     }
 
     fn launch_companion(&self, app: &tauri::AppHandle) -> Result<(), DesktopError> {
@@ -343,13 +410,7 @@ impl DesktopState {
         action: CompanionActionV1,
     ) -> Result<CompanionResponseV1, DesktopError> {
         let credentials = self.companion_credentials()?;
-        let nonce = {
-            let _guard = self
-                .companion_nonce
-                .lock()
-                .map_err(|_| DesktopError::Companion)?;
-            next_persisted_nonce(COMPANION_NONCE_ACCOUNT)?
-        };
+        let nonce = next_companion_nonce(&self.companion_nonce)?;
         let request = CompanionRequestV1::sign(&credentials.secret, nonce, action)
             .map_err(|_| DesktopError::Companion)?;
         tokio::time::timeout(
@@ -366,6 +427,16 @@ async fn get_agent_status(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<AgentStatus, String> {
+    let device_authorized = state.device_authorized();
+    if !device_authorized {
+        return Ok(AgentStatus {
+            protocol: HARNESS_PROTOCOL_V1,
+            execution_boundary: "local_device",
+            daemon: "stopped".into(),
+            active_run: None,
+            device_authorized,
+        });
+    }
     let mut response = state
         .companion_request(CompanionActionV1::Status)
         .await
@@ -386,7 +457,7 @@ async fn get_agent_status(
         active_run: response
             .and_then(|value| value.active_run)
             .map(|run_id| run_id.to_string()),
-        device_authorized: credential_exists(REFRESH_TOKEN_ACCOUNT),
+        device_authorized,
     })
 }
 
@@ -413,7 +484,7 @@ async fn send_local_command(
         execution_boundary: "local_device",
         daemon: response.execution_state,
         active_run: response.active_run.map(|run_id| run_id.to_string()),
-        device_authorized: credential_exists(REFRESH_TOKEN_ACCOUNT),
+        device_authorized: state.device_authorized(),
     })
 }
 
@@ -472,6 +543,7 @@ async fn complete_device_authorization(
                 access_expires_at: tokens.access_expires_at,
             };
             store_tokens(&tokens).map_err(|error| error.code().to_owned())?;
+            state.cache_device_tokens(tokens).await;
             Ok(authorized)
         }
         Err(error @ (DeviceAuthorizationError::Pending | DeviceAuthorizationError::Request(_))) => {
@@ -489,8 +561,9 @@ async fn complete_device_authorization(
 }
 
 #[tauri::command]
-async fn get_remote_state() -> Result<RemoteState, String> {
-    let token = rotate_desktop_tokens()
+async fn get_remote_state(state: State<'_, DesktopState>) -> Result<RemoteState, String> {
+    let token = state
+        .device_tokens()
         .await
         .map_err(|error| error.code().to_owned())?;
     let devices = device_api::<Value>(
@@ -530,8 +603,9 @@ async fn get_public_arenas() -> Result<PublicArenaState, String> {
 }
 
 #[tauri::command]
-async fn get_agent_versions() -> Result<AgentVersionState, String> {
-    let token = rotate_desktop_tokens()
+async fn get_agent_versions(state: State<'_, DesktopState>) -> Result<AgentVersionState, String> {
+    let token = state
+        .device_tokens()
         .await
         .map_err(|error| error.code().to_owned())?;
     let versions = list_agent_version_envelopes(&token.access_token)
@@ -547,8 +621,10 @@ async fn create_agent_version(
     name: String,
     model_id: String,
     system_instructions: String,
+    state: State<'_, DesktopState>,
 ) -> Result<AgentVersionSummary, String> {
-    let token = rotate_desktop_tokens()
+    let token = state
+        .device_tokens()
         .await
         .map_err(|error| error.code().to_owned())?;
     let devices = device_api::<Value>(
@@ -623,11 +699,13 @@ async fn enroll_arena(
     arena_id: String,
     agent_version_id: String,
     model_id: String,
+    state: State<'_, DesktopState>,
 ) -> Result<(), String> {
     let arena_id = Uuid::parse_str(&arena_id).map_err(|_| DesktopError::Arena.code().to_owned())?;
     let agent_version_id = Uuid::parse_str(&agent_version_id)
         .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
-    let token = rotate_desktop_tokens()
+    let token = state
+        .device_tokens()
         .await
         .map_err(|error| error.code().to_owned())?;
     enroll_arena_with_token(arena_id, agent_version_id, &model_id, &token.access_token)
@@ -660,7 +738,8 @@ async fn start_local_arena(
     let arena_id = Uuid::parse_str(&arena_id).map_err(|_| DesktopError::Arena.code().to_owned())?;
     let agent_version_id = Uuid::parse_str(&agent_version_id)
         .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
-    let token = rotate_desktop_tokens()
+    let token = state
+        .device_tokens()
         .await
         .map_err(|error| error.code().to_owned())?;
     let arenas = fetch_public_arenas()
@@ -816,7 +895,8 @@ async fn send_remote_command(
         controller,
     )
     .map_err(|_| DesktopError::RemoteCommand.code().to_owned())?;
-    let token = rotate_desktop_tokens()
+    let token = state
+        .device_tokens()
         .await
         .map_err(|error| error.code().to_owned())?;
     let response = device_api::<Value>(
@@ -903,7 +983,7 @@ fn store_tokens(tokens: &DeviceTokens) -> Result<(), DesktopError> {
     store_password(DEVICE_ID_ACCOUNT, &tokens.device_id.to_string())
 }
 
-async fn rotate_desktop_tokens() -> Result<DeviceTokens, DesktopError> {
+async fn load_or_rotate_desktop_tokens() -> Result<DeviceTokens, DesktopError> {
     if let (Ok(access_token), Ok(refresh_token), Ok(device_id), Ok(expires_at)) = (
         load_password(ACCESS_TOKEN_ACCOUNT),
         load_password(REFRESH_TOKEN_ACCOUNT),
@@ -1202,6 +1282,12 @@ fn next_controller_nonce() -> Result<u64, DesktopError> {
     next_persisted_nonce(CONTROLLER_NONCE_ACCOUNT)
 }
 
+fn next_companion_nonce(nonce: &Mutex<u64>) -> Result<u64, DesktopError> {
+    let mut nonce = nonce.lock().map_err(|_| DesktopError::Companion)?;
+    *nonce = nonce.checked_add(1).ok_or(DesktopError::Companion)?;
+    Ok(*nonce)
+}
+
 fn next_persisted_nonce(account: &str) -> Result<u64, DesktopError> {
     let previous = load_password(account)
         .ok()
@@ -1366,4 +1452,22 @@ fn should_show_main_window(event: &tauri::RunEvent) -> bool {
 #[cfg(not(target_os = "macos"))]
 fn should_show_main_window(event: &tauri::RunEvent) -> bool {
     matches!(event, tauri::RunEvent::Ready)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn companion_poll_nonce_is_monotonic_without_keychain_io() {
+        let nonce = Mutex::new(0);
+        assert_eq!(
+            next_companion_nonce(&nonce).map_err(|error| error.code()),
+            Ok(1)
+        );
+        assert_eq!(
+            next_companion_nonce(&nonce).map_err(|error| error.code()),
+            Ok(2)
+        );
+    }
 }

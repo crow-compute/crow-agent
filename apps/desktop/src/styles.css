@@ -48,14 +48,10 @@ button:focus-visible { outline: 2px solid var(--heat); outline-offset: 3px; }
 
 .brand-lockup { display: flex; align-items: center; gap: 12px; }
 .brand-mark {
-  width: 44px;
-  height: 44px;
-  display: grid;
-  place-items: center;
-  border: 2px solid var(--bone);
-  color: var(--heat);
-  font: 700 27px/.9 var(--display);
-  transform: skew(-5deg);
+  width: 54px;
+  height: auto;
+  display: block;
+  object-fit: contain;
 }
 .brand-lockup > span:last-child { display: grid; gap: 3px; }
 .brand-lockup strong { font: 600 20px/.9 var(--display); letter-spacing: .06em; }
@@ -490,7 +486,7 @@ button:disabled { cursor: not-allowed; opacity: .38; }
   .rail { padding: 22px 14px; }
   .brand-lockup > span:last-child, .nav-item:not(.active)::after, .nav-item { font-size: 0; }
   .brand-lockup { justify-content: center; }
-  .brand-mark { width: 40px; height: 40px; }
+  .brand-mark { width: 42px; }
   .rail nav { margin: 55px -14px 0; }
   .nav-item { justify-content: center; padding: 0; }
   .nav-item span { width: auto; font-size: 9px; }
