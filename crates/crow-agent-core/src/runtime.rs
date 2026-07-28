@@ -98,15 +98,15 @@ pub struct CycleContext<'a> {
     pub run_id: Uuid,
     pub cycle_id: Uuid,
     pub model_id: &'a str,
-    pub market: &'a MarketState,
-    pub portfolio: &'a PortfolioState,
+    pub markets: &'a BTreeMap<String, MarketState>,
+    pub portfolios: &'a BTreeMap<String, PortfolioState>,
     pub cycle_context: Value,
 }
 
 #[derive(Debug, Clone)]
 pub struct CycleOutcome {
     pub proposal: Proposal,
-    pub order: OrderDecision,
+    pub order: Result<OrderDecision, PolicyError>,
     pub receipts: Vec<ArenaInferenceReceiptV1>,
     pub tool_results: Vec<ToolResult>,
 }
@@ -182,14 +182,22 @@ where
                 return Err(RuntimeError::AmbiguousTurn);
             }
             if let Some(proposal) = turn.output.proposal {
+                let market = context
+                    .markets
+                    .get(&proposal.symbol)
+                    .ok_or(RuntimeError::ToolUnavailable)?;
+                let portfolio = context
+                    .portfolios
+                    .get(&proposal.symbol)
+                    .ok_or(RuntimeError::ToolUnavailable)?;
                 let order = evaluate_proposal(
                     &proposal,
                     &PolicyContext {
                         rules: &context.manifest.risk_rules,
-                        market: context.market,
-                        portfolio: context.portfolio,
+                        market,
+                        portfolio,
                     },
-                )?;
+                );
                 return Ok(CycleOutcome {
                     proposal,
                     order,
@@ -307,17 +315,20 @@ mod tests {
         });
         runtime.register_tool(Box::new(CandlesTool))?;
         let manifest = manifest();
-        let market = MarketState {
-            symbol: "BTC".into(),
-            mark_price_micro_usdc: 100_000_000,
-            oracle_price_micro_usdc: 100_000_000,
-            spread_bps: 4,
-            book_age_seconds: 1,
-            ask_depth_micro_usdc: 10_000_000,
-            bid_depth_micro_usdc: 10_000_000,
-            size_decimals: 5,
-            delisted: false,
-        };
+        let markets = BTreeMap::from([(
+            "BTC".into(),
+            MarketState {
+                symbol: "BTC".into(),
+                mark_price_micro_usdc: 100_000_000,
+                oracle_price_micro_usdc: 100_000_000,
+                spread_bps: 4,
+                book_age_seconds: 1,
+                ask_depth_micro_usdc: 10_000_000,
+                bid_depth_micro_usdc: 10_000_000,
+                size_decimals: 5,
+                delisted: false,
+            },
+        )]);
         let portfolio = PortfolioState {
             equity_micro_usdc: 1_000_000_000,
             available_collateral_micro_usdc: 1_000_000_000,
@@ -326,20 +337,21 @@ mod tests {
             symbol_position_micro_usdc: 0,
             orders_today: 0,
         };
+        let portfolios = BTreeMap::from([("BTC".into(), portfolio)]);
         let outcome = runtime
             .execute_cycle(&CycleContext {
                 manifest: &manifest,
                 run_id: Uuid::from_u128(10),
                 cycle_id: Uuid::from_u128(11),
                 model_id: ALLOWED_MODELS[0],
-                market: &market,
-                portfolio: &portfolio,
+                markets: &markets,
+                portfolios: &portfolios,
                 cycle_context: json!({"candle_closed_at": "2026-07-01T00:00:00Z"}),
             })
             .await?;
         assert_eq!(outcome.receipts.len(), 2);
         assert_eq!(outcome.tool_results.len(), 1);
-        assert_eq!(outcome.order.symbol, "BTC");
+        assert_eq!(outcome.order?.symbol, "BTC");
         Ok(())
     }
 

@@ -22,7 +22,7 @@ pub struct Proposal {
     pub reduce_only: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketState {
     pub symbol: String,
     pub mark_price_micro_usdc: i64,
@@ -35,7 +35,7 @@ pub struct MarketState {
     pub delisted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortfolioState {
     pub equity_micro_usdc: i64,
     pub available_collateral_micro_usdc: i64,

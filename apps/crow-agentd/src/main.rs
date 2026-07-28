@@ -43,6 +43,7 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod live_run;
 mod soak;
 
 const REFRESH_TOKEN_SECRET: &str = "device-refresh-token";
@@ -108,6 +109,8 @@ struct DaemonConfig {
     api_origin: String,
     #[serde(default = "default_state_directory")]
     state_directory: PathBuf,
+    #[serde(default)]
+    live_arena: Option<live_run::LiveArenaConfig>,
 }
 
 fn production_api_origin() -> String {
@@ -145,18 +148,18 @@ struct RemoteCommandDelivery {
 }
 
 #[derive(Debug, Clone)]
-struct ExecutionGate {
+pub(crate) struct ExecutionGate {
     state: Arc<AtomicU8>,
 }
 
 impl ExecutionGate {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(EXECUTION_PAUSED)),
         }
     }
 
-    fn apply(&self, action: RemoteAction) -> bool {
+    pub(crate) fn apply(&self, action: RemoteAction) -> bool {
         match action {
             RemoteAction::Pause => {
                 self.state.store(EXECUTION_PAUSED, Ordering::SeqCst);
@@ -178,12 +181,16 @@ impl ExecutionGate {
         }
     }
 
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self.state.load(Ordering::SeqCst) {
             EXECUTION_RUNNING => "running",
             EXECUTION_STOPPED => "stopped",
             _ => "paused",
         }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == EXECUTION_RUNNING
     }
 }
 
@@ -199,6 +206,8 @@ enum DaemonError {
     EncryptionCredential,
     #[error("journal credential must be exactly 32 raw bytes")]
     JournalCredential,
+    #[error("Hyperliquid API wallet credential must be exactly 32 raw bytes")]
+    ApiWalletCredential,
     #[error("device token credential is invalid")]
     DeviceTokenCredential,
     #[error("CREDENTIALS_DIRECTORY is required")]
@@ -229,6 +238,8 @@ enum DaemonError {
     Companion(#[from] CompanionIpcError),
     #[error("headless component soak failed")]
     Soak(#[from] soak::SoakError),
+    #[error("live arena runtime failed closed")]
+    LiveRun(#[from] live_run::LiveRunError),
     #[error("TLS provider initialization failed")]
     TlsProvider(#[from] TlsProviderError),
 }
@@ -332,13 +343,35 @@ async fn main() -> Result<(), DaemonError> {
         }
         Command::Run { config } => {
             let config = serde_json::from_slice::<DaemonConfig>(&fs::read(config)?)?;
+            let prepared_live = config
+                .live_arena
+                .clone()
+                .map(live_run::prepare)
+                .transpose()?;
             let identity = load_identity()?;
             fs::create_dir_all(&config.state_directory)?;
             let journal_key = load_credential_32("journal-key", DaemonError::JournalCredential)?;
             let journal =
                 EncryptedJournal::open(&config.state_directory.join("journal.db"), journal_key)?;
             let refresh_token = load_refresh_token(&journal)?;
-            run_relay(&config, &identity, &journal, refresh_token).await?;
+            let api_wallet_key = if prepared_live.is_some() {
+                Some(Zeroizing::new(load_credential_32(
+                    "hyperliquid-api-wallet-key",
+                    DaemonError::ApiWalletCredential,
+                )?))
+            } else {
+                None
+            };
+            Box::pin(run_relay(
+                &config,
+                &identity,
+                &journal,
+                journal_key,
+                refresh_token,
+                prepared_live.as_ref(),
+                api_wallet_key.as_ref(),
+            ))
+            .await?;
         }
     }
     Ok(())
@@ -521,7 +554,10 @@ async fn run_relay(
     config: &DaemonConfig,
     identity: &DeviceIdentity,
     journal: &EncryptedJournal,
+    journal_key: [u8; 32],
     mut refresh_token: Zeroizing<String>,
+    live_arena: Option<&live_run::PreparedLiveArena>,
+    api_wallet_key: Option<&Zeroizing<[u8; 32]>>,
 ) -> Result<(), DaemonError> {
     let url = Url::parse(&config.relay_url).map_err(|_| DaemonError::RelayUrl)?;
     if url.scheme() != "wss" {
@@ -529,6 +565,7 @@ async fn run_relay(
     }
     let authorization = DeviceAuthorizationClient::new(&config.api_origin)?;
     let execution_gate = ExecutionGate::new();
+    let active_run = Arc::new(std::sync::Mutex::new(None));
     let mut backoff = Duration::from_secs(1);
     loop {
         let tokens = match authorization.rotate(&refresh_token, identity).await {
@@ -542,16 +579,40 @@ async fn run_relay(
         };
         journal.put_secret(REFRESH_TOKEN_SECRET, tokens.refresh_token.as_bytes())?;
         refresh_token = Zeroizing::new(tokens.refresh_token.to_string());
-        match relay_session(
+        let relay = relay_session(
             config,
             identity,
             journal,
             &tokens.access_token,
             tokens.access_expires_at,
             &execution_gate,
-        )
-        .await
+            &active_run,
+        );
+        let session_result = if let (Some(live_arena), Some(api_wallet_key)) =
+            (live_arena, api_wallet_key)
+            && execution_gate.label() != "stopped"
         {
+            tokio::select! {
+                result = relay => result,
+                result = live_run::run_session(
+                    live_arena,
+                    &config.api_origin,
+                    &config.state_directory,
+                    journal_key,
+                    api_wallet_key,
+                    &tokens.access_token,
+                    identity,
+                    &execution_gate,
+                    &active_run,
+                ) => match result {
+                    Ok(live_run::LiveSessionOutcome::Stopped) => Ok(()),
+                    Err(error) => Err(DaemonError::LiveRun(error)),
+                },
+            }
+        } else {
+            relay.await
+        };
+        match session_result {
             Ok(()) => {
                 backoff = Duration::from_secs(1);
             }
@@ -574,6 +635,7 @@ async fn relay_session(
     access_token: &Zeroizing<String>,
     access_expires_at: OffsetDateTime,
     execution_gate: &ExecutionGate,
+    active_run: &Arc<std::sync::Mutex<Option<Uuid>>>,
 ) -> Result<(), DaemonError> {
     let mut connection = connect_authenticated(config, identity, access_token).await?;
     info!(device_id = %config.device_id, "outbound relay authentication sent");
@@ -596,6 +658,9 @@ async fn relay_session(
                 return Ok(());
             }
             _ = heartbeat.tick() => {
+                let active_run = *active_run
+                    .lock()
+                    .map_err(|_| DaemonError::RemoteCommand)?;
                 let envelope = OutboundEnvelope {
                     protocol: HARNESS_PROTOCOL_V1,
                     kind: "heartbeat",
@@ -603,7 +668,7 @@ async fn relay_session(
                     timestamp: OffsetDateTime::now_utc(),
                     payload: json!({
                         "device_id": config.device_id,
-                        "active_run": null,
+                        "active_run": active_run,
                         "execution_state": execution_gate.label()
                     }),
                 };
@@ -617,11 +682,15 @@ async fn relay_session(
                             info!("relay requested shutdown");
                             return Ok(());
                         }
+                        let command_run = *active_run
+                            .lock()
+                            .map_err(|_| DaemonError::RemoteCommand)?;
                         if let Some(acknowledgement) = apply_relay_message(
                             envelope,
                             config.device_id,
                             execution_gate,
                             journal,
+                            command_run,
                         )? {
                             connection.send(Message::Text(serde_json::to_string(&acknowledgement)?.into())).await?;
                         }
@@ -687,6 +756,7 @@ fn apply_relay_message(
     device_id: Uuid,
     execution_gate: &ExecutionGate,
     journal: &EncryptedJournal,
+    active_run: Option<Uuid>,
 ) -> Result<Option<OutboundEnvelope<'static>>, DaemonError> {
     if envelope.protocol != HARNESS_PROTOCOL_V1 {
         return Err(DaemonError::Challenge);
@@ -702,6 +772,7 @@ fn apply_relay_message(
                 .and_then(|value| value.as_slice().try_into().ok().map(u64::from_be_bytes));
             if command.command_id.to_string() != envelope.id
                 || command.target_device_id != device_id
+                || active_run != Some(command.run_id)
                 || command.relay_receipt.is_none()
                 || command
                     .verify(&delivery.controller_public_key, OffsetDateTime::now_utc())
@@ -770,8 +841,13 @@ mod tests {
         {
             let journal = EncryptedJournal::open(&journal_path, [3_u8; 32])?;
             let gate = ExecutionGate::new();
-            let acknowledgement =
-                apply_relay_message(envelope(), target_device_id, &gate, &journal)?;
+            let acknowledgement = apply_relay_message(
+                envelope(),
+                target_device_id,
+                &gate,
+                &journal,
+                Some(command.run_id),
+            )?;
             assert!(acknowledgement.is_some());
             assert_eq!(gate.label(), "running");
         }
@@ -782,7 +858,8 @@ mod tests {
                 envelope(),
                 target_device_id,
                 &restarted_gate,
-                &restarted_journal
+                &restarted_journal,
+                Some(command.run_id),
             )
             .is_err()
         );

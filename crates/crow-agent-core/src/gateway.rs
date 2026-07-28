@@ -50,7 +50,7 @@ pub struct GatewayClient {
 }
 
 impl GatewayClient {
-    pub fn new(api_origin: &str, token: String) -> Result<Self, GatewayError> {
+    pub fn new(api_origin: &str, token: &str) -> Result<Self, GatewayError> {
         let endpoint = Url::parse(api_origin)
             .map_err(|_| GatewayError::Url)?
             .join("/api/v1/harness/inference")
@@ -61,7 +61,7 @@ impl GatewayClient {
         let https_only = endpoint.scheme() == "https";
         Ok(Self {
             endpoint,
-            token: Zeroizing::new(token),
+            token: Zeroizing::new(token.to_owned()),
             client: reqwest::Client::builder().https_only(https_only).build()?,
         })
     }
