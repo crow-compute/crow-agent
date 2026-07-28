@@ -17,11 +17,14 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use tauri::{Manager as _, State};
-use tauri_plugin_shell::{ShellExt as _, process::CommandChild};
+use tauri_plugin_shell::{
+    ShellExt as _,
+    process::{CommandChild, CommandEvent},
+};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use url::Url;
@@ -134,7 +137,7 @@ struct DesktopState {
     companion_secret: Zeroizing<[u8; 32]>,
     companion_ipc_name: String,
     companion_child: Mutex<Option<CommandChild>>,
-    companion_spawned: AtomicBool,
+    companion_spawned: Arc<AtomicBool>,
 }
 
 impl DesktopState {
@@ -148,7 +151,7 @@ impl DesktopState {
             companion_secret: secret,
             companion_ipc_name: format!("crow-agent-{}", hex::encode(&digest[..12])),
             companion_child: Mutex::new(None),
-            companion_spawned: AtomicBool::new(false),
+            companion_spawned: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -178,7 +181,15 @@ impl DesktopState {
             return Err(DesktopError::Companion);
         };
         *slot = Some(child);
-        tauri::async_runtime::spawn(async move { while events.recv().await.is_some() {} });
+        let spawned = Arc::clone(&self.companion_spawned);
+        tauri::async_runtime::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if matches!(event, CommandEvent::Error(_) | CommandEvent::Terminated(_)) {
+                    spawned.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+        });
         Ok(())
     }
 
@@ -205,11 +216,21 @@ impl DesktopState {
 }
 
 #[tauri::command]
-async fn get_agent_status(state: State<'_, DesktopState>) -> Result<AgentStatus, String> {
-    let response = state
+async fn get_agent_status(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<AgentStatus, String> {
+    let mut response = state
         .companion_request(CompanionActionV1::Status)
         .await
         .ok();
+    if response.is_none() && state.launch_companion(&app).is_ok() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        response = state
+            .companion_request(CompanionActionV1::Status)
+            .await
+            .ok();
+    }
     Ok(AgentStatus {
         protocol: HARNESS_PROTOCOL_V1,
         execution_boundary: "local_device",
@@ -639,7 +660,7 @@ pub fn run() {
         );
         std::process::exit(1);
     });
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(state)
         .setup(|app| {
@@ -656,7 +677,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                let _ = window.minimize();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -667,9 +688,20 @@ pub fn run() {
             get_remote_state,
             send_remote_command
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
             eprintln!("Crow Agent desktop runtime failed: {error}");
             std::process::exit(1);
         });
+    app.run(|handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::Ready | tauri::RunEvent::Reopen { .. }
+        ) && let Some(window) = handle.get_webview_window("main")
+        {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    });
 }

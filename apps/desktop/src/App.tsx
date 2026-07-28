@@ -129,7 +129,7 @@ export function App() {
         <article>
           <p className="label">Runtime</p>
           <h2>Local daemon</h2>
-          <p>Background execution continues independently of this window.</p>
+          <p>Closing minimizes this controller; background execution continues.</p>
           <div className="local-controls" role="group" aria-label="Local daemon controls">
             <button
               type="button"

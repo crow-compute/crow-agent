@@ -42,8 +42,8 @@ is generated locally, stored in the OS credential store, and never enters the
 React WebView. Status and pause/resume/stop requests use bounded canonical JSON
 messages authenticated with HMAC-SHA256 over a cross-platform local
 socket/named pipe. Nonces persist in the credential store so replayed commands
-remain invalid across controller restarts. Closing the desktop window hides it
-without terminating the app or companion.
+remain invalid across controller restarts. Closing the desktop window minimizes
+the controller without terminating the app or companion.
 
 For a headless host, generate the three device credentials locally with
 `openssl rand 32 | systemd-creds encrypt --name=<credential> - <destination>`.
