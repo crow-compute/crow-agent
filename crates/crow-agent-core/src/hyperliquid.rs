@@ -2,16 +2,19 @@ use crate::{OrderDecision, Side};
 use crow_agent_protocol::ALLOWED_SYMBOLS;
 use futures_util::StreamExt;
 use hypersdk::{
-    Decimal,
+    Address, Decimal,
     hypercore::{
-        self, Cloid, HttpClient, NonceHandler, PerpMarket, PrivateKeySigner, WebSocket,
+        self, CandleInterval, Cloid, HttpClient, NonceHandler, PerpMarket, PrivateKeySigner,
+        WebSocket,
         types::{
             BatchCancel, BatchOrder, Cancel, Incoming, OrderGrouping, OrderRequest,
-            OrderResponseStatus, OrderTypePlacement, Subscription, TimeInForce,
+            OrderResponseStatus, OrderTypePlacement, PerpAssetCtx, Subscription, TimeInForce,
         },
         ws::Event,
     },
 };
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -23,6 +26,8 @@ use zeroize::Zeroizing;
 const REST_WEIGHT_PER_MINUTE: u16 = 1_000;
 const INFO_META_WEIGHT: u16 = 20;
 const INFO_L2_WEIGHT: u16 = 2;
+const INFO_USER_WEIGHT: u16 = 20;
+const INFO_CANDLE_WEIGHT: u16 = 20;
 
 #[derive(Debug, Error)]
 pub enum HyperliquidError {
@@ -42,6 +47,10 @@ pub enum HyperliquidError {
     StreamClosed,
     #[error("Hyperliquid order book payload is invalid")]
     Book,
+    #[error("Hyperliquid account or market snapshot is invalid")]
+    Snapshot,
+    #[error("Hyperliquid returned a resting or trigger state for an IOC order")]
+    IocInvariant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,19 +60,50 @@ pub struct CoreAsset {
     pub size_decimals: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookLevel {
     pub price: String,
     pub size: String,
     pub order_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookSnapshot {
     pub symbol: String,
     pub venue_time_ms: u64,
     pub bids: Vec<BookLevel>,
     pub asks: Vec<BookLevel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PositionSnapshot {
+    pub symbol: String,
+    pub quantity_e8: i64,
+    pub notional_micro_usdc: i64,
+    pub entry_price_micro_usdc: Option<i64>,
+    pub unrealized_pnl_micro_usdc: i64,
+    pub isolated: bool,
+    pub leverage: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSnapshot {
+    pub venue_time_ms: u64,
+    pub equity_micro_usdc: i64,
+    pub withdrawable_micro_usdc: i64,
+    pub positions: BTreeMap<String, PositionSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketSnapshot {
+    pub market: crate::MarketState,
+    pub book: BookSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VenueSubmission {
+    pub client_order_id: String,
+    pub statuses: Value,
 }
 
 impl BookSnapshot {
@@ -159,10 +199,15 @@ impl HyperliquidVenue {
     pub async fn submit_ioc(
         &self,
         order: &OrderDecision,
-    ) -> Result<Vec<OrderResponseStatus>, HyperliquidError> {
+        client_order_id: &str,
+    ) -> Result<VenueSubmission, HyperliquidError> {
         self.budget.consume(1)?;
-        let request = build_ioc_request(order, &self.assets)?;
-        self.client
+        let cloid = format!("0x{client_order_id}")
+            .parse::<Cloid>()
+            .map_err(|_| HyperliquidError::Numeric)?;
+        let request = build_ioc_request(order, &self.assets, cloid)?;
+        let statuses = self
+            .client
             .place(
                 &self.signer,
                 BatchOrder {
@@ -175,7 +220,39 @@ impl HyperliquidVenue {
                 None,
             )
             .await
-            .map_err(|_| HyperliquidError::Sdk)
+            .map_err(|_| HyperliquidError::Sdk)?;
+        for status in &statuses {
+            match status {
+                OrderResponseStatus::Resting { oid, .. } => {
+                    self.cancel_direct(&order.symbol, *oid).await?;
+                    return Err(HyperliquidError::IocInvariant);
+                }
+                OrderResponseStatus::WaitingForTrigger | OrderResponseStatus::WaitingForFill => {
+                    return Err(HyperliquidError::IocInvariant);
+                }
+                _ => {}
+            }
+        }
+        let statuses = statuses
+            .iter()
+            .map(|status| {
+                json!({
+                    "accepted": status.is_ok(),
+                    "order_id": status.oid().map(|value| value.to_string()),
+                    "state": if status.is_err() {
+                        "venue_rejected"
+                    } else if status.oid().is_some() {
+                        "acknowledged"
+                    } else {
+                        "accepted"
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(VenueSubmission {
+            client_order_id: client_order_id.to_owned(),
+            statuses: Value::Array(statuses),
+        })
     }
 
     pub async fn cancel_direct(
@@ -202,6 +279,206 @@ impl HyperliquidVenue {
             .await
             .map_err(|_| HyperliquidError::Sdk)
     }
+
+    pub async fn account_snapshot(
+        &self,
+        execution_account: &str,
+    ) -> Result<AccountSnapshot, HyperliquidError> {
+        let account = parse_account(execution_account)?;
+        self.budget.consume(INFO_USER_WEIGHT)?;
+        let state = self
+            .client
+            .clearinghouse_state(account, None)
+            .await
+            .map_err(|_| HyperliquidError::Sdk)?;
+        let mut positions = BTreeMap::new();
+        for asset in state.asset_positions {
+            let position = asset.position;
+            if !ALLOWED_SYMBOLS.contains(&position.coin.as_str()) || position.szi.is_zero() {
+                continue;
+            }
+            let quantity_e8 = decimal_to_fixed(position.szi, 8)?;
+            let notional_micro_usdc = decimal_to_fixed(position.position_value.abs(), 6)?;
+            let snapshot = PositionSnapshot {
+                symbol: position.coin.clone(),
+                quantity_e8,
+                notional_micro_usdc,
+                entry_price_micro_usdc: position
+                    .entry_px
+                    .map(|value| decimal_to_fixed(value, 6))
+                    .transpose()?,
+                unrealized_pnl_micro_usdc: decimal_to_fixed(position.unrealized_pnl, 6)?,
+                isolated: position.leverage.is_isolated(),
+                leverage: position.leverage.value,
+            };
+            positions.insert(position.coin, snapshot);
+        }
+        Ok(AccountSnapshot {
+            venue_time_ms: state.time,
+            equity_micro_usdc: decimal_to_fixed(state.margin_summary.account_value, 6)?,
+            withdrawable_micro_usdc: decimal_to_fixed(state.withdrawable, 6)?,
+            positions,
+        })
+    }
+
+    pub async fn market_snapshots(
+        &self,
+        books: Vec<BookSnapshot>,
+        now_ms: u64,
+    ) -> Result<BTreeMap<String, MarketSnapshot>, HyperliquidError> {
+        self.budget.consume(INFO_META_WEIGHT)?;
+        let raw = self
+            .client
+            .meta_and_asset_ctxs(None)
+            .await
+            .map_err(|_| HyperliquidError::Sdk)?;
+        let values = raw.as_array().ok_or(HyperliquidError::Snapshot)?;
+        if values.len() != 2 {
+            return Err(HyperliquidError::Snapshot);
+        }
+        let contexts = serde_json::from_value::<Vec<PerpAssetCtx>>(values[1].clone())
+            .map_err(|_| HyperliquidError::Snapshot)?;
+        let books = books
+            .into_iter()
+            .map(|book| (book.symbol.clone(), book))
+            .collect::<BTreeMap<_, _>>();
+        let mut snapshots = BTreeMap::new();
+        for symbol in ALLOWED_SYMBOLS {
+            let asset = self.assets.get(symbol).ok_or(HyperliquidError::Metadata)?;
+            let context = contexts
+                .get(usize::try_from(asset.asset_index).map_err(|_| HyperliquidError::Snapshot)?)
+                .ok_or(HyperliquidError::Snapshot)?;
+            let book = books.get(symbol).ok_or(HyperliquidError::Book)?.clone();
+            let bid = book.bids.first().ok_or(HyperliquidError::Book)?;
+            let ask = book.asks.first().ok_or(HyperliquidError::Book)?;
+            let bid_price = decimal_string_to_fixed(&bid.price, 6)?;
+            let ask_price = decimal_string_to_fixed(&ask.price, 6)?;
+            if bid_price <= 0 || ask_price < bid_price || now_ms < book.venue_time_ms {
+                return Err(HyperliquidError::Book);
+            }
+            let midpoint = bid_price
+                .checked_add(ask_price)
+                .ok_or(HyperliquidError::Numeric)?
+                / 2;
+            let spread_bps = i64::try_from(
+                i128::from(ask_price - bid_price)
+                    .checked_mul(10_000)
+                    .ok_or(HyperliquidError::Numeric)?
+                    / i128::from(midpoint),
+            )
+            .map_err(|_| HyperliquidError::Numeric)?;
+            let bid_size = decimal_string_to_fixed(&bid.size, 8)?;
+            let ask_size = decimal_string_to_fixed(&ask.size, 8)?;
+            let bid_depth = i64::try_from(
+                i128::from(bid_price)
+                    .checked_mul(i128::from(bid_size))
+                    .ok_or(HyperliquidError::Numeric)?
+                    / 100_000_000,
+            )
+            .map_err(|_| HyperliquidError::Numeric)?;
+            let ask_depth = i64::try_from(
+                i128::from(ask_price)
+                    .checked_mul(i128::from(ask_size))
+                    .ok_or(HyperliquidError::Numeric)?
+                    / 100_000_000,
+            )
+            .map_err(|_| HyperliquidError::Numeric)?;
+            snapshots.insert(
+                symbol.to_owned(),
+                MarketSnapshot {
+                    market: crate::MarketState {
+                        symbol: symbol.to_owned(),
+                        mark_price_micro_usdc: decimal_to_fixed(context.mark_px, 6)?,
+                        oracle_price_micro_usdc: decimal_to_fixed(context.oracle_px, 6)?,
+                        spread_bps: u16::try_from(spread_bps)
+                            .map_err(|_| HyperliquidError::Numeric)?,
+                        book_age_seconds: u16::try_from((now_ms - book.venue_time_ms) / 1_000)
+                            .unwrap_or(u16::MAX),
+                        ask_depth_micro_usdc: ask_depth,
+                        bid_depth_micro_usdc: bid_depth,
+                        size_decimals: asset.size_decimals,
+                        delisted: false,
+                    },
+                    book,
+                },
+            );
+        }
+        Ok(snapshots)
+    }
+
+    pub async fn recent_candles(
+        &self,
+        start_time_ms: u64,
+        end_time_ms: u64,
+    ) -> Result<Value, HyperliquidError> {
+        let mut output = serde_json::Map::new();
+        for symbol in ALLOWED_SYMBOLS {
+            self.budget.consume(INFO_CANDLE_WEIGHT)?;
+            let candles = self
+                .client
+                .candle_snapshot(
+                    symbol.to_owned(),
+                    CandleInterval::FifteenMinutes,
+                    start_time_ms,
+                    end_time_ms,
+                )
+                .await
+                .map_err(|_| HyperliquidError::Sdk)?;
+            output.insert(
+                symbol.to_owned(),
+                serde_json::to_value(candles).map_err(|_| HyperliquidError::Snapshot)?,
+            );
+        }
+        Ok(Value::Object(output))
+    }
+
+    pub async fn fills_since(
+        &self,
+        execution_account: &str,
+        start_time_ms: u64,
+        end_time_ms: u64,
+    ) -> Result<Value, HyperliquidError> {
+        let account = parse_account(execution_account)?;
+        self.budget.consume(INFO_USER_WEIGHT)?;
+        let fills = self
+            .client
+            .user_fills_by_time(account, start_time_ms, Some(end_time_ms))
+            .await
+            .map_err(|_| HyperliquidError::Sdk)?
+            .into_iter()
+            .filter(|fill| ALLOWED_SYMBOLS.contains(&fill.coin.as_str()))
+            .collect::<Vec<_>>();
+        serde_json::to_value(fills).map_err(|_| HyperliquidError::Snapshot)
+    }
+
+    pub async fn funding_since(
+        &self,
+        execution_account: &str,
+        start_time_ms: u64,
+        end_time_ms: u64,
+    ) -> Result<Value, HyperliquidError> {
+        let account = parse_account(execution_account)?;
+        self.budget.consume(INFO_USER_WEIGHT)?;
+        let funding = self
+            .client
+            .user_funding(account, start_time_ms, Some(end_time_ms))
+            .await
+            .map_err(|_| HyperliquidError::Sdk)?
+            .into_iter()
+            .filter(|entry| ALLOWED_SYMBOLS.contains(&entry.delta.coin.as_str()))
+            .collect::<Vec<_>>();
+        serde_json::to_value(funding).map_err(|_| HyperliquidError::Snapshot)
+    }
+}
+
+pub fn hyperliquid_api_wallet_address(
+    api_wallet_key: &[u8; 32],
+) -> Result<String, HyperliquidError> {
+    let encoded_key = Zeroizing::new(format!("0x{}", hex::encode(api_wallet_key)));
+    let signer = encoded_key
+        .parse::<PrivateKeySigner>()
+        .map_err(|_| HyperliquidError::Wallet)?;
+    Ok(signer.address().to_string())
 }
 
 pub struct HyperliquidBookStream {
@@ -348,6 +625,7 @@ fn discover_core_assets_from<'a>(
 fn build_ioc_request(
     order: &OrderDecision,
     assets: &BTreeMap<String, CoreAsset>,
+    cloid: Cloid,
 ) -> Result<OrderRequest, HyperliquidError> {
     let asset = assets.get(&order.symbol).ok_or(HyperliquidError::Symbol)?;
     let limit_price = fixed_decimal(order.limit_price_micro_usdc, 6)?;
@@ -367,7 +645,7 @@ fn build_ioc_request(
         reduce_only: order.reduce_only,
         limit_px,
         sz,
-        cloid: Cloid::default(),
+        cloid,
         order_type: OrderTypePlacement::Limit {
             tif: TimeInForce::Ioc,
         },
@@ -397,6 +675,53 @@ fn decimal_places(value: &str) -> usize {
     value
         .split_once('.')
         .map_or(0, |(_, fraction)| fraction.len())
+}
+
+fn parse_account(value: &str) -> Result<Address, HyperliquidError> {
+    value.parse().map_err(|_| HyperliquidError::Wallet)
+}
+
+fn decimal_to_fixed(value: Decimal, scale: u8) -> Result<i64, HyperliquidError> {
+    decimal_string_to_fixed(&value.normalize().to_string(), scale)
+}
+
+fn decimal_string_to_fixed(value: &str, scale: u8) -> Result<i64, HyperliquidError> {
+    let negative = value.starts_with('-');
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(HyperliquidError::Numeric);
+    }
+    let scale = usize::from(scale);
+    if fraction.len() > scale && fraction[scale..].bytes().any(|byte| byte != b'0') {
+        return Err(HyperliquidError::Numeric);
+    }
+    let whole = whole
+        .parse::<i128>()
+        .map_err(|_| HyperliquidError::Numeric)?;
+    let mut fractional = fraction[..fraction.len().min(scale)].to_owned();
+    fractional.extend(std::iter::repeat_n(
+        '0',
+        scale.saturating_sub(fractional.len()),
+    ));
+    let fractional = if fractional.is_empty() {
+        0
+    } else {
+        fractional
+            .parse::<i128>()
+            .map_err(|_| HyperliquidError::Numeric)?
+    };
+    let multiplier = 10_i128
+        .checked_pow(u32::try_from(scale).map_err(|_| HyperliquidError::Numeric)?)
+        .ok_or(HyperliquidError::Numeric)?;
+    let fixed = whole
+        .checked_mul(multiplier)
+        .and_then(|value| value.checked_add(fractional))
+        .ok_or(HyperliquidError::Numeric)?;
+    i64::try_from(if negative { -fixed } else { fixed }).map_err(|_| HyperliquidError::Numeric)
 }
 
 #[cfg(test)]
@@ -431,6 +756,7 @@ mod tests {
                 reduce_only: false,
             },
             &assets,
+            Cloid::default(),
         )?;
         assert!(request.is_buy);
         assert_eq!(request.asset, 0);

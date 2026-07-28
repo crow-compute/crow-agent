@@ -95,9 +95,27 @@ crow-agentd authorize "Trading host" \
 ```
 
 The command prints only the short-lived Crow URL/user code and the resulting
-public device ID. Put that public ID and the outbound relay URL in
-`/etc/crow/agent.json`, install `deploy/crow-agentd.service`, and start the
-service. The unit opens no inbound socket.
+public device ID. Copy `deploy/agent.example.json` to `/etc/crow/agent.json`,
+replace its public device, arena, agent-version, release, model, and execution
+account values, install `deploy/crow-agentd.service`, and start the service.
+The signed arena manifest is verified before the daemon connects to the venue.
+The unit opens no inbound socket.
+
+For a hosted-runner cutover, set `handoff_snapshot` to a root-readable,
+fixed-point JSON snapshot captured after the hosted run stops and reconciles.
+The first local run binds that snapshot to its backend record and signed event
+chain before any resume. Existing isolated 1× positions are preserved; inherited
+shorts may only be reduced by reduce-only buys and can never be increased.
+
+The live daemon starts or reclaims one bound arena run, renews its lease every
+10 seconds while running or paused, and begins in the paused state. An
+authenticated local or remote resume is required before the first 15-minute
+decision. It keeps a persistent BTC/ETH/SOL book stream, performs bounded REST
+reconciliation after reconnect, encrypts the lease and daily risk counters in
+the local journal, durably records an order dispatch before sending the exact
+IOC client ID, and checks the execution gate again immediately before venue
+submission. A stop preserves positions and removes only the completed run's
+local lease metadata.
 
 Ubuntu 24.04 uses host-bound `LoadCredentialEncrypted` files. Ubuntu 22.04
 ships systemd 249, before encrypted systemd credentials were introduced, so

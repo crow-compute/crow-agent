@@ -1,11 +1,14 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use crow_agent_core::{
-    CompanionActionV1, CompanionRequestV1, CompanionResponseV1, DeviceAuthorizationClient,
-    DeviceAuthorizationError, DeviceAuthorizationSession, DeviceEncryptionKey, DeviceTokens,
-    MAX_COMPANION_MESSAGE_BYTES,
+    AgentVersionRecipient, CompanionActionV1, CompanionRequestV1, CompanionResponseV1,
+    DeviceAuthorizationClient, DeviceAuthorizationError, DeviceAuthorizationSession,
+    DeviceEncryptionKey, DeviceTokens, MAX_COMPANION_MESSAGE_BYTES, REQUIRED_STRATEGY_TOOLS,
+    StrategyBundleV1, decode_device_encryption_public_key, hyperliquid_api_wallet_address,
+    open_agent_version, seal_agent_version,
 };
 use crow_agent_protocol::{
-    DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1, sha256,
+    AgentVersionEnvelopeV1, DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1,
+    SignedArenaManifestV1, sha256,
 };
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, Name,
@@ -16,9 +19,13 @@ use rand_core::{OsRng, RngCore as _};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tauri::{Manager as _, State};
 use tauri_plugin_shell::{
@@ -28,19 +35,26 @@ use tauri_plugin_shell::{
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use url::Url;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const CREDENTIAL_SERVICE: &str = "ai.crowcompute.agent";
 const SIGNING_SEED_ACCOUNT: &str = "device-signing-seed";
 const ENCRYPTION_SECRET_ACCOUNT: &str = "device-encryption-secret";
 const ACCESS_TOKEN_ACCOUNT: &str = "device-access-token";
+const ACCESS_EXPIRES_AT_ACCOUNT: &str = "device-access-expires-at";
 const REFRESH_TOKEN_ACCOUNT: &str = "device-refresh-token";
 const DEVICE_ID_ACCOUNT: &str = "device-id";
 const CONTROLLER_NONCE_ACCOUNT: &str = "controller-nonce";
 const COMPANION_SECRET_ACCOUNT: &str = "companion-ipc-secret";
 const COMPANION_NONCE_ACCOUNT: &str = "companion-ipc-nonce";
+const JOURNAL_KEY_ACCOUNT: &str = "journal-key";
+const HYPERLIQUID_API_WALLET_ACCOUNT: &str = "hyperliquid-api-wallet-key";
 const PRODUCTION_API_ORIGIN: &str = "https://api.crowcompute.ai";
+const PRODUCTION_RELAY_URL: &str = "wss://api.crowcompute.ai/harness/v1/connect";
+const HYPERLIQUID_TESTNET_API_URL: &str = "https://app.hyperliquid-testnet.xyz/API";
 const COMPANION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const MAX_DESKTOP_REFRESH_TOKEN_BYTES: usize = 512;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +91,7 @@ struct RemoteDevice {
     platform: String,
     state: String,
     last_seen_at: Option<String>,
+    encryption_public_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,12 +112,57 @@ struct RemoteState {
     runs: Vec<RemoteRun>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+struct PublicArena {
+    id: String,
+    mode: String,
+    manifest: Value,
+    state: String,
+    starts_at: String,
+    ends_at: String,
+    tickets_enabled: bool,
+    manifest_sha256: String,
+    signer_public_key: String,
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicArenaState {
+    arenas: Vec<PublicArena>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteCommandResult {
     command_id: String,
     action: String,
     accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+struct AgentVersionSummary {
+    id: String,
+    agent_id: String,
+    version: u32,
+    model_id: String,
+    configuration_sha256: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentVersionState {
+    versions: Vec<AgentVersionSummary>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HyperliquidWalletSetup {
+    address: String,
+    approval_url: String,
 }
 
 #[derive(Debug)]
@@ -114,6 +174,9 @@ enum DesktopError {
     Network,
     RemoteCommand,
     Companion,
+    AgentVersion,
+    Arena,
+    Venue,
 }
 
 impl DesktopError {
@@ -126,6 +189,9 @@ impl DesktopError {
             Self::Network => "device_api_unavailable",
             Self::RemoteCommand => "remote_command_rejected",
             Self::Companion => "local_companion_unavailable",
+            Self::AgentVersion => "agent_version_invalid",
+            Self::Arena => "arena_operation_failed",
+            Self::Venue => "hyperliquid_api_wallet_unavailable",
         }
     }
 }
@@ -134,28 +200,48 @@ struct DesktopState {
     pending_authorization: Mutex<Option<DeviceAuthorizationSession>>,
     command_nonce: Mutex<()>,
     companion_nonce: Mutex<()>,
-    companion_secret: Zeroizing<[u8; 32]>,
-    companion_ipc_name: String,
+    companion_credentials: Mutex<Option<Arc<CompanionCredentials>>>,
     companion_child: Mutex<Option<CommandChild>>,
     companion_spawned: Arc<AtomicBool>,
 }
 
+struct CompanionCredentials {
+    secret: Zeroizing<[u8; 32]>,
+    ipc_name: String,
+}
+
 impl DesktopState {
-    fn new() -> Result<Self, DesktopError> {
-        let secret = load_or_create_companion_secret()?;
-        let digest = sha256(secret.as_ref());
-        Ok(Self {
+    fn new() -> Self {
+        Self {
             pending_authorization: Mutex::new(None),
             command_nonce: Mutex::new(()),
             companion_nonce: Mutex::new(()),
-            companion_secret: secret,
-            companion_ipc_name: format!("crow-agent-{}", hex::encode(&digest[..12])),
+            companion_credentials: Mutex::new(None),
             companion_child: Mutex::new(None),
             companion_spawned: Arc::new(AtomicBool::new(false)),
-        })
+        }
+    }
+
+    fn companion_credentials(&self) -> Result<Arc<CompanionCredentials>, DesktopError> {
+        let mut slot = self
+            .companion_credentials
+            .lock()
+            .map_err(|_| DesktopError::Credential)?;
+        if let Some(credentials) = slot.as_ref() {
+            return Ok(Arc::clone(credentials));
+        }
+        let secret = load_or_create_companion_secret()?;
+        let digest = sha256(secret.as_ref());
+        let credentials = Arc::new(CompanionCredentials {
+            secret,
+            ipc_name: format!("crow-agent-{}", hex::encode(&digest[..12])),
+        });
+        *slot = Some(Arc::clone(&credentials));
+        Ok(credentials)
     }
 
     fn launch_companion(&self, app: &tauri::AppHandle) -> Result<(), DesktopError> {
+        let credentials = self.companion_credentials()?;
         if self.companion_spawned.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -164,13 +250,13 @@ impl DesktopState {
             return Err(DesktopError::Companion);
         };
         let Ok((mut events, mut child)) = command
-            .args(["companion", "--ipc-name", &self.companion_ipc_name])
+            .args(["companion", "--ipc-name", &credentials.ipc_name])
             .spawn()
         else {
             self.companion_spawned.store(false, Ordering::SeqCst);
             return Err(DesktopError::Companion);
         };
-        if child.write(self.companion_secret.as_ref()).is_err() {
+        if child.write(credentials.secret.as_ref()).is_err() {
             let _ = child.kill();
             self.companion_spawned.store(false, Ordering::SeqCst);
             return Err(DesktopError::Companion);
@@ -193,10 +279,70 @@ impl DesktopState {
         Ok(())
     }
 
+    async fn launch_desktop_run(
+        &self,
+        app: &tauri::AppHandle,
+        config_path: &Path,
+        credential_frame: &Zeroizing<Vec<u8>>,
+    ) -> Result<(), DesktopError> {
+        let credentials = self.companion_credentials()?;
+        if let Ok(mut slot) = self.companion_child.lock()
+            && let Some(child) = slot.take()
+        {
+            let _ = child.kill();
+        }
+        self.companion_spawned.store(false, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let config_path = config_path.to_str().ok_or(DesktopError::Companion)?;
+        let command = app
+            .shell()
+            .sidecar("crow-agentd")
+            .map_err(|_| DesktopError::Companion)?;
+        let (mut events, mut child) = command
+            .args([
+                "desktop-run",
+                config_path,
+                "--ipc-name",
+                &credentials.ipc_name,
+            ])
+            .spawn()
+            .map_err(|_| DesktopError::Companion)?;
+        if child.write(credential_frame.as_ref()).is_err() {
+            let _ = child.kill();
+            return Err(DesktopError::Companion);
+        }
+        let mut slot = self
+            .companion_child
+            .lock()
+            .map_err(|_| DesktopError::Companion)?;
+        *slot = Some(child);
+        self.companion_spawned.store(true, Ordering::SeqCst);
+        let spawned = Arc::clone(&self.companion_spawned);
+        tauri::async_runtime::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if matches!(event, CommandEvent::Error(_) | CommandEvent::Terminated(_)) {
+                    spawned.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn stop_owned_companion(&self) {
+        if let Ok(mut slot) = self.companion_child.lock()
+            && let Some(child) = slot.take()
+        {
+            let _ = child.kill();
+        }
+        self.companion_spawned.store(false, Ordering::SeqCst);
+    }
+
     async fn companion_request(
         &self,
         action: CompanionActionV1,
     ) -> Result<CompanionResponseV1, DesktopError> {
+        let credentials = self.companion_credentials()?;
         let nonce = {
             let _guard = self
                 .companion_nonce
@@ -204,11 +350,11 @@ impl DesktopState {
                 .map_err(|_| DesktopError::Companion)?;
             next_persisted_nonce(COMPANION_NONCE_ACCOUNT)?
         };
-        let request = CompanionRequestV1::sign(&self.companion_secret, nonce, action)
+        let request = CompanionRequestV1::sign(&credentials.secret, nonce, action)
             .map_err(|_| DesktopError::Companion)?;
         tokio::time::timeout(
             COMPANION_TIMEOUT,
-            send_companion_request(&self.companion_ipc_name, &self.companion_secret, &request),
+            send_companion_request(&credentials.ipc_name, &credentials.secret, &request),
         )
         .await
         .map_err(|_| DesktopError::Companion)?
@@ -375,6 +521,262 @@ async fn get_remote_state() -> Result<RemoteState, String> {
 }
 
 #[tauri::command]
+async fn get_public_arenas() -> Result<PublicArenaState, String> {
+    Ok(PublicArenaState {
+        arenas: fetch_public_arenas()
+            .await
+            .map_err(|error| error.code().to_owned())?,
+    })
+}
+
+#[tauri::command]
+async fn get_agent_versions() -> Result<AgentVersionState, String> {
+    let token = rotate_desktop_tokens()
+        .await
+        .map_err(|error| error.code().to_owned())?;
+    let versions = list_agent_version_envelopes(&token.access_token)
+        .await
+        .map_err(|error| error.code().to_owned())?;
+    Ok(AgentVersionState {
+        versions: versions.iter().map(agent_version_summary).collect(),
+    })
+}
+
+#[tauri::command]
+async fn create_agent_version(
+    name: String,
+    model_id: String,
+    system_instructions: String,
+) -> Result<AgentVersionSummary, String> {
+    let token = rotate_desktop_tokens()
+        .await
+        .map_err(|error| error.code().to_owned())?;
+    let devices = device_api::<Value>(
+        reqwest::Method::GET,
+        "/api/v1/harness/remote-devices",
+        &token.access_token,
+        None,
+    )
+    .await
+    .map_err(|error| error.code().to_owned())?;
+    let devices = serde_json::from_value::<Vec<RemoteDevice>>(
+        devices.get("devices").cloned().unwrap_or_else(|| json!([])),
+    )
+    .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
+    let recipients = devices
+        .into_iter()
+        .filter(|device| device.state == "active")
+        .map(|device| {
+            Ok(AgentVersionRecipient {
+                device_id: uuid::Uuid::parse_str(&device.id)
+                    .map_err(|_| DesktopError::AgentVersion)?,
+                encryption_public_key: decode_device_encryption_public_key(
+                    &device.encryption_public_key,
+                )
+                .map_err(|_| DesktopError::AgentVersion)?,
+            })
+        })
+        .collect::<Result<Vec<_>, DesktopError>>()
+        .map_err(|error| error.code().to_owned())?;
+    let version_id = Uuid::new_v4();
+    let bundle = StrategyBundleV1 {
+        protocol: HARNESS_PROTOCOL_V1.into(),
+        version_id,
+        model_id,
+        name,
+        system_instructions,
+        tools: REQUIRED_STRATEGY_TOOLS.map(str::to_owned).to_vec(),
+        created_at: OffsetDateTime::now_utc(),
+    };
+    let envelope = seal_agent_version(&bundle, Uuid::new_v4(), 1, &recipients)
+        .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
+    let _: Value = device_api(
+        reqwest::Method::POST,
+        "/api/v1/harness/agent-versions",
+        &token.access_token,
+        Some(
+            serde_json::to_value(&envelope)
+                .map_err(|_| DesktopError::AgentVersion.code().to_owned())?,
+        ),
+    )
+    .await
+    .map_err(|error| error.code().to_owned())?;
+    Ok(agent_version_summary(&envelope))
+}
+
+#[tauri::command]
+fn prepare_hyperliquid_wallet() -> Result<HyperliquidWalletSetup, String> {
+    let key =
+        load_or_create_hyperliquid_api_wallet_key().map_err(|error| error.code().to_owned())?;
+    let address =
+        hyperliquid_api_wallet_address(&key).map_err(|_| DesktopError::Venue.code().to_owned())?;
+    open::that_detached(HYPERLIQUID_TESTNET_API_URL)
+        .map_err(|_| DesktopError::Browser.code().to_owned())?;
+    Ok(HyperliquidWalletSetup {
+        address,
+        approval_url: HYPERLIQUID_TESTNET_API_URL.into(),
+    })
+}
+
+#[tauri::command]
+async fn enroll_arena(
+    arena_id: String,
+    agent_version_id: String,
+    model_id: String,
+) -> Result<(), String> {
+    let arena_id = Uuid::parse_str(&arena_id).map_err(|_| DesktopError::Arena.code().to_owned())?;
+    let agent_version_id = Uuid::parse_str(&agent_version_id)
+        .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
+    let token = rotate_desktop_tokens()
+        .await
+        .map_err(|error| error.code().to_owned())?;
+    enroll_arena_with_token(arena_id, agent_version_id, &model_id, &token.access_token)
+        .await
+        .map_err(|error| error.code().to_owned())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_lines)]
+async fn start_local_arena(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    arena_id: String,
+    agent_version_id: String,
+    execution_account: String,
+    handoff_snapshot: Option<Value>,
+) -> Result<AgentStatus, String> {
+    if state
+        .companion_request(CompanionActionV1::Status)
+        .await
+        .ok()
+        .and_then(|response| response.active_run)
+        .is_some()
+    {
+        return Err(DesktopError::Arena.code().into());
+    }
+    if !valid_execution_account(&execution_account) {
+        return Err(DesktopError::Venue.code().into());
+    }
+    let arena_id = Uuid::parse_str(&arena_id).map_err(|_| DesktopError::Arena.code().to_owned())?;
+    let agent_version_id = Uuid::parse_str(&agent_version_id)
+        .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
+    let token = rotate_desktop_tokens()
+        .await
+        .map_err(|error| error.code().to_owned())?;
+    let arenas = fetch_public_arenas()
+        .await
+        .map_err(|error| error.code().to_owned())?;
+    let arena = arenas
+        .into_iter()
+        .find(|arena| arena.id == arena_id.to_string())
+        .ok_or_else(|| DesktopError::Arena.code().to_owned())?;
+    let signed = SignedArenaManifestV1 {
+        manifest: serde_json::from_value(arena.manifest.clone())
+            .map_err(|_| DesktopError::Arena.code().to_owned())?,
+        manifest_sha256: arena.manifest_sha256,
+        signer_public_key: arena.signer_public_key,
+        signature: arena.signature,
+    };
+    signed
+        .verify()
+        .map_err(|_| DesktopError::Arena.code().to_owned())?;
+    let envelope = list_agent_version_envelopes(&token.access_token)
+        .await
+        .map_err(|error| error.code().to_owned())?
+        .into_iter()
+        .find(|version| version.version_id == agent_version_id)
+        .ok_or_else(|| DesktopError::AgentVersion.code().to_owned())?;
+    let device_id = Uuid::parse_str(
+        &load_password(DEVICE_ID_ACCOUNT).map_err(|error| error.code().to_owned())?,
+    )
+    .map_err(|_| DesktopError::Credential.code().to_owned())?;
+    let device_encryption_key =
+        load_or_create_encryption_key().map_err(|error| error.code().to_owned())?;
+    let strategy = open_agent_version(&envelope, device_id, &device_encryption_key)
+        .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
+    if strategy.model_id != envelope.model_id
+        || !signed
+            .manifest
+            .eligible_models
+            .iter()
+            .any(|model| model == &strategy.model_id)
+    {
+        return Err(DesktopError::AgentVersion.code().into());
+    }
+    enroll_arena_with_token(
+        arena_id,
+        agent_version_id,
+        &strategy.model_id,
+        &token.access_token,
+    )
+    .await
+    .map_err(|error| error.code().to_owned())?;
+    let identity = load_or_create_identity().map_err(|error| error.code().to_owned())?;
+    let runner_tokens = DeviceAuthorizationClient::new(&api_origin())
+        .map_err(|_| DesktopError::Authorization.code().to_owned())?
+        .fork(&token.access_token, &identity)
+        .await
+        .map_err(|_| DesktopError::Authorization.code().to_owned())?;
+    if runner_tokens.device_id != device_id {
+        return Err(DesktopError::Authorization.code().into());
+    }
+
+    let runtime_directory =
+        desktop_runtime_directory(&app).map_err(|error| error.code().to_owned())?;
+    let state_directory = runtime_directory.join("state");
+    create_private_directory(&runtime_directory)
+        .and_then(|()| create_private_directory(&state_directory))
+        .map_err(|error| error.code().to_owned())?;
+    let manifest_path = runtime_directory.join(format!("arena-{arena_id}.json"));
+    write_runtime_json(&manifest_path, &signed).map_err(|error| error.code().to_owned())?;
+    let handoff_path = if let Some(snapshot) = handoff_snapshot {
+        let path = runtime_directory.join(format!("handoff-{arena_id}.json"));
+        write_runtime_json(&path, &snapshot).map_err(|error| error.code().to_owned())?;
+        Some(path)
+    } else {
+        None
+    };
+    let config_path = runtime_directory.join(format!("run-{arena_id}.json"));
+    let config = json!({
+        "device_id": device_id,
+        "relay_url": PRODUCTION_RELAY_URL,
+        "api_origin": api_origin(),
+        "state_directory": state_directory,
+        "live_arena": {
+            "arena_manifest": manifest_path,
+            "handoff_snapshot": handoff_path,
+            "agent_version_id": agent_version_id,
+            "execution_account": execution_account.to_ascii_lowercase(),
+            "model_id": strategy.model_id,
+            "client_release": env!("CARGO_PKG_VERSION"),
+        }
+    });
+    write_runtime_json(&config_path, &config).map_err(|error| error.code().to_owned())?;
+    let credential_frame = desktop_credential_frame(&state, &runner_tokens.refresh_token)
+        .map_err(|error| error.code().to_owned())?;
+    state
+        .launch_desktop_run(&app, &config_path, &credential_frame)
+        .await
+        .map_err(|error| error.code().to_owned())?;
+    for _ in 0..75 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Ok(response) = state.companion_request(CompanionActionV1::Status).await
+            && response.active_run.is_some()
+        {
+            return Ok(AgentStatus {
+                protocol: HARNESS_PROTOCOL_V1,
+                execution_boundary: "local_device",
+                daemon: response.execution_state,
+                active_run: response.active_run.map(|run_id| run_id.to_string()),
+                device_authorized: true,
+            });
+        }
+    }
+    state.stop_owned_companion();
+    Err(DesktopError::Companion.code().into())
+}
+
+#[tauri::command]
 async fn send_remote_command(
     target_device_id: String,
     run_id: String,
@@ -493,11 +895,32 @@ fn load_or_create_encryption_key() -> Result<DeviceEncryptionKey, DesktopError> 
 
 fn store_tokens(tokens: &DeviceTokens) -> Result<(), DesktopError> {
     store_password(ACCESS_TOKEN_ACCOUNT, tokens.access_token.as_str())?;
+    store_password(
+        ACCESS_EXPIRES_AT_ACCOUNT,
+        &tokens.access_expires_at.unix_timestamp().to_string(),
+    )?;
     store_password(REFRESH_TOKEN_ACCOUNT, tokens.refresh_token.as_str())?;
     store_password(DEVICE_ID_ACCOUNT, &tokens.device_id.to_string())
 }
 
 async fn rotate_desktop_tokens() -> Result<DeviceTokens, DesktopError> {
+    if let (Ok(access_token), Ok(refresh_token), Ok(device_id), Ok(expires_at)) = (
+        load_password(ACCESS_TOKEN_ACCOUNT),
+        load_password(REFRESH_TOKEN_ACCOUNT),
+        load_password(DEVICE_ID_ACCOUNT),
+        load_password(ACCESS_EXPIRES_AT_ACCOUNT),
+    ) && let (Ok(device_id), Ok(timestamp)) =
+        (Uuid::parse_str(&device_id), expires_at.parse::<i64>())
+        && let Ok(access_expires_at) = OffsetDateTime::from_unix_timestamp(timestamp)
+        && access_expires_at > OffsetDateTime::now_utc() + time::Duration::minutes(1)
+    {
+        return Ok(DeviceTokens {
+            device_id,
+            access_token: Zeroizing::new(access_token),
+            refresh_token: Zeroizing::new(refresh_token),
+            access_expires_at,
+        });
+    }
     let refresh_token = Zeroizing::new(load_password(REFRESH_TOKEN_ACCOUNT)?);
     if !refresh_token.starts_with("crow_device_refresh_") {
         return Err(DesktopError::Credential);
@@ -533,13 +956,246 @@ async fn device_api<T: DeserializeOwned>(
         request = request.json(&body);
     }
     let response = request.send().await.map_err(|_| DesktopError::Network)?;
-    if response.status() != StatusCode::OK && response.status() != StatusCode::ACCEPTED {
+    if !response.status().is_success() {
         return Err(DesktopError::RemoteCommand);
     }
     response
         .json::<T>()
         .await
         .map_err(|_| DesktopError::Network)
+}
+
+async fn device_api_empty(
+    method: reqwest::Method,
+    path: &str,
+    access_token: &Zeroizing<String>,
+    body: Value,
+) -> Result<(), DesktopError> {
+    let endpoint = Url::parse(&api_origin())
+        .and_then(|origin| origin.join(path))
+        .map_err(|_| DesktopError::Network)?;
+    let response = reqwest::Client::builder()
+        .https_only(endpoint.scheme() == "https")
+        .build()
+        .map_err(|_| DesktopError::Network)?
+        .request(method, endpoint)
+        .bearer_auth(access_token.as_str())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| DesktopError::Network)?;
+    if !response.status().is_success() {
+        return Err(DesktopError::Arena);
+    }
+    Ok(())
+}
+
+async fn fetch_public_arenas() -> Result<Vec<PublicArena>, DesktopError> {
+    let endpoint = Url::parse(&api_origin())
+        .and_then(|origin| origin.join("/api/v1/harness/arenas"))
+        .map_err(|_| DesktopError::Network)?;
+    let response = reqwest::Client::builder()
+        .https_only(endpoint.scheme() == "https")
+        .build()
+        .map_err(|_| DesktopError::Network)?
+        .get(endpoint)
+        .send()
+        .await
+        .map_err(|_| DesktopError::Network)?;
+    if response.status() != StatusCode::OK {
+        return Err(DesktopError::Network);
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|_| DesktopError::Network)?;
+    serde_json::from_value::<Vec<PublicArena>>(
+        payload.get("arenas").cloned().unwrap_or_else(|| json!([])),
+    )
+    .map_err(|_| DesktopError::Network)
+}
+
+async fn list_agent_version_envelopes(
+    access_token: &Zeroizing<String>,
+) -> Result<Vec<AgentVersionEnvelopeV1>, DesktopError> {
+    let payload = device_api::<Value>(
+        reqwest::Method::GET,
+        "/api/v1/harness/agent-versions",
+        access_token,
+        None,
+    )
+    .await?;
+    serde_json::from_value::<Vec<AgentVersionEnvelopeV1>>(
+        payload
+            .get("versions")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .map_err(|_| DesktopError::AgentVersion)
+}
+
+async fn enroll_arena_with_token(
+    arena_id: Uuid,
+    agent_version_id: Uuid,
+    model_id: &str,
+    access_token: &Zeroizing<String>,
+) -> Result<(), DesktopError> {
+    device_api_empty(
+        reqwest::Method::POST,
+        &format!("/api/v1/harness/device/arenas/{arena_id}/enrollments"),
+        access_token,
+        json!({
+            "agent_version_id": agent_version_id,
+            "model_id": model_id,
+        }),
+    )
+    .await
+}
+
+fn agent_version_summary(envelope: &AgentVersionEnvelopeV1) -> AgentVersionSummary {
+    let created_at = match envelope
+        .created_at
+        .format(&time::format_description::well_known::Rfc3339)
+    {
+        Ok(value) => value,
+        Err(_) => envelope.created_at.unix_timestamp().to_string(),
+    };
+    AgentVersionSummary {
+        id: envelope.version_id.to_string(),
+        agent_id: envelope.agent_id.to_string(),
+        version: envelope.version,
+        model_id: envelope.model_id.clone(),
+        configuration_sha256: envelope.configuration_sha256.clone(),
+        created_at,
+    }
+}
+
+fn load_or_create_hyperliquid_api_wallet_key() -> Result<Zeroizing<[u8; 32]>, DesktopError> {
+    let entry = Entry::new(CREDENTIAL_SERVICE, HYPERLIQUID_API_WALLET_ACCOUNT)
+        .map_err(|_| DesktopError::Credential)?;
+    match entry.get_secret() {
+        Ok(stored) => {
+            let stored = Zeroizing::new(stored);
+            let key: [u8; 32] = stored
+                .as_slice()
+                .try_into()
+                .map_err(|_| DesktopError::Venue)?;
+            hyperliquid_api_wallet_address(&key).map_err(|_| DesktopError::Venue)?;
+            Ok(Zeroizing::new(key))
+        }
+        Err(KeyringError::NoEntry) => {
+            for _ in 0..64 {
+                let mut key = Zeroizing::new([0_u8; 32]);
+                OsRng.fill_bytes(key.as_mut());
+                if hyperliquid_api_wallet_address(&key).is_ok() {
+                    entry
+                        .set_secret(key.as_ref())
+                        .map_err(|_| DesktopError::Credential)?;
+                    return Ok(key);
+                }
+            }
+            Err(DesktopError::Venue)
+        }
+        Err(_) => Err(DesktopError::Credential),
+    }
+}
+
+fn desktop_runtime_directory(app: &tauri::AppHandle) -> Result<PathBuf, DesktopError> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("runtime"))
+        .map_err(|_| DesktopError::Companion)
+}
+
+fn create_private_directory(path: &Path) -> Result<(), DesktopError> {
+    fs::create_dir_all(path).map_err(|_| DesktopError::Companion)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| DesktopError::Companion)?;
+    }
+    Ok(())
+}
+
+fn write_runtime_json(path: &Path, value: &impl Serialize) -> Result<(), DesktopError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| DesktopError::Companion)?;
+    fs::write(path, encoded).map_err(|_| DesktopError::Companion)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| DesktopError::Companion)?;
+    }
+    Ok(())
+}
+
+fn desktop_credential_frame(
+    state: &DesktopState,
+    runner_refresh_token: &Zeroizing<String>,
+) -> Result<Zeroizing<Vec<u8>>, DesktopError> {
+    let companion_credentials = state.companion_credentials()?;
+    let signing_seed = load_secret_32(SIGNING_SEED_ACCOUNT)?;
+    let encryption_secret = load_secret_32(ENCRYPTION_SECRET_ACCOUNT)?;
+    let journal_key = load_or_create_secret_32(JOURNAL_KEY_ACCOUNT)?;
+    let api_wallet_key = load_or_create_hyperliquid_api_wallet_key()?;
+    if runner_refresh_token.len() > MAX_DESKTOP_REFRESH_TOKEN_BYTES
+        || runner_refresh_token.len() > usize::from(u16::MAX)
+    {
+        return Err(DesktopError::Credential);
+    }
+    let length = u16::try_from(runner_refresh_token.len()).map_err(|_| DesktopError::Credential)?;
+    let mut frame = Zeroizing::new(Vec::with_capacity(32 * 5 + 2 + runner_refresh_token.len()));
+    frame.extend_from_slice(companion_credentials.secret.as_ref());
+    frame.extend_from_slice(signing_seed.as_ref());
+    frame.extend_from_slice(encryption_secret.as_ref());
+    frame.extend_from_slice(journal_key.as_ref());
+    frame.extend_from_slice(api_wallet_key.as_ref());
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(runner_refresh_token.as_bytes());
+    Ok(frame)
+}
+
+fn load_secret_32(account: &str) -> Result<Zeroizing<[u8; 32]>, DesktopError> {
+    let raw = Zeroizing::new(
+        Entry::new(CREDENTIAL_SERVICE, account)
+            .and_then(|entry| entry.get_secret())
+            .map_err(|_| DesktopError::Credential)?,
+    );
+    let value: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| DesktopError::Credential)?;
+    Ok(Zeroizing::new(value))
+}
+
+fn load_or_create_secret_32(account: &str) -> Result<Zeroizing<[u8; 32]>, DesktopError> {
+    let entry = Entry::new(CREDENTIAL_SERVICE, account).map_err(|_| DesktopError::Credential)?;
+    match entry.get_secret() {
+        Ok(raw) => {
+            let raw = Zeroizing::new(raw);
+            let value: [u8; 32] = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| DesktopError::Credential)?;
+            Ok(Zeroizing::new(value))
+        }
+        Err(KeyringError::NoEntry) => {
+            let mut value = Zeroizing::new([0_u8; 32]);
+            OsRng.fill_bytes(value.as_mut());
+            entry
+                .set_secret(value.as_ref())
+                .map_err(|_| DesktopError::Credential)?;
+            Ok(value)
+        }
+        Err(_) => Err(DesktopError::Credential),
+    }
+}
+
+fn valid_execution_account(value: &str) -> bool {
+    value.len() == 42
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn next_controller_nonce() -> Result<u64, DesktopError> {
@@ -657,25 +1313,10 @@ pub fn run() {
         eprintln!("Crow Agent TLS initialization failed: {error}");
         std::process::exit(1);
     }
-    let state = DesktopState::new().unwrap_or_else(|error| {
-        eprintln!(
-            "Crow Agent credential initialization failed: {}",
-            error.code()
-        );
-        std::process::exit(1);
-    });
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .manage(state)
         .setup(|app| {
-            let state = app.state::<DesktopState>();
-            if tauri::async_runtime::block_on(state.companion_request(CompanionActionV1::Status))
-                .is_err()
-            {
-                state
-                    .launch_companion(app.handle())
-                    .map_err(|error| error.code().to_owned())?;
-            }
+            app.manage(DesktopState::new());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -690,6 +1331,12 @@ pub fn run() {
             begin_device_authorization,
             complete_device_authorization,
             get_remote_state,
+            get_public_arenas,
+            get_agent_versions,
+            create_agent_version,
+            prepare_hyperliquid_wallet,
+            enroll_arena,
+            start_local_arena,
             send_remote_command
         ])
         .build(tauri::generate_context!())

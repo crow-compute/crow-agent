@@ -49,6 +49,15 @@ impl EncryptedJournal {
                 updated_at INTEGER NOT NULL DEFAULT (unixepoch())
              );",
         )?;
+        let has_server_receipt = connection
+            .prepare("PRAGMA table_info(run_events)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "server_receipt");
+        if !has_server_receipt {
+            connection.execute("ALTER TABLE run_events ADD COLUMN server_receipt TEXT", [])?;
+        }
         Ok(Self {
             connection,
             key: Zeroizing::new(key),
@@ -125,6 +134,61 @@ impl EncryptedJournal {
         .transpose()
     }
 
+    pub fn pending_events(
+        &self,
+        run_id: uuid::Uuid,
+    ) -> Result<Vec<RunEventEnvelopeV1>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT public_envelope FROM run_events
+             WHERE run_id=?1 AND server_receipt IS NULL ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([run_id.to_string()], |row| row.get::<_, String>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            let event = serde_json::from_str::<RunEventEnvelopeV1>(&row?)?;
+            event.verify().map_err(|_| JournalError::Event)?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    pub fn acknowledge_event(
+        &self,
+        event_id: uuid::Uuid,
+        server_receipt: &str,
+    ) -> Result<(), JournalError> {
+        if server_receipt.trim().is_empty() {
+            return Err(JournalError::Sequence);
+        }
+        let existing: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT server_receipt FROM run_events
+                 WHERE json_extract(public_envelope,'$.event_id')=?1",
+                [event_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            None => return Err(JournalError::Sequence),
+            Some(Some(receipt)) if receipt != server_receipt => {
+                return Err(JournalError::Sequence);
+            }
+            Some(Some(_)) => return Ok(()),
+            Some(None) => {}
+        }
+        let changed = self.connection.execute(
+            "UPDATE run_events SET server_receipt=?1
+             WHERE json_extract(public_envelope,'$.event_id')=?2
+               AND server_receipt IS NULL",
+            params![server_receipt, event_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::Sequence);
+        }
+        Ok(())
+    }
+
     pub fn private_payload(&self, event_sha256: &str) -> Result<Option<Value>, JournalError> {
         let row: Option<(String, String)> = self
             .connection
@@ -179,6 +243,15 @@ impl EncryptedJournal {
                 )
             })
             .transpose()?)
+    }
+
+    pub fn delete_secret(&self, name: &str) -> Result<(), JournalError> {
+        if name.is_empty() {
+            return Err(JournalError::Sequence);
+        }
+        self.connection
+            .execute("DELETE FROM local_secrets WHERE name=?1", [name])?;
+        Ok(())
     }
 }
 
@@ -265,6 +338,51 @@ mod tests {
         assert_eq!(
             journal.latest_event_state(run_id)?,
             Some((1, event.event_sha256))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_events_are_ordered_and_acknowledged_idempotently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("journal.db");
+        let identity = DeviceIdentity::generate();
+        let arena_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let first = RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            None,
+            1,
+            "0".repeat(64),
+            "run_started".into(),
+            OffsetDateTime::now_utc(),
+            json!({"release": "0.1.0"}),
+        )?;
+        let second = RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            Some(Uuid::new_v4()),
+            2,
+            first.event_sha256.clone(),
+            "cycle_started".into(),
+            OffsetDateTime::now_utc(),
+            json!({"scheduled": true}),
+        )?;
+        let mut journal = EncryptedJournal::open(&path, [23_u8; 32])?;
+        journal.append(&first, &json!({"private": "first"}))?;
+        journal.append(&second, &json!({"private": "second"}))?;
+        assert_eq!(journal.pending_events(run_id)?, vec![first.clone(), second]);
+        journal.acknowledge_event(first.event_id, "gateway-receipt-1")?;
+        journal.acknowledge_event(first.event_id, "gateway-receipt-1")?;
+        assert_eq!(journal.pending_events(run_id)?.len(), 1);
+        assert!(
+            journal
+                .acknowledge_event(first.event_id, "different-receipt")
+                .is_err()
         );
         Ok(())
     }
