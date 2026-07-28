@@ -85,6 +85,20 @@ state files for plaintext leakage, and updates the JSON report after every
 cycle. This component gate complements—rather than replaces—the staging soak
 that uses an authorized Crow device and actual Hyperliquid Testnet account.
 
+## Deterministic replay
+
+The macOS, Windows, and Linux CI matrix asserts the same fixed-point historical
+replay and signed Parquet package against immutable SHA-256 golden values:
+
+- backtest result:
+  `67580b3c870a429b5aee61a01007809ac3862c2c5484d6ee36f9ec14e28cd77d`
+- signed dataset bytes:
+  `5121842cd832614ffefefffe3fb00ee186a4a48b3c661a0d531513082cbcbbd0`
+
+Changing either digest requires an explicit review of the arena execution or
+dataset-package semantics. A platform-specific serialization or arithmetic
+difference fails CI.
+
 OpenProphet is a noncommercial project and no OpenProphet source is included.
 This repository remains proprietary and all rights are reserved; making the
 source publicly readable does not grant an open-source license.
