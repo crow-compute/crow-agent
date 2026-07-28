@@ -17,7 +17,7 @@ pub struct CandleV1 {
     pub low_micro_usdc: i64,
     pub close_micro_usdc: i64,
     pub volume_e8: i64,
-    pub funding_micros_per_usdc: i64,
+    pub funding_rate_e12: i64,
     pub size_decimals: u8,
 }
 
@@ -283,7 +283,7 @@ impl BacktestEngine {
                     .ok_or(BacktestError::CandleOrder)?;
                 let notional = position_notional(quantity, candle.close_micro_usdc)?;
                 let payment = i64::try_from(
-                    i128::from(notional) * i128::from(candle.funding_micros_per_usdc) / 1_000_000,
+                    i128::from(notional) * i128::from(candle.funding_rate_e12) / 1_000_000_000_000,
                 )
                 .map_err(|_| BacktestError::Overflow)?;
                 cash = cash.checked_sub(payment).ok_or(BacktestError::Overflow)?;
@@ -434,7 +434,7 @@ mod tests {
             low_micro_usdc: 59_000_000_000,
             close_micro_usdc: 60_000_000_000,
             volume_e8: 1,
-            funding_micros_per_usdc: 0,
+            funding_rate_e12: 0,
             size_decimals: 5,
         };
         let next = CandleV1 {
@@ -493,7 +493,7 @@ mod tests {
                     low_micro_usdc: price,
                     close_micro_usdc: price,
                     volume_e8: 100,
-                    funding_micros_per_usdc: 10,
+                    funding_rate_e12: 10_000_000,
                     size_decimals: decimals,
                 });
             }
@@ -546,7 +546,7 @@ mod tests {
                     low_micro_usdc: price - 1_000_000,
                     close_micro_usdc: price + 500_000,
                     volume_e8: 100_000_000 + interval,
-                    funding_micros_per_usdc: (interval + 1) * 2,
+                    funding_rate_e12: (interval + 1) * 2_000_000,
                     size_decimals: decimals,
                 });
             }

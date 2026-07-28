@@ -1,0 +1,203 @@
+name: signed-historical-dataset
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: Immutable dataset UUID
+        required: true
+        default: "019fa600-7b45-7000-8000-000000000001"
+      version:
+        description: Positive dataset version
+        required: true
+        default: "1"
+      start_time_ms:
+        description: Inclusive UTC hour boundary in epoch milliseconds
+        required: true
+        default: "1782518400000"
+      end_time_ms:
+        description: Exclusive UTC hour boundary in epoch milliseconds
+        required: true
+        default: "1785110400000"
+      release_tag:
+        description: Immutable public dataset release tag
+        required: true
+        default: "dataset-v1"
+      publish:
+        description: Create the immutable public GitHub prerelease
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Fetch, sign, verify, and publish
+    runs-on: ubuntu-22.04
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: signed-historical-dataset
+      - name: Install deterministic packaging tools
+        run: sudo apt-get update && sudo apt-get install -y jq zstd
+      - name: Materialize the protected dataset key
+        shell: bash
+        env:
+          DATASET_SIGNING_KEY_BASE64: ${{ secrets.DATASET_SIGNING_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$DATASET_SIGNING_KEY_BASE64"
+          printf '%s' "$DATASET_SIGNING_KEY_BASE64" |
+            base64 --decode > "$RUNNER_TEMP/dataset-signing-key"
+          test "$(wc -c < "$RUNNER_TEMP/dataset-signing-key")" -eq 32
+      - name: Require the pinned public key
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(
+            cargo run --quiet --release --locked -p crow-dataset-publisher -- \
+              public-key \
+              --signing-key-file "$RUNNER_TEMP/dataset-signing-key"
+          )
+          expected=$(tr -d '\r\n' < deploy/crow-dataset-release-v1.pub)
+          test "$actual" = "$expected"
+      - name: Fetch and sign the immutable dataset
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --quiet --release --locked -p crow-dataset-publisher -- \
+            publish \
+            --output "$RUNNER_TEMP/dataset" \
+            --dataset-id "${{ inputs.dataset_id }}" \
+            --version "${{ inputs.version }}" \
+            --start-time-ms "${{ inputs.start_time_ms }}" \
+            --end-time-ms "${{ inputs.end_time_ms }}" \
+            --signing-key-file "$RUNNER_TEMP/dataset-signing-key" |
+            tee "$RUNNER_TEMP/publication-result.json"
+      - name: Verify the package from its public key
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --quiet --release --locked -p crow-dataset-publisher -- \
+            verify \
+            --dataset-directory "$RUNNER_TEMP/dataset" \
+            --expected-public-key-file deploy/crow-dataset-release-v1.pub |
+            tee "$RUNNER_TEMP/verification-result.json"
+          test "$(jq -r .verified "$RUNNER_TEMP/verification-result.json")" = true
+      - name: Build and reverify the deterministic archive
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${{ inputs.release_tag }}"
+          [[ "$release_tag" =~ ^dataset-v[1-9][0-9]*$ ]]
+          archive="crow-historical-${release_tag}-${{ inputs.start_time_ms }}-${{ inputs.end_time_ms }}.tar.zst"
+          tar \
+            --sort=name \
+            --mtime='UTC 1970-01-01' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "$RUNNER_TEMP/dataset" \
+            -cf - . |
+            zstd --ultra -19 --threads=1 -o "$RUNNER_TEMP/$archive"
+          (
+            cd "$RUNNER_TEMP"
+            sha256sum "$archive" > "$archive.sha256"
+          )
+          mkdir "$RUNNER_TEMP/reverify"
+          zstd --decompress --stdout "$RUNNER_TEMP/$archive" |
+            tar -xf - -C "$RUNNER_TEMP/reverify"
+          cargo run --quiet --release --locked -p crow-dataset-publisher -- \
+            verify \
+            --dataset-directory "$RUNNER_TEMP/reverify" \
+            --expected-public-key-file deploy/crow-dataset-release-v1.pub
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+      - name: Record publication provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg protocol "crow.harness.v1" \
+            --arg source "Hyperliquid mainnet public info API" \
+            --arg endpoint "https://api.hyperliquid.xyz/info" \
+            --arg documentation "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint" \
+            --arg source_commit "$GITHUB_SHA" \
+            --arg start_time_ms "${{ inputs.start_time_ms }}" \
+            --arg end_time_ms "${{ inputs.end_time_ms }}" \
+            --slurpfile publication "$RUNNER_TEMP/publication-result.json" \
+            --slurpfile verification "$RUNNER_TEMP/verification-result.json" \
+            '{
+              protocol: $protocol,
+              source: $source,
+              endpoint: $endpoint,
+              documentation: $documentation,
+              source_commit: $source_commit,
+              start_time_ms: $start_time_ms,
+              end_time_ms: $end_time_ms,
+              publication: $publication[0],
+              verification: $verification[0]
+            }' > "$RUNNER_TEMP/dataset-publication-evidence.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-historical-dataset-v${{ inputs.version }}
+          path: |
+            ${{ runner.temp }}/${{ steps.archive.outputs.archive }}
+            ${{ runner.temp }}/${{ steps.archive.outputs.archive }}.sha256
+            ${{ runner.temp }}/dataset/dataset-manifest-v1.json
+            ${{ runner.temp }}/dataset-publication-evidence.json
+            deploy/crow-dataset-release-v1.pub
+          if-no-files-found: error
+          retention-days: 90
+      - name: Publish the immutable public dataset release
+        if: inputs.publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${{ inputs.release_tag }}" >/dev/null 2>&1; then
+            echo "Release ${{ inputs.release_tag }} already exists; refusing to mutate it." >&2
+            exit 1
+          fi
+          package_sha256=$(
+            jq -r .package_sha256 "$RUNNER_TEMP/publication-result.json"
+          )
+          archive_sha256=$(
+            cut -d ' ' -f 1 \
+              "$RUNNER_TEMP/${{ steps.archive.outputs.archive }}.sha256"
+          )
+          printf '%s\n' \
+            '# Crow Historical Dataset v${{ inputs.version }}' \
+            '' \
+            'Signed BTC/ETH/SOL 15-minute OHLCV, hourly funding, and instrument metadata from the Hyperliquid mainnet public info API.' \
+            '' \
+            "- Window: \`${{ inputs.start_time_ms }}\` inclusive to \`${{ inputs.end_time_ms }}\` exclusive" \
+            "- Dataset package digest: \`$package_sha256\`" \
+            "- Archive SHA-256: \`$archive_sha256\`" \
+            "- Source commit: \`$GITHUB_SHA\`" \
+            '' \
+            'Verify after extraction:' \
+            '' \
+            '```bash' \
+            'crow-dataset-publisher verify --dataset-directory . --expected-public-key-file crow-dataset-release-v1.pub' \
+            '```' > "$RUNNER_TEMP/release-notes.md"
+          gh release create "${{ inputs.release_tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Crow Historical Dataset v${{ inputs.version }}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --prerelease \
+            "$RUNNER_TEMP/${{ steps.archive.outputs.archive }}" \
+            "$RUNNER_TEMP/${{ steps.archive.outputs.archive }}.sha256" \
+            "$RUNNER_TEMP/dataset/dataset-manifest-v1.json" \
+            "$RUNNER_TEMP/dataset-publication-evidence.json" \
+            deploy/crow-dataset-release-v1.pub

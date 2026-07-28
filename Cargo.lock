@@ -2720,6 +2720,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "crow-dataset-publisher"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "crow-agent-core",
+ "crow-agent-protocol",
+ "ed25519-dalek",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

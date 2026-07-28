@@ -20,7 +20,10 @@ pub use companion::{
     MAX_COMPANION_MESSAGE_BYTES,
 };
 pub use crypto::{BundleCiphertext, DeviceEncryptionKey, WrappedBundleKey};
-pub use dataset::{DatasetError, DatasetPackage, read_verified_dataset, write_signed_dataset};
+pub use dataset::{
+    DATASET_MANIFEST_FILE, DatasetError, DatasetPackage, InstrumentV1, read_verified_dataset,
+    write_signed_dataset,
+};
 pub use device_auth::{
     DeviceAuthorizationClient, DeviceAuthorizationError, DeviceAuthorizationSession, DeviceTokens,
 };
