@@ -11,8 +11,8 @@ repository.workspace = true
 [dependencies]
 base64.workspace = true
 clap.workspace = true
-crow-agent-core = { version = "=0.1.8", path = "../../crates/crow-agent-core" }
-crow-agent-protocol = { version = "=0.1.8", path = "../../crates/crow-agent-protocol" }
+crow-agent-core = { version = "=0.1.9", path = "../../crates/crow-agent-core" }
+crow-agent-protocol = { version = "=0.1.9", path = "../../crates/crow-agent-protocol" }
 ed25519-dalek.workspace = true
 reqwest.workspace = true
 serde.workspace = true
