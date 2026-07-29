@@ -5,6 +5,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -40,6 +41,21 @@ pub enum GatewayError {
     Status(u16),
     #[error("gateway receipt is not bound to the request")]
     ReceiptBinding,
+}
+
+impl GatewayError {
+    /// Stable operational classification.  It deliberately excludes response
+    /// text, prompts, bearer material, and upstream-provider detail.
+    #[must_use]
+    pub fn failure_class(&self) -> &'static str {
+        match self {
+            Self::Url => "gateway_url",
+            Self::Authorization => "gateway_authorization",
+            Self::Request(_) => "gateway_request",
+            Self::Status(_) => "gateway_http_status",
+            Self::ReceiptBinding => "gateway_receipt_binding",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -141,9 +157,17 @@ impl InferenceProvider for GatewayClient {
             },
         )
         .await
-        .map_err(|_| RuntimeError::Inference)?;
-        let output = serde_json::from_value::<ModelTurn>(response.output)
-            .map_err(|_| RuntimeError::Inference)?;
+        .map_err(|error| {
+            warn!(failure_class = error.failure_class(), "arena inference rejected before model-turn parsing");
+            RuntimeError::Inference
+        })?;
+        let output = serde_json::from_value::<ModelTurn>(response.output).map_err(|_| {
+            warn!(
+                failure_class = "gateway_model_turn_invalid",
+                "arena inference returned an invalid model turn"
+            );
+            RuntimeError::Inference
+        })?;
         Ok(InferenceTurn {
             output,
             receipt: response.receipt,

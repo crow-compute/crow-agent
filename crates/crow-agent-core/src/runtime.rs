@@ -107,8 +107,11 @@ pub struct CycleContext<'a> {
 
 #[derive(Debug, Clone)]
 pub struct CycleOutcome {
-    pub proposal: Proposal,
-    pub order: Result<OrderDecision, PolicyError>,
+    /// A model may deliberately abstain after receiving a valid, signed turn.
+    /// `None` is a receipt-backed hold, not a policy rejection and never
+    /// permits venue execution.
+    pub proposal: Option<Proposal>,
+    pub order: Option<Result<OrderDecision, PolicyError>>,
     pub receipts: Vec<ArenaInferenceReceiptV1>,
     pub tool_results: Vec<ToolResult>,
 }
@@ -207,8 +210,8 @@ where
                     },
                 );
                 return Ok(CycleOutcome {
-                    proposal,
-                    order,
+                    proposal: Some(proposal),
+                    order: Some(order),
                     receipts,
                     tool_results,
                 });
@@ -217,7 +220,12 @@ where
                 return Err(RuntimeError::ToolRoundLimit);
             }
             if turn.output.tool_calls.is_empty() {
-                return Err(RuntimeError::MissingProposal);
+                return Ok(CycleOutcome {
+                    proposal: None,
+                    order: None,
+                    receipts,
+                    tool_results,
+                });
             }
             for call in turn.output.tool_calls {
                 let tool = self
@@ -316,6 +324,23 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct HoldingInference;
+
+    #[async_trait]
+    impl InferenceProvider for HoldingInference {
+        async fn infer(&self, request: &ModelTurnRequest) -> Result<InferenceTurn, RuntimeError> {
+            let output = ModelTurn {
+                tool_calls: Vec::new(),
+                proposal: None,
+            };
+            Ok(InferenceTurn {
+                receipt: receipt_for(request, &output)?,
+                output,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn bounded_model_loop_executes_only_after_local_policy() -> Result<(), RuntimeError> {
         let mut runtime = AgentRuntime::new(ScriptedInference {
@@ -360,7 +385,52 @@ mod tests {
             .await?;
         assert_eq!(outcome.receipts.len(), 2);
         assert_eq!(outcome.tool_results.len(), 1);
-        assert_eq!(outcome.order?.symbol, "BTC");
+        let order = outcome.order.ok_or(RuntimeError::Inference)?;
+        assert_eq!(order?.symbol, "BTC");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_model_hold_is_not_a_policy_rejection() -> Result<(), RuntimeError> {
+        let runtime = AgentRuntime::new(HoldingInference);
+        let markets = BTreeMap::from([(
+            "BTC".into(),
+            MarketState {
+                symbol: "BTC".into(),
+                mark_price_micro_usdc: 100_000_000,
+                oracle_price_micro_usdc: 100_000_000,
+                spread_bps: 4,
+                book_age_seconds: 1,
+                ask_depth_micro_usdc: 10_000_000,
+                bid_depth_micro_usdc: 10_000_000,
+                size_decimals: 5,
+                delisted: false,
+            },
+        )]);
+        let portfolio = PortfolioState {
+            equity_micro_usdc: 1_000_000_000,
+            available_collateral_micro_usdc: 1_000_000_000,
+            trading_day_start_equity_micro_usdc: 1_000_000_000,
+            peak_equity_micro_usdc: 1_000_000_000,
+            symbol_position_micro_usdc: 0,
+            orders_today: 0,
+        };
+        let portfolios = BTreeMap::from([("BTC".into(), portfolio)]);
+        let outcome = runtime
+            .execute_cycle(&CycleContext {
+                manifest: &manifest(),
+                run_id: Uuid::from_u128(20),
+                cycle_id: Uuid::from_u128(21),
+                model_id: ALLOWED_MODELS[0],
+                strategy_instructions: "Hold when no compliant action exists.",
+                markets: &markets,
+                portfolios: &portfolios,
+                cycle_context: json!({"candle_closed_at": "2026-07-01T00:00:00Z"}),
+            })
+            .await?;
+        assert!(outcome.proposal.is_none());
+        assert!(outcome.order.is_none());
+        assert_eq!(outcome.receipts.len(), 1);
         Ok(())
     }
 
