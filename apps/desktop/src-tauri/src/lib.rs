@@ -1642,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_state_accepts_backend_snake_case_payloads() {
+    fn remote_state_accepts_backend_snake_case_payloads() -> Result<(), serde_json::Error> {
         let device = serde_json::from_value::<RemoteDevice>(json!({
             "id": Uuid::nil().to_string(),
             "device_label": "Crow desktop",
@@ -1653,20 +1653,18 @@ mod tests {
             "signing_public_key": "ignored by the desktop inventory",
             "inference_api_key_id": Uuid::nil().to_string(),
             "created_at": "2026-07-29T01:31:41.825668Z"
-        }))
-        .expect("backend device payload");
+        }))?;
         assert_eq!(device.device_label, "Crow desktop");
         assert_eq!(device.platform, "macos");
 
-        let runs =
-            serde_json::from_value::<Vec<RemoteRun>>(json!([])).expect("empty backend run list");
+        let runs = serde_json::from_value::<Vec<RemoteRun>>(json!([]))?;
         assert!(runs.is_empty());
         let null_runs = serde_json::from_value::<Vec<RemoteRun>>(array_field_or_empty(
             &json!({"runs": null}),
             "runs",
-        ))
-        .expect("legacy null backend run list");
+        ))?;
         assert!(null_runs.is_empty());
+        Ok(())
     }
 
     #[test]
