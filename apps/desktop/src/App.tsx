@@ -138,6 +138,7 @@ export function App() {
   const [localBusy, setLocalBusy] = useState("");
   const [selectedArena, setSelectedArena] = useState<PublicArena | null>(null);
   const [arenaSetupStep, setArenaSetupStep] = useState<ArenaSetupStep>("agent");
+  const [arenaLaunchNotice, setArenaLaunchNotice] = useState<string | null>(null);
   const [agentVersions, setAgentVersions] = useState<AgentVersionSummary[]>([]);
   const [selectedVersionId, setSelectedVersionId] = useState("");
   const [agentName, setAgentName] = useState("Measured momentum");
@@ -266,10 +267,12 @@ export function App() {
   async function openArenaSetup(arena: PublicArena) {
     setSelectedArena(arena);
     setArenaSetupStep("agent");
+    setArenaLaunchNotice(null);
     setWalletSetup(null);
     setHandoffSnapshot("");
     setArenaBusy(true);
     setNotice(null);
+    setArenaLaunchNotice(null);
     const models = arenaModels(arena);
     setAgentModelId(models[0] ?? "");
     try {
@@ -335,7 +338,7 @@ export function App() {
       setView("overview");
       setNotice("Local arena staged and reconciled in pause. Review the run, then Resume.");
     } catch (error) {
-      setNotice(arenaLaunchFailure(error));
+      setArenaLaunchNotice(arenaLaunchFailure(error));
     } finally {
       setArenaBusy(false);
     }
@@ -655,6 +658,12 @@ export function App() {
             <p className="setup-intro">
               Strategy plaintext and the venue signing key stay inside this machine. The run starts paused after Crow and Hyperliquid reconciliation.
             </p>
+            {arenaLaunchNotice ? (
+              <div className="setup-error" role="alert">
+                <strong>Could not stage arena</strong>
+                <span>{arenaLaunchNotice}</span>
+              </div>
+            ) : null}
 
             {arenaSetupStep === "agent" ? (
               <div className="setup-body">
@@ -736,6 +745,7 @@ export function App() {
                 <label className="field-block">
                   <span>Hyperliquid master account</span>
                   <input
+                    aria-label="Hyperliquid master account"
                     value={executionAccount}
                     placeholder="0x…"
                     spellCheck={false}

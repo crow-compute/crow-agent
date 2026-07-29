@@ -452,6 +452,20 @@ button:disabled { cursor: not-allowed; opacity: .38; }
 .setup-progress span.complete, .setup-progress span.complete b { color: var(--bone-2); }
 .setup-progress i { height: 1px; background: var(--line-strong); }
 .setup-body { display: grid; gap: 18px; }
+.setup-error {
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid var(--heat);
+  background: rgba(255, 77, 0, .11);
+}
+.setup-error strong {
+  color: var(--heat);
+  font: 600 9px var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.setup-error span { color: var(--bone-2); font-size: 12px; line-height: 1.5; }
 .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .field-block { display: grid; gap: 8px; }
 .field-block > span, .venue-key-panel > span, .launch-contract > span {

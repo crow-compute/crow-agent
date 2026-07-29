@@ -847,16 +847,13 @@ async fn start_local_arena(
         .into_iter()
         .find(|arena| arena.id == arena_id.to_string())
         .ok_or_else(|| DesktopError::Arena.code().to_owned())?;
-    let signed = SignedArenaManifestV1 {
-        manifest: serde_json::from_value(arena.manifest.clone())
-            .map_err(|_| DesktopError::Arena.code().to_owned())?,
-        manifest_sha256: arena.manifest_sha256,
-        signer_public_key: arena.signer_public_key,
-        signature: arena.signature,
-    };
-    signed
-        .verify()
-        .map_err(|_| DesktopError::Arena.code().to_owned())?;
+    let signed = SignedArenaManifestV1::from_signed_value(
+        arena.manifest,
+        arena.manifest_sha256,
+        arena.signer_public_key,
+        arena.signature,
+    )
+    .map_err(|_| DesktopError::Arena.code().to_owned())?;
     let envelope = list_agent_version_envelopes(&token.access_token)
         .await
         .map_err(|error| error.code().to_owned())?
