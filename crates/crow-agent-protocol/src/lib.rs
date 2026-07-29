@@ -263,6 +263,8 @@ pub struct SignedArenaManifestV1 {
     pub manifest_sha256: String,
     pub signer_public_key: String,
     pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signed_manifest: Option<Value>,
 }
 
 impl SignedArenaManifestV1 {
@@ -277,12 +279,42 @@ impl SignedArenaManifestV1 {
             manifest_sha256: hex::encode(digest),
             signer_public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes()),
             signature: URL_SAFE_NO_PAD.encode(signing_key.sign(&digest).to_bytes()),
+            signed_manifest: None,
         })
+    }
+
+    pub fn from_signed_value(
+        manifest: Value,
+        manifest_sha256: String,
+        signer_public_key: String,
+        signature: String,
+    ) -> Result<Self, ProtocolError> {
+        let typed_manifest = serde_json::from_value::<ArenaManifestV1>(manifest.clone())
+            .map_err(ProtocolError::CanonicalJson)?;
+        let signed = Self {
+            manifest: typed_manifest,
+            manifest_sha256,
+            signer_public_key,
+            signature,
+            signed_manifest: Some(manifest),
+        };
+        signed.verify()?;
+        Ok(signed)
     }
 
     pub fn verify(&self) -> Result<(), ProtocolError> {
         self.manifest.validate()?;
-        let digest = sha256(&canonical_json(&self.manifest)?);
+        let canonical = if let Some(signed_manifest) = &self.signed_manifest {
+            let typed_manifest = serde_json::from_value::<ArenaManifestV1>(signed_manifest.clone())
+                .map_err(ProtocolError::CanonicalJson)?;
+            if typed_manifest != self.manifest {
+                return Err(ProtocolError::InvalidEventHash);
+            }
+            canonical_json(signed_manifest)?
+        } else {
+            canonical_json(&self.manifest)?
+        };
+        let digest = sha256(&canonical);
         if hex::encode(digest) != self.manifest_sha256 {
             return Err(ProtocolError::InvalidEventHash);
         }
@@ -873,6 +905,33 @@ mod tests {
         signed.manifest.required_client_version = "0.2.0".into();
         assert!(signed.verify().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn signed_manifest_preserves_operator_timestamp_bytes() -> Result<(), ProtocolError> {
+        let identity = DeviceIdentity::generate();
+        let mut manifest =
+            serde_json::to_value(valid_manifest()).map_err(ProtocolError::CanonicalJson)?;
+        manifest["starts_at"] = json!("2026-07-01T00:00:00.000Z");
+        manifest["ends_at"] = json!("2026-07-02T00:00:00.000Z");
+        let digest = sha256(&canonical_json(&manifest)?);
+        let signed = SignedArenaManifestV1::from_signed_value(
+            manifest,
+            hex::encode(digest),
+            identity.public_key(),
+            identity.sign_bytes(&digest),
+        )?;
+
+        signed.verify()?;
+        assert_ne!(
+            signed.manifest_sha256,
+            hex::encode(sha256(&canonical_json(&signed.manifest)?))
+        );
+
+        let encoded = serde_json::to_vec(&signed).map_err(ProtocolError::CanonicalJson)?;
+        let restored = serde_json::from_slice::<SignedArenaManifestV1>(&encoded)
+            .map_err(ProtocolError::CanonicalJson)?;
+        restored.verify()
     }
 
     #[test]

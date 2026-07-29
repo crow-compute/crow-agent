@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   App,
@@ -15,6 +15,8 @@ const harnessMock = vi.hoisted(() => ({
   arenas: [] as Array<Record<string, unknown>>,
   arenaFetches: 0,
   unlockCalls: 0,
+  versions: [] as Array<Record<string, unknown>>,
+  launchFailure: "",
 }));
 
 vi.mock("./tauri", async () => {
@@ -33,7 +35,22 @@ vi.mock("./tauri", async () => {
       return { arenas: harnessMock.arenas };
     },
     getRemoteState: async () => ({ devices: [], runs: [] }),
-    getAgentVersions: async () => ({ versions: [] }),
+    getAgentVersions: async () => ({ versions: harnessMock.versions }),
+    prepareHyperliquidWallet: async () => ({
+      address: "0x1111111111111111111111111111111111111111",
+      approvalUrl: "https://app.hyperliquid-testnet.xyz/API",
+    }),
+    enrollArena: async () => undefined,
+    startLocalArena: async () => {
+      if (harnessMock.launchFailure) throw new Error(harnessMock.launchFailure);
+      return {
+        protocol: "crow.harness.v1",
+        executionBoundary: "local_device",
+        daemon: "paused",
+        activeRun: "run",
+        deviceAuthorized: true,
+      };
+    },
     unlockDeviceCredentials: async () => {
       harnessMock.unlockCalls += 1;
       return { deviceId: "device", accessExpiresAt: "2026-07-28T00:00:00Z" };
@@ -49,6 +66,8 @@ describe("Crow Agent shell", () => {
     harnessMock.arenas = [];
     harnessMock.arenaFetches = 0;
     harnessMock.unlockCalls = 0;
+    harnessMock.versions = [];
+    harnessMock.launchFailure = "";
     vi.useRealTimers();
   });
 
@@ -189,6 +208,49 @@ describe("Crow Agent shell", () => {
     expect(arenaLaunchFailure("unexpected secret-shaped detail")).toBe(
       "Arena launch failed closed. No order was submitted.",
     );
+  });
+
+  it("shows a bounded launch failure inside the open setup dialog", async () => {
+    harnessMock.authorized = true;
+    harnessMock.arenas = [{
+      id: "00000000-0000-0000-0000-000000000003",
+      mode: "hyperliquid_testnet",
+      manifest: {
+        name: "Operator-created arena",
+        eligible_models: ["crow-qwen3-5-27b"],
+      },
+      state: "enrollment",
+      startsAt: "2099-07-29T03:15:00Z",
+      endsAt: "2099-07-29T03:45:00Z",
+      ticketsEnabled: false,
+      manifestSha256: "c".repeat(64),
+      signerPublicKey: "public",
+      signature: "signature",
+    }];
+    harnessMock.versions = [{
+      id: "00000000-0000-0000-0000-000000000004",
+      agentId: "00000000-0000-0000-0000-000000000005",
+      version: 1,
+      modelId: "crow-qwen3-5-27b",
+      configurationSha256: "d".repeat(64),
+      createdAt: "2026-07-29T00:00:00Z",
+    }];
+    harnessMock.launchFailure = "arena_operation_failed";
+
+    render(<App />);
+    screen.getByRole("button", { name: /Paper arenas/ }).click();
+    (await screen.findByRole("button", { name: "Select agent" })).click();
+    (await screen.findByRole("button", { name: /Continue to venue/ })).click();
+    const account = await screen.findByLabelText("Hyperliquid master account");
+    fireEvent.change(account, {
+      target: { value: "0x2222222222222222222222222222222222222222" },
+    });
+    screen.getByRole("button", { name: /stage paused/ }).click();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Could not stage arena");
+    expect(alert).toHaveTextContent("Crow rejected the enrollment");
+    expect(screen.getByRole("dialog", { name: "Operator-created arena" })).toContainElement(alert);
   });
 
   it("explains that a denied credential unlock will not retry", () => {

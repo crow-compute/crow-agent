@@ -4,9 +4,7 @@ use crow_agent_core::{
     HyperliquidBookStream, HyperliquidVenue, LiveRiskState, StartHarnessRunV1, execute_live_cycle,
     load_live_risk_state, open_agent_version, reconcile_live_state, store_live_risk_state,
 };
-use crow_agent_protocol::{
-    ArenaMode, DeviceIdentity, SignedArenaManifestV1, canonical_json, sha256,
-};
+use crow_agent_protocol::{ArenaMode, DeviceIdentity, SignedArenaManifestV1};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -336,9 +334,7 @@ async fn initialize_event_chain(
         writer.flush_pending().await?;
         return Ok(());
     }
-    let manifest_sha256 = hex::encode(sha256(
-        &canonical_json(&config.signed.manifest).map_err(|_| LiveRunError::Manifest)?,
-    ));
+    let manifest_sha256 = config.signed.manifest_sha256.clone();
     let mut writer = DurableRunEventWriter::new(journal, api, identity, arena_id, run_id);
     writer
         .append(
