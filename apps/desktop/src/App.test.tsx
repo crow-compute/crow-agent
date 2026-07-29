@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   App,
@@ -13,6 +13,7 @@ const harnessMock = vi.hoisted(() => ({
   daemon: "ready",
   activeRun: null as string | null,
   arenas: [] as Array<Record<string, unknown>>,
+  arenaFetches: 0,
   unlockCalls: 0,
 }));
 
@@ -27,7 +28,10 @@ vi.mock("./tauri", async () => {
       activeRun: harnessMock.activeRun,
       deviceAuthorized: harnessMock.authorized,
     }),
-    getPublicArenas: async () => ({ arenas: harnessMock.arenas }),
+    getPublicArenas: async () => {
+      harnessMock.arenaFetches += 1;
+      return { arenas: harnessMock.arenas };
+    },
     getRemoteState: async () => ({ devices: [], runs: [] }),
     getAgentVersions: async () => ({ versions: [] }),
     unlockDeviceCredentials: async () => {
@@ -43,7 +47,9 @@ describe("Crow Agent shell", () => {
     harnessMock.daemon = "ready";
     harnessMock.activeRun = null;
     harnessMock.arenas = [];
+    harnessMock.arenaFetches = 0;
     harnessMock.unlockCalls = 0;
+    vi.useRealTimers();
   });
 
   it("touches the credential vault only after an explicit unlock", async () => {
@@ -71,9 +77,50 @@ describe("Crow Agent shell", () => {
 
   it("navigates to the real arena catalog empty state", async () => {
     render(<App />);
-    screen.getByRole("button", { name: /Paper arenas/ }).click();
+    await act(async () => {
+      screen.getByRole("button", { name: /Paper arenas/ }).click();
+    });
     expect(await screen.findByRole("heading", { name: "PAPER ARENAS" })).toBeInTheDocument();
     expect(screen.getByText("No arena manifest is open.")).toBeInTheDocument();
+  });
+
+  it("refreshes the arena catalog without restarting or reopening the credential vault", async () => {
+    vi.useFakeTimers();
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(harnessMock.arenaFetches).toBe(1);
+    expect(harnessMock.unlockCalls).toBe(0);
+
+    await act(async () => {
+      screen.getByRole("button", { name: /Paper arenas/ }).click();
+    });
+    expect(screen.getByText("No arena manifest is open.")).toBeInTheDocument();
+    harnessMock.arenas = [{
+      id: "00000000-0000-0000-0000-000000000002",
+      mode: "hyperliquid_testnet",
+      manifest: {
+        name: "Fresh verified Testnet arena",
+        eligible_models: ["crow-qwen3-5-27b"],
+      },
+      state: "enrollment",
+      startsAt: "2026-07-29T03:15:00Z",
+      endsAt: "2099-07-29T03:45:00Z",
+      ticketsEnabled: false,
+      manifestSha256: "b".repeat(64),
+      signerPublicKey: "public",
+      signature: "signature",
+    }];
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+
+    expect(screen.getByRole("heading", { name: "Fresh verified Testnet arena" }))
+      .toBeInTheDocument();
+    expect(harnessMock.arenaFetches).toBe(2);
+    expect(harnessMock.unlockCalls).toBe(0);
   });
 
   it("does not present an idle paused companion as an active run", async () => {

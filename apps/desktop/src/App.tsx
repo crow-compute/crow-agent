@@ -176,9 +176,11 @@ export function App() {
     void refresh();
     void loadArenas();
     const interval = window.setInterval(refresh, 2_000);
+    const arenaInterval = window.setInterval(loadArenas, 15_000);
     return () => {
       active = false;
       window.clearInterval(interval);
+      window.clearInterval(arenaInterval);
     };
   }, []);
 
