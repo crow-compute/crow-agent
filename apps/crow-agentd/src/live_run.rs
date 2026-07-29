@@ -135,6 +135,7 @@ pub(crate) async fn run_session(
     if now >= manifest.ends_at {
         return Err(LiveRunError::Configuration);
     }
+    let expected_cycles = expected_cycle_count(manifest)?;
     let journal_path = state_directory.join("journal.db");
     let mut journal = EncryptedJournal::open(&journal_path, journal_key)?;
     let api = HarnessApiClient::new(api_origin, access_token.as_str())?;
@@ -149,6 +150,10 @@ pub(crate) async fn run_session(
     let venue = HyperliquidVenue::connect_testnet(api_wallet_key).await?;
 
     initialize_event_chain(config, run_id, &mut journal, &api, identity).await?;
+    let mut completed_cycles = journal.event_count(run_id, "cycle_started")?;
+    if completed_cycles > expected_cycles {
+        return Err(LiveRunError::State);
+    }
     let mut risk = if let Some(state) = load_live_risk_state(&journal, run_id)? {
         state
     } else {
@@ -221,7 +226,11 @@ pub(crate) async fn run_session(
                 }
             }
             _ = cycle_tick.tick() => {
-                if OffsetDateTime::now_utc() >= manifest.ends_at {
+                // The wall-clock tick can wake just before the signed end and
+                // spend time reconciling before the cycle event is appended.
+                // The immutable schedule and durable journal are authoritative:
+                // never begin more cycles than the manifest contains.
+                if completed_cycles >= expected_cycles || OffsetDateTime::now_utc() >= manifest.ends_at {
                     append_lifecycle(&mut journal, &api, identity, manifest.arena_id, run_id, "run_stopped").await?;
                     journal.delete_secret(&run_id_key(manifest.arena_id))?;
                     journal.delete_secret(&lease_key(manifest.arena_id))?;
@@ -254,6 +263,7 @@ pub(crate) async fn run_session(
                     submitted = result.order_submitted,
                     "live arena cycle durably accepted"
                 );
+                completed_cycles = completed_cycles.checked_add(1).ok_or(LiveRunError::State)?;
             }
             snapshot = stream.next_snapshot() => {
                 match snapshot {
@@ -402,6 +412,17 @@ fn duration_until_next_cycle(
     Duration::try_from(next - now).map_err(|_| LiveRunError::State)
 }
 
+fn expected_cycle_count(
+    manifest: &crow_agent_protocol::ArenaManifestV1,
+) -> Result<u64, LiveRunError> {
+    let interval = i64::from(manifest.decision_interval_seconds);
+    let duration = (manifest.ends_at - manifest.starts_at).whole_seconds();
+    if interval <= 0 || duration <= 0 || duration % interval != 0 {
+        return Err(LiveRunError::Configuration);
+    }
+    u64::try_from(duration / interval).map_err(|_| LiveRunError::State)
+}
+
 fn load_secret_string(journal: &EncryptedJournal, name: &str) -> Result<String, LiveRunError> {
     let value = journal.secret(name)?.ok_or(LiveRunError::State)?;
     std::str::from_utf8(&value)
@@ -458,5 +479,56 @@ mod tests {
             "positions": [{"symbol": "BTC", "quantity_e8": -42}]
         })));
         assert!(!fixed_point_value(&json!({"equity": 1.25})));
+    }
+
+    #[test]
+    fn expected_cycles_excludes_the_end_boundary() -> Result<(), Box<dyn std::error::Error>> {
+        let mut manifest = serde_json::from_value::<crow_agent_protocol::ArenaManifestV1>(json!({
+            "protocol": "crow.harness.v1",
+            "arena_id": Uuid::new_v4(),
+            "manifest_version": 1,
+            "mode": "hyperliquid_testnet",
+            "starts_at": "2026-07-29T13:30:00Z",
+            "ends_at": "2026-07-29T14:00:00Z",
+            "decision_interval_seconds": 900,
+            "symbols": ["BTC", "ETH", "SOL"],
+            "eligible_models": ["crow-qwen3-5-27b"],
+            "dataset_sha256": null,
+            "required_client_version": "0.1.10",
+            "risk_rules": {
+                "cash_reserve_bps": 1000,
+                "daily_loss_bps": 200,
+                "drawdown_bps": 1000,
+                "max_order_bps": 200,
+                "max_position_bps": 1000,
+                "max_spread_bps": 40,
+                "max_oracle_gap_bps": 100,
+                "book_max_age_seconds": 10,
+                "max_orders_day": 20,
+                "isolated_leverage": 1,
+                "long_only": true,
+                "ioc_only": true
+            },
+            "execution": {"half_spread_bps": 2, "slippage_bps": 3, "taker_fee_bps": 5},
+            "scoring": {"net_return": 50, "sortino": 30, "inverse_drawdown": 20},
+            "penalties": {
+                "policy_rejection_millis": 1000,
+                "missed_cycle_millis": 250,
+                "cap_millis": 15000
+            },
+            "ticket": {
+                "enabled": false,
+                "usdc_address": null,
+                "ticket_micro_usdc": 0,
+                "participant_cap": 0,
+                "prize_bps": 9000,
+                "protocol_bps": 1000,
+                "winner_bps": [5000, 3000, 2000]
+            }
+        }))?;
+        assert_eq!(expected_cycle_count(&manifest)?, 2);
+        manifest.ends_at += time::Duration::seconds(1);
+        assert!(expected_cycle_count(&manifest).is_err());
+        Ok(())
     }
 }

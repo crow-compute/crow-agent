@@ -134,6 +134,17 @@ impl EncryptedJournal {
         .transpose()
     }
 
+    pub fn event_count(&self, run_id: uuid::Uuid, event_type: &str) -> Result<u64, JournalError> {
+        let count = self.connection.query_row(
+            "SELECT COUNT(*) FROM run_events
+             WHERE run_id=?1
+               AND json_extract(public_envelope,'$.event_type')=?2",
+            params![run_id.to_string(), event_type],
+            |row| row.get::<_, i64>(0),
+        )?;
+        u64::try_from(count).map_err(|_| JournalError::Sequence)
+    }
+
     pub fn pending_events(
         &self,
         run_id: uuid::Uuid,
@@ -339,6 +350,43 @@ mod tests {
             journal.latest_event_state(run_id)?,
             Some((1, event.event_sha256))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn event_count_recovers_completed_cycles() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("journal.db");
+        let identity = DeviceIdentity::generate();
+        let arena_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let first = RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            Some(Uuid::new_v4()),
+            1,
+            "0".repeat(64),
+            "cycle_started".into(),
+            OffsetDateTime::now_utc(),
+            json!({"scheduled": true}),
+        )?;
+        let second = RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            None,
+            2,
+            first.event_sha256.clone(),
+            "run_resumed".into(),
+            OffsetDateTime::now_utc(),
+            json!({"source": "authenticated_control"}),
+        )?;
+        let mut journal = EncryptedJournal::open(&path, [17_u8; 32])?;
+        journal.append(&first, &json!({}))?;
+        journal.append(&second, &json!({}))?;
+        assert_eq!(journal.event_count(run_id, "cycle_started")?, 1);
+        assert_eq!(journal.event_count(run_id, "proposal")?, 0);
         Ok(())
     }
 
