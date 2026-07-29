@@ -427,14 +427,11 @@ impl DesktopState {
             let _ = child.kill();
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let command = match app.shell().sidecar("crow-agentd") {
-            Ok(command) => command,
-            Err(_) => {
-                self.companion_spawned.store(false, Ordering::SeqCst);
-                return Err(DesktopError::Companion);
-            }
+        let Ok(command) = app.shell().sidecar("crow-agentd") else {
+            self.companion_spawned.store(false, Ordering::SeqCst);
+            return Err(DesktopError::Companion);
         };
-        let (mut events, mut child) = match command
+        let Ok((mut events, mut child)) = command
             .args([
                 "desktop-run",
                 config_path,
@@ -442,25 +439,19 @@ impl DesktopState {
                 &credentials.ipc_name,
             ])
             .spawn()
-        {
-            Ok(spawned) => spawned,
-            Err(_) => {
-                self.companion_spawned.store(false, Ordering::SeqCst);
-                return Err(DesktopError::Companion);
-            }
+        else {
+            self.companion_spawned.store(false, Ordering::SeqCst);
+            return Err(DesktopError::Companion);
         };
         if child.write(credential_frame.as_ref()).is_err() {
             let _ = child.kill();
             self.companion_spawned.store(false, Ordering::SeqCst);
             return Err(DesktopError::Companion);
         }
-        let mut slot = match self.companion_child.lock() {
-            Ok(slot) => slot,
-            Err(_) => {
-                let _ = child.kill();
-                self.companion_spawned.store(false, Ordering::SeqCst);
-                return Err(DesktopError::Companion);
-            }
+        let Ok(mut slot) = self.companion_child.lock() else {
+            let _ = child.kill();
+            self.companion_spawned.store(false, Ordering::SeqCst);
+            return Err(DesktopError::Companion);
         };
         *slot = Some(child);
         let spawned = Arc::clone(&self.companion_spawned);
