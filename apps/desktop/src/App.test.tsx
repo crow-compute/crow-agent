@@ -2,6 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   App,
+  arenaAcceptsSetup,
   arenaLaunchFailure,
   credentialUnlockFailure,
   parseHandoffSnapshot,
@@ -95,7 +96,7 @@ describe("Crow Agent shell", () => {
       },
       state: "enrollment",
       startsAt: "2026-07-28T00:00:00Z",
-      endsAt: "2026-07-29T00:00:00Z",
+      endsAt: "2099-07-29T00:00:00Z",
       ticketsEnabled: false,
       manifestSha256: "a".repeat(64),
       signerPublicKey: "public",
@@ -108,6 +109,23 @@ describe("Crow Agent shell", () => {
     expect(await screen.findByRole("heading", { name: "First verified Testnet arena" })).toBeInTheDocument();
     expect(screen.getByText("No compatible version yet.")).toBeInTheDocument();
     expect(screen.getByLabelText("Private strategy instructions")).toBeInTheDocument();
+  });
+
+  it("fails closed for an arena whose immutable end time passed", () => {
+    const arena = {
+      id: "00000000-0000-0000-0000-000000000001",
+      mode: "hyperliquid_testnet",
+      manifest: {},
+      state: "enrollment",
+      startsAt: "2026-07-28T00:00:00Z",
+      endsAt: "2026-07-28T00:30:00Z",
+      ticketsEnabled: false,
+      manifestSha256: "a".repeat(64),
+      signerPublicKey: "public",
+      signature: "signature",
+    };
+    expect(arenaAcceptsSetup(arena, Date.parse("2026-07-28T00:29:59Z"))).toBe(true);
+    expect(arenaAcceptsSetup(arena, Date.parse("2026-07-28T00:30:00Z"))).toBe(false);
   });
 
   it("accepts only structured fixed-point handoff snapshots", () => {

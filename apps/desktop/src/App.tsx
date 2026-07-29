@@ -68,6 +68,13 @@ function arenaModels(arena: PublicArena) {
   return Array.isArray(models) ? models.filter((model): model is string => typeof model === "string") : [];
 }
 
+export function arenaAcceptsSetup(arena: PublicArena, now = Date.now()) {
+  const endsAt = new Date(arena.endsAt).getTime();
+  return ["enrollment", "running"].includes(arena.state)
+    && Number.isFinite(endsAt)
+    && now < endsAt;
+}
+
 function fixedPointHandoffValue(value: unknown): boolean {
   if (value === null || typeof value === "boolean" || typeof value === "string") return true;
   if (typeof value === "number") return Number.isSafeInteger(value);
@@ -534,12 +541,16 @@ export function App() {
                     type="button"
                     disabled={
                       !status.deviceAuthorized
-                      || !["enrollment", "running"].includes(arena.state)
+                      || !arenaAcceptsSetup(arena)
                       || Boolean(status.activeRun)
                     }
                     onClick={() => void openArenaSetup(arena)}
                   >
-                    {["enrollment", "running"].includes(arena.state) ? "Select agent" : arena.state}
+                    {arenaAcceptsSetup(arena)
+                      ? "Select agent"
+                      : ["enrollment", "running"].includes(arena.state)
+                        ? "Closed"
+                        : arena.state}
                   </button>
                 </article>
               )) : (

@@ -684,14 +684,11 @@ async fn get_remote_state(state: State<'_, DesktopState>) -> Result<RemoteState,
     )
     .await
     .map_err(|error| error.code().to_owned())?;
-    let devices = serde_json::from_value::<Vec<RemoteDevice>>(
-        devices.get("devices").cloned().unwrap_or_else(|| json!([])),
-    )
-    .map_err(|_| DesktopError::Network.code().to_owned())?;
-    let runs = serde_json::from_value::<Vec<RemoteRun>>(
-        runs.get("runs").cloned().unwrap_or_else(|| json!([])),
-    )
-    .map_err(|_| DesktopError::Network.code().to_owned())?;
+    let devices =
+        serde_json::from_value::<Vec<RemoteDevice>>(array_field_or_empty(&devices, "devices"))
+            .map_err(|_| DesktopError::Network.code().to_owned())?;
+    let runs = serde_json::from_value::<Vec<RemoteRun>>(array_field_or_empty(&runs, "runs"))
+        .map_err(|_| DesktopError::Network.code().to_owned())?;
     Ok(RemoteState { devices, runs })
 }
 
@@ -737,10 +734,9 @@ async fn create_agent_version(
     )
     .await
     .map_err(|error| error.code().to_owned())?;
-    let devices = serde_json::from_value::<Vec<RemoteDevice>>(
-        devices.get("devices").cloned().unwrap_or_else(|| json!([])),
-    )
-    .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
+    let devices =
+        serde_json::from_value::<Vec<RemoteDevice>>(array_field_or_empty(&devices, "devices"))
+            .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
     let recipients = devices
         .into_iter()
         .filter(|device| device.state == "active")
@@ -1246,6 +1242,13 @@ async fn device_api_empty(
     Ok(())
 }
 
+fn array_field_or_empty(payload: &Value, field: &str) -> Value {
+    match payload.get(field) {
+        None | Some(Value::Null) => json!([]),
+        Some(value) => value.clone(),
+    }
+}
+
 async fn fetch_public_arenas() -> Result<Vec<PublicArena>, DesktopError> {
     let endpoint = Url::parse(&api_origin())
         .and_then(|origin| origin.join("/api/v1/harness/arenas"))
@@ -1265,10 +1268,8 @@ async fn fetch_public_arenas() -> Result<Vec<PublicArena>, DesktopError> {
         .json::<Value>()
         .await
         .map_err(|_| DesktopError::Network)?;
-    serde_json::from_value::<Vec<PublicArena>>(
-        payload.get("arenas").cloned().unwrap_or_else(|| json!([])),
-    )
-    .map_err(|_| DesktopError::Network)
+    serde_json::from_value::<Vec<PublicArena>>(array_field_or_empty(&payload, "arenas"))
+        .map_err(|_| DesktopError::Network)
 }
 
 async fn list_agent_version_envelopes(
@@ -1281,12 +1282,9 @@ async fn list_agent_version_envelopes(
         None,
     )
     .await?;
-    serde_json::from_value::<Vec<AgentVersionEnvelopeV1>>(
-        payload
-            .get("versions")
-            .cloned()
-            .unwrap_or_else(|| json!([])),
-    )
+    serde_json::from_value::<Vec<AgentVersionEnvelopeV1>>(array_field_or_empty(
+        &payload, "versions",
+    ))
     .map_err(|_| DesktopError::AgentVersion)
 }
 
@@ -1641,6 +1639,32 @@ mod tests {
             Err(DesktopError::NoAuthorization)
         ));
         assert!(state.device_tokens.lock().await.is_none());
+    }
+
+    #[test]
+    fn remote_state_accepts_backend_snake_case_payloads() -> Result<(), serde_json::Error> {
+        let device = serde_json::from_value::<RemoteDevice>(json!({
+            "id": Uuid::nil().to_string(),
+            "device_label": "Crow desktop",
+            "platform": "macos",
+            "state": "active",
+            "last_seen_at": "2026-07-29T01:41:40.17766Z",
+            "encryption_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "signing_public_key": "ignored by the desktop inventory",
+            "inference_api_key_id": Uuid::nil().to_string(),
+            "created_at": "2026-07-29T01:31:41.825668Z"
+        }))?;
+        assert_eq!(device.device_label, "Crow desktop");
+        assert_eq!(device.platform, "macos");
+
+        let runs = serde_json::from_value::<Vec<RemoteRun>>(json!([]))?;
+        assert!(runs.is_empty());
+        let null_runs = serde_json::from_value::<Vec<RemoteRun>>(array_field_or_empty(
+            &json!({"runs": null}),
+            "runs",
+        ))?;
+        assert!(null_runs.is_empty());
+        Ok(())
     }
 
     #[test]
