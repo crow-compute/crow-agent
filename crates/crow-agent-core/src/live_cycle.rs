@@ -408,7 +408,7 @@ where
             )
             .await?;
     }
-    writer
+    let proposal_event = writer
         .append(
             Some(cycle_id),
             "proposal",
@@ -420,8 +420,19 @@ where
         )
         .await?;
 
-    let proposal_symbol = outcome.proposal.symbol.clone();
-    let order = match outcome.order {
+    let Some(proposal) = outcome.proposal else {
+        store_live_risk_state_with_writer(&writer, run_id, risk)?;
+        return Ok(LiveCycleResult {
+            cycle_id,
+            proposal_symbol: "HOLD".into(),
+            policy_allowed: false,
+            order_submitted: false,
+            client_order_id: None,
+            last_event_sha256: proposal_event.event_sha256,
+        });
+    };
+    let proposal_symbol = proposal.symbol.clone();
+    let order = match outcome.order.ok_or(LiveCycleError::RiskState)? {
         Ok(order) => order,
         Err(policy_error) => {
             let policy_event = writer
