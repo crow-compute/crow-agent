@@ -82,6 +82,9 @@ export type LocalRunSummary = {
   state: "running" | "paused" | "stopped";
   startedAt: string;
   latestAt: string;
+  arenaStartsAt: string | null;
+  arenaEndsAt: string | null;
+  decisionIntervalSeconds: number | null;
   eventCount: number;
   cycleCount: number;
   orderCount: number;

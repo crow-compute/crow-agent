@@ -21,6 +21,7 @@ import {
   type HyperliquidWalletSetup,
   type LocalRunEvent,
   type LocalRunJournal,
+  type LocalRunSummary,
   type PublicArena,
   type RemoteState,
 } from "./tauri";
@@ -139,6 +140,98 @@ export function arenaAcceptsSetup(arena: PublicArena, now = Date.now()) {
     && now < endsAt;
 }
 
+export type DecisionCountdown = {
+  tone: "active" | "paused" | "ended" | "stopped" | "unavailable";
+  label: string;
+  value: string;
+  boundaryAt: string | null;
+  detail: string;
+};
+
+function formatCountdown(milliseconds: number) {
+  const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1_000));
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+export function nextDecisionCountdown(
+  run: LocalRunSummary,
+  now = Date.now(),
+): DecisionCountdown {
+  const startsAt = run.arenaStartsAt ? Date.parse(run.arenaStartsAt) : Number.NaN;
+  const endsAt = run.arenaEndsAt ? Date.parse(run.arenaEndsAt) : Number.NaN;
+  const intervalSeconds = run.decisionIntervalSeconds;
+  if (
+    !Number.isFinite(startsAt)
+    || !Number.isFinite(endsAt)
+    || startsAt >= endsAt
+    || typeof intervalSeconds !== "number"
+    || !Number.isSafeInteger(intervalSeconds)
+    || intervalSeconds <= 0
+  ) {
+    return {
+      tone: "unavailable",
+      label: "SCHEDULE UNAVAILABLE",
+      value: "—",
+      boundaryAt: null,
+      detail: "The signed local arena schedule could not be verified.",
+    };
+  }
+  if (now >= endsAt) {
+    return {
+      tone: "ended",
+      label: "ARENA ENDED",
+      value: "00:00",
+      boundaryAt: null,
+      detail: `Ended ${formatMoment(run.arenaEndsAt)}`,
+    };
+  }
+  if (run.state === "stopped") {
+    return {
+      tone: "stopped",
+      label: "RUN STOPPED",
+      value: "—",
+      boundaryAt: null,
+      detail: "No further decisions will execute.",
+    };
+  }
+
+  const intervalMilliseconds = intervalSeconds * 1_000;
+  const nextAt = now < startsAt
+    ? startsAt
+    : startsAt + (Math.floor((now - startsAt) / intervalMilliseconds) + 1)
+      * intervalMilliseconds;
+  if (nextAt >= endsAt) {
+    return {
+      tone: "ended",
+      label: "DECISION WINDOWS COMPLETE",
+      value: "00:00",
+      boundaryAt: null,
+      detail: `Arena ends ${formatMoment(run.arenaEndsAt)}`,
+    };
+  }
+
+  const beforeStart = now < startsAt;
+  const paused = run.state === "paused";
+  return {
+    tone: paused ? "paused" : "active",
+    label: paused
+      ? beforeStart
+        ? "PAUSED — RESUME BEFORE START"
+        : "PAUSED — RESUME BEFORE NEXT WINDOW"
+      : beforeStart
+        ? "ARENA STARTS IN"
+        : "NEXT DECISION",
+    value: formatCountdown(nextAt - now),
+    boundaryAt: new Date(nextAt).toISOString(),
+    detail: `${paused ? "Scheduled window" : "Scheduled for"} ${formatMoment(new Date(nextAt).toISOString())}`,
+  };
+}
+
 function fixedPointHandoffValue(value: unknown): boolean {
   if (value === null || typeof value === "boolean" || typeof value === "string") return true;
   if (typeof value === "number") return Number.isSafeInteger(value);
@@ -222,6 +315,7 @@ export function App() {
   const [journalFilter, setJournalFilter] = useState<JournalFilter>("all");
   const [journalBusy, setJournalBusy] = useState(false);
   const [journalNotice, setJournalNotice] = useState<string | null>(null);
+  const [clockNow, setClockNow] = useState(() => Date.now());
 
   useEffect(() => {
     let active = true;
@@ -280,6 +374,13 @@ export function App() {
       window.clearInterval(interval);
     };
   }, [view, status.deviceAuthorized, status.activeRun, journal.selectedRunId]);
+
+  useEffect(() => {
+    if (view !== "runs") return;
+    setClockNow(Date.now());
+    const interval = window.setInterval(() => setClockNow(Date.now()), 1_000);
+    return () => window.clearInterval(interval);
+  }, [view]);
 
   async function selectJournalRun(runId: string) {
     setJournalBusy(true);
@@ -459,6 +560,10 @@ export function App() {
   const localLive = Boolean(status.activeRun)
     && (status.daemon === "running" || status.daemon === "paused");
   const selectedRun = journal.runs.find((run) => run.runId === journal.selectedRunId) ?? null;
+  const decisionCountdown = useMemo(
+    () => selectedRun ? nextDecisionCountdown(selectedRun, clockNow) : null,
+    [selectedRun, clockNow],
+  );
   const visibleJournalEvents = [...journal.events]
     .filter((event) => eventIsVisible(event, journalFilter))
     .reverse();
@@ -747,9 +852,22 @@ export function App() {
                           <h2>{selectedRun.state} / {selectedRun.fillCount ? `${selectedRun.fillCount} FILLS` : "NO FILLS YET"}</h2>
                           <p>Arena {shortId(selectedRun.arenaId)} · started {formatMoment(selectedRun.startedAt)}</p>
                         </div>
-                        <span className={selectedRun.allReceipted ? "receipt-state complete" : "receipt-state"}>
-                          {selectedRun.allReceipted ? "CHAIN RECEIPTED" : "RECEIPTS PENDING"}
-                        </span>
+                        <div className="journal-run-signals">
+                          {decisionCountdown ? (
+                            <div
+                              className={`decision-countdown countdown-${decisionCountdown.tone}`}
+                              role="timer"
+                              aria-label={`${decisionCountdown.label}: ${decisionCountdown.value}`}
+                            >
+                              <span>{decisionCountdown.label}</span>
+                              <strong>{decisionCountdown.value}</strong>
+                              <small>{decisionCountdown.detail}</small>
+                            </div>
+                          ) : null}
+                          <span className={selectedRun.allReceipted ? "receipt-state complete" : "receipt-state"}>
+                            {selectedRun.allReceipted ? "CHAIN RECEIPTED" : "RECEIPTS PENDING"}
+                          </span>
+                        </div>
                       </header>
 
                       <dl className="journal-metrics">

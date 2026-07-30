@@ -20,6 +20,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
@@ -223,6 +224,9 @@ struct LocalRunSummary {
     state: String,
     started_at: String,
     latest_at: String,
+    arena_starts_at: Option<String>,
+    arena_ends_at: Option<String>,
+    decision_interval_seconds: Option<u32>,
     event_count: u64,
     cycle_count: u64,
     order_count: u64,
@@ -247,6 +251,13 @@ struct LocalRunJournal {
     runs: Vec<LocalRunSummary>,
     selected_run_id: Option<String>,
     events: Vec<LocalRunEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalArenaSchedule {
+    starts_at: String,
+    ends_at: String,
+    decision_interval_seconds: u32,
 }
 
 #[derive(Debug)]
@@ -583,9 +594,9 @@ fn get_local_run_journal(
     if !state.device_authorized() {
         return Err(DesktopError::NoAuthorization.code().to_owned());
     }
-    let path = desktop_runtime_directory(&app)
-        .map_err(|_| DesktopError::Journal.code().to_owned())?
-        .join("state/journal.db");
+    let runtime_directory =
+        desktop_runtime_directory(&app).map_err(|_| DesktopError::Journal.code().to_owned())?;
+    let path = runtime_directory.join("state/journal.db");
     if !path.exists() {
         return Ok(LocalRunJournal {
             runs: Vec::new(),
@@ -600,35 +611,86 @@ fn get_local_run_journal(
     let public_events = journal
         .public_events()
         .map_err(|_| DesktopError::Journal.code().to_owned())?;
-    Ok(build_local_run_journal(&public_events, run_id.as_deref()))
+    let schedules = load_local_arena_schedules(&runtime_directory, &public_events);
+    Ok(build_local_run_journal(
+        &public_events,
+        run_id.as_deref(),
+        &schedules,
+    ))
+}
+
+fn load_local_arena_schedules(
+    runtime_directory: &Path,
+    public_events: &[crow_agent_protocol::RunEventEnvelopeV1],
+) -> BTreeMap<Uuid, LocalArenaSchedule> {
+    public_events
+        .iter()
+        .map(|event| event.arena_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|arena_id| {
+            let bytes = fs::read(runtime_directory.join(format!("arena-{arena_id}.json"))).ok()?;
+            verified_local_arena_schedule(&bytes, arena_id).map(|schedule| (arena_id, schedule))
+        })
+        .collect()
+}
+
+fn verified_local_arena_schedule(
+    bytes: &[u8],
+    expected_arena_id: Uuid,
+) -> Option<LocalArenaSchedule> {
+    let signed = serde_json::from_slice::<SignedArenaManifestV1>(bytes).ok()?;
+    signed.verify().ok()?;
+    if signed.manifest.arena_id != expected_arena_id {
+        return None;
+    }
+    Some(LocalArenaSchedule {
+        starts_at: signed
+            .manifest
+            .starts_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok()?,
+        ends_at: signed
+            .manifest
+            .ends_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok()?,
+        decision_interval_seconds: signed.manifest.decision_interval_seconds,
+    })
 }
 
 fn build_local_run_journal(
     public_events: &[crow_agent_protocol::RunEventEnvelopeV1],
     requested_run_id: Option<&str>,
+    schedules: &BTreeMap<Uuid, LocalArenaSchedule>,
 ) -> LocalRunJournal {
     let mut runs = Vec::<LocalRunSummary>::new();
     for event in public_events {
         let run_id = event.run_id.to_string();
         let occurred_at = event.occurred_at.to_string();
-        let summary_index =
-            if let Some(index) = runs.iter().position(|summary| summary.run_id == run_id) {
-                index
-            } else {
-                runs.push(LocalRunSummary {
-                    run_id: run_id.clone(),
-                    arena_id: event.arena_id.to_string(),
-                    state: "running".into(),
-                    started_at: occurred_at.clone(),
-                    latest_at: occurred_at.clone(),
-                    event_count: 0,
-                    cycle_count: 0,
-                    order_count: 0,
-                    fill_count: 0,
-                    all_receipted: true,
-                });
-                runs.len() - 1
-            };
+        let summary_index = if let Some(index) =
+            runs.iter().position(|summary| summary.run_id == run_id)
+        {
+            index
+        } else {
+            let schedule = schedules.get(&event.arena_id);
+            runs.push(LocalRunSummary {
+                run_id: run_id.clone(),
+                arena_id: event.arena_id.to_string(),
+                state: "running".into(),
+                started_at: occurred_at.clone(),
+                latest_at: occurred_at.clone(),
+                arena_starts_at: schedule.map(|value| value.starts_at.clone()),
+                arena_ends_at: schedule.map(|value| value.ends_at.clone()),
+                decision_interval_seconds: schedule.map(|value| value.decision_interval_seconds),
+                event_count: 0,
+                cycle_count: 0,
+                order_count: 0,
+                fill_count: 0,
+                all_receipted: true,
+            });
+            runs.len() - 1
+        };
         let summary = &mut runs[summary_index];
         summary.event_count += 1;
         summary.latest_at = occurred_at;
@@ -2007,13 +2069,57 @@ mod tests {
         )?;
 
         let events = [started, fill, paused];
-        let journal = build_local_run_journal(&events, Some(&run_id.to_string()));
+        let journal = build_local_run_journal(&events, Some(&run_id.to_string()), &BTreeMap::new());
         assert_eq!(journal.runs.len(), 1);
         assert_eq!(journal.runs[0].state, "paused");
         assert_eq!(journal.runs[0].fill_count, 2);
         assert!(!journal.runs[0].all_receipted);
         assert_eq!(journal.events.len(), 3);
         assert_eq!(journal.events[1].details["fills"][0]["coin"], "BTC");
+        Ok(())
+    }
+
+    #[test]
+    fn journal_schedule_requires_the_exact_signed_arena_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = DeviceIdentity::generate();
+        let arena_id = Uuid::new_v4();
+        let manifest = crow_agent_protocol::ArenaManifestV1 {
+            protocol: HARNESS_PROTOCOL_V1.into(),
+            arena_id,
+            manifest_version: 1,
+            mode: crow_agent_protocol::ArenaMode::HyperliquidTestnet,
+            starts_at: time::macros::datetime!(2026-07-30 04:15 UTC),
+            ends_at: time::macros::datetime!(2026-07-30 04:45 UTC),
+            decision_interval_seconds: 900,
+            symbols: crow_agent_protocol::ALLOWED_SYMBOLS
+                .map(str::to_owned)
+                .to_vec(),
+            eligible_models: vec![crow_agent_protocol::ALLOWED_MODELS[0].into()],
+            dataset_sha256: None,
+            required_client_version: "0.1.14".into(),
+            risk_rules: crow_agent_protocol::RiskRulesV1::default(),
+            execution: crow_agent_protocol::ExecutionAssumptionsV1 {
+                half_spread_bps: 2,
+                slippage_bps: 3,
+                taker_fee_bps: 5,
+            },
+            scoring: crow_agent_protocol::ScoringWeightsV1::default(),
+            penalties: crow_agent_protocol::PenaltyRulesV1::default(),
+            ticket: crow_agent_protocol::TicketConfigV1::default(),
+        };
+        let signed = SignedArenaManifestV1::sign(manifest, identity.signing_key())?;
+        let encoded = serde_json::to_vec(&signed)?;
+        let schedule =
+            verified_local_arena_schedule(&encoded, arena_id).ok_or("missing schedule")?;
+        assert_eq!(schedule.starts_at, "2026-07-30T04:15:00Z");
+        assert_eq!(schedule.ends_at, "2026-07-30T04:45:00Z");
+        assert_eq!(schedule.decision_interval_seconds, 900);
+        assert!(verified_local_arena_schedule(&encoded, Uuid::new_v4()).is_none());
+
+        let mut mutated = serde_json::to_value(signed)?;
+        mutated["manifest"]["starts_at"] = json!("2026-07-30T04:16:00Z");
+        assert!(verified_local_arena_schedule(&serde_json::to_vec(&mutated)?, arena_id).is_none());
         Ok(())
     }
 }

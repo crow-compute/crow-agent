@@ -406,6 +406,48 @@ button:disabled { cursor: not-allowed; opacity: .38; }
   text-transform: uppercase;
 }
 .journal-run-header p:not(.meta) { margin: 10px 0 0; color: var(--muted); font: 500 9px var(--mono); }
+.journal-run-signals {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  flex-direction: column;
+  gap: 9px;
+}
+.decision-countdown {
+  min-width: 250px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  background: rgba(231, 225, 211, .025);
+  text-align: right;
+}
+.decision-countdown span,
+.decision-countdown small {
+  display: block;
+  font: 600 7px var(--mono);
+  letter-spacing: .09em;
+  text-transform: uppercase;
+}
+.decision-countdown span { color: var(--muted); }
+.decision-countdown strong {
+  display: block;
+  margin: 5px 0 4px;
+  color: var(--bone);
+  font: 600 31px/1 var(--display);
+  letter-spacing: -.025em;
+}
+.decision-countdown small { color: var(--muted); letter-spacing: .03em; }
+.decision-countdown.countdown-active { border-color: var(--heat); }
+.decision-countdown.countdown-active span,
+.decision-countdown.countdown-active strong { color: var(--heat); }
+.decision-countdown.countdown-paused {
+  border-color: #e9a832;
+  background: rgba(233, 168, 50, .06);
+}
+.decision-countdown.countdown-paused span,
+.decision-countdown.countdown-paused strong { color: #e9a832; }
+.decision-countdown.countdown-ended,
+.decision-countdown.countdown-stopped,
+.decision-countdown.countdown-unavailable { opacity: .78; }
 .receipt-state {
   flex: none;
   padding: 8px 10px;
@@ -729,6 +771,8 @@ button:disabled { cursor: not-allowed; opacity: .38; }
   .view-heading h1 { font-size: 48px; }
   .run-index-list { grid-template-columns: 1fr; }
   .journal-run-header { flex-direction: column; }
+  .journal-run-signals { width: 100%; align-items: stretch; }
+  .decision-countdown { min-width: 0; text-align: left; }
   .journal-metrics { grid-template-columns: repeat(2, 1fr); }
   .journal-metrics div:nth-child(2) { border-right: 0; }
   .journal-metrics div:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
