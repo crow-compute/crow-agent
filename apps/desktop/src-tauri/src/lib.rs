@@ -302,13 +302,20 @@ struct DesktopState {
     command_nonce: Mutex<()>,
     companion_nonce: Mutex<u64>,
     companion_request_lock: AsyncMutex<()>,
+    companion_transition_lock: AsyncMutex<()>,
     companion_credentials: Mutex<Option<Arc<CompanionCredentials>>>,
     companion_credentials_unavailable: AtomicBool,
     companion_child: Mutex<Option<CommandChild>>,
-    companion_spawned: Arc<AtomicBool>,
+    companion_slot: Arc<Mutex<CompanionSlot>>,
     authorization_status: Mutex<Option<bool>>,
     device_tokens: AsyncMutex<Option<Arc<DeviceTokens>>>,
     device_tokens_unavailable: AtomicBool,
+}
+
+#[derive(Default)]
+struct CompanionSlot {
+    generation: u64,
+    spawned: bool,
 }
 
 struct CompanionCredentials {
@@ -323,10 +330,11 @@ impl DesktopState {
             command_nonce: Mutex::new(()),
             companion_nonce: Mutex::new(0),
             companion_request_lock: AsyncMutex::new(()),
+            companion_transition_lock: AsyncMutex::new(()),
             companion_credentials: Mutex::new(None),
             companion_credentials_unavailable: AtomicBool::new(false),
             companion_child: Mutex::new(None),
-            companion_spawned: Arc::new(AtomicBool::new(false)),
+            companion_slot: Arc::new(Mutex::new(CompanionSlot::default())),
             // Never touch the OS credential store during startup or background
             // polling. Direct-distribution alpha binaries are ad-hoc signed,
             // so macOS may require approval after an update. Credential access
@@ -422,36 +430,36 @@ impl DesktopState {
 
     fn launch_companion(&self, app: &tauri::AppHandle) -> Result<(), DesktopError> {
         let credentials = self.companion_credentials()?;
-        if !claim_companion_slot(&self.companion_spawned) {
+        let Some(generation) = claim_companion_slot(&self.companion_slot)? else {
             return Ok(());
-        }
+        };
         let Ok(command) = app.shell().sidecar("crow-agentd") else {
-            self.companion_spawned.store(false, Ordering::SeqCst);
+            release_companion_slot(&self.companion_slot, generation)?;
             return Err(DesktopError::Companion);
         };
         let Ok((mut events, mut child)) = command
             .args(["companion", "--ipc-name", &credentials.ipc_name])
             .spawn()
         else {
-            self.companion_spawned.store(false, Ordering::SeqCst);
+            release_companion_slot(&self.companion_slot, generation)?;
             return Err(DesktopError::Companion);
         };
         if child.write(credentials.secret.as_ref()).is_err() {
             let _ = child.kill();
-            self.companion_spawned.store(false, Ordering::SeqCst);
+            release_companion_slot(&self.companion_slot, generation)?;
             return Err(DesktopError::Companion);
         }
         let Ok(mut slot) = self.companion_child.lock() else {
             let _ = child.kill();
-            self.companion_spawned.store(false, Ordering::SeqCst);
+            release_companion_slot(&self.companion_slot, generation)?;
             return Err(DesktopError::Companion);
         };
         *slot = Some(child);
-        let spawned = Arc::clone(&self.companion_spawned);
+        let companion_slot = Arc::clone(&self.companion_slot);
         tauri::async_runtime::spawn(async move {
             while let Some(event) = events.recv().await {
                 if matches!(event, CommandEvent::Error(_) | CommandEvent::Terminated(_)) {
-                    spawned.store(false, Ordering::SeqCst);
+                    let _ = release_companion_slot(&companion_slot, generation);
                     break;
                 }
             }
@@ -471,7 +479,7 @@ impl DesktopState {
         // process. Status polling continues while this command awaits; leaving
         // the slot false here lets a poll spawn a second listener on the same
         // socket and hide the live run's authenticated status response.
-        reserve_companion_slot(&self.companion_spawned);
+        let generation = reserve_companion_slot(&self.companion_slot)?;
         if let Ok(mut slot) = self.companion_child.lock()
             && let Some(child) = slot.take()
         {
@@ -479,7 +487,7 @@ impl DesktopState {
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let Ok(command) = app.shell().sidecar("crow-agentd") else {
-            self.companion_spawned.store(false, Ordering::SeqCst);
+            release_companion_slot(&self.companion_slot, generation)?;
             return Err(DesktopError::Companion);
         };
         let Ok((mut events, mut child)) = command
@@ -491,25 +499,25 @@ impl DesktopState {
             ])
             .spawn()
         else {
-            self.companion_spawned.store(false, Ordering::SeqCst);
+            release_companion_slot(&self.companion_slot, generation)?;
             return Err(DesktopError::Companion);
         };
         if child.write(credential_frame.as_ref()).is_err() {
             let _ = child.kill();
-            self.companion_spawned.store(false, Ordering::SeqCst);
+            release_companion_slot(&self.companion_slot, generation)?;
             return Err(DesktopError::Companion);
         }
         let Ok(mut slot) = self.companion_child.lock() else {
             let _ = child.kill();
-            self.companion_spawned.store(false, Ordering::SeqCst);
+            release_companion_slot(&self.companion_slot, generation)?;
             return Err(DesktopError::Companion);
         };
         *slot = Some(child);
-        let spawned = Arc::clone(&self.companion_spawned);
+        let companion_slot = Arc::clone(&self.companion_slot);
         tauri::async_runtime::spawn(async move {
             while let Some(event) = events.recv().await {
                 if matches!(event, CommandEvent::Error(_) | CommandEvent::Terminated(_)) {
-                    spawned.store(false, Ordering::SeqCst);
+                    let _ = release_companion_slot(&companion_slot, generation);
                     break;
                 }
             }
@@ -518,12 +526,12 @@ impl DesktopState {
     }
 
     fn stop_owned_companion(&self) {
+        let _ = invalidate_companion_slot(&self.companion_slot);
         if let Ok(mut slot) = self.companion_child.lock()
             && let Some(child) = slot.take()
         {
             let _ = child.kill();
         }
-        self.companion_spawned.store(false, Ordering::SeqCst);
     }
 
     async fn companion_request(
@@ -1125,6 +1133,7 @@ async fn start_local_arena(
     execution_account: String,
     handoff_snapshot: Option<Value>,
 ) -> Result<AgentStatus, String> {
+    let _transition_guard = state.companion_transition_lock.lock().await;
     if state
         .companion_request(CompanionActionV1::Status)
         .await
@@ -1784,12 +1793,49 @@ fn next_companion_nonce(nonce: &Mutex<u64>) -> Result<u64, DesktopError> {
     Ok(*nonce)
 }
 
-fn claim_companion_slot(spawned: &AtomicBool) -> bool {
-    !spawned.swap(true, Ordering::SeqCst)
+fn claim_companion_slot(slot: &Mutex<CompanionSlot>) -> Result<Option<u64>, DesktopError> {
+    let mut slot = slot.lock().map_err(|_| DesktopError::Companion)?;
+    if slot.spawned {
+        return Ok(None);
+    }
+    slot.generation = slot
+        .generation
+        .checked_add(1)
+        .ok_or(DesktopError::Companion)?;
+    slot.spawned = true;
+    Ok(Some(slot.generation))
 }
 
-fn reserve_companion_slot(spawned: &AtomicBool) {
-    spawned.store(true, Ordering::SeqCst);
+fn reserve_companion_slot(slot: &Mutex<CompanionSlot>) -> Result<u64, DesktopError> {
+    let mut slot = slot.lock().map_err(|_| DesktopError::Companion)?;
+    slot.generation = slot
+        .generation
+        .checked_add(1)
+        .ok_or(DesktopError::Companion)?;
+    slot.spawned = true;
+    Ok(slot.generation)
+}
+
+fn release_companion_slot(
+    slot: &Mutex<CompanionSlot>,
+    generation: u64,
+) -> Result<bool, DesktopError> {
+    let mut slot = slot.lock().map_err(|_| DesktopError::Companion)?;
+    if slot.generation != generation {
+        return Ok(false);
+    }
+    slot.spawned = false;
+    Ok(true)
+}
+
+fn invalidate_companion_slot(slot: &Mutex<CompanionSlot>) -> Result<(), DesktopError> {
+    let mut slot = slot.lock().map_err(|_| DesktopError::Companion)?;
+    slot.generation = slot
+        .generation
+        .checked_add(1)
+        .ok_or(DesktopError::Companion)?;
+    slot.spawned = false;
+    Ok(())
 }
 
 fn next_persisted_nonce(account: &str) -> Result<u64, DesktopError> {
@@ -1969,11 +2015,26 @@ mod tests {
     }
 
     #[test]
-    fn desktop_run_transition_blocks_idle_companion_race() {
-        let spawned = AtomicBool::new(false);
-        reserve_companion_slot(&spawned);
-        assert!(!claim_companion_slot(&spawned));
-        assert!(spawned.load(Ordering::SeqCst));
+    fn desktop_run_transition_blocks_idle_companion_race() -> Result<(), DesktopError> {
+        let slot = Mutex::new(CompanionSlot::default());
+        reserve_companion_slot(&slot)?;
+        assert!(claim_companion_slot(&slot)?.is_none());
+        assert!(slot.lock().map_err(|_| DesktopError::Companion)?.spawned);
+        Ok(())
+    }
+
+    #[test]
+    fn retired_companion_cannot_release_new_generation() -> Result<(), DesktopError> {
+        let slot = Mutex::new(CompanionSlot::default());
+        let idle_generation =
+            claim_companion_slot(&slot).and_then(|value| value.ok_or(DesktopError::Companion))?;
+        let run_generation = reserve_companion_slot(&slot)?;
+
+        assert!(!release_companion_slot(&slot, idle_generation)?);
+        assert!(slot.lock().map_err(|_| DesktopError::Companion)?.spawned);
+        assert!(release_companion_slot(&slot, run_generation)?);
+        assert!(!slot.lock().map_err(|_| DesktopError::Companion)?.spawned);
+        Ok(())
     }
 
     #[test]

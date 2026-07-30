@@ -137,6 +137,27 @@ describe("Crow Agent shell", () => {
       selectedRunId: harnessMock.activeRun,
       events: [
         {
+          sequence: 3,
+          cycleId: null,
+          eventType: "portfolio_snapshot",
+          occurredAt: "2026-07-30T01:14:57Z",
+          receipted: true,
+          details: {
+            equity_micro_usdc: 1_001_473_289,
+            positions: {
+              BTC: {
+                symbol: "BTC",
+                quantity_e8: 100_000,
+                notional_micro_usdc: 118_000_000,
+                entry_price_micro_usdc: 117_500_000_000,
+                unrealized_pnl_micro_usdc: 500_000,
+                isolated: true,
+                leverage: 1,
+              },
+            },
+          },
+        },
+        {
           sequence: 4,
           cycleId: "00000000-0000-0000-0000-000000000009",
           eventType: "proposal",
@@ -145,6 +166,8 @@ describe("Crow Agent shell", () => {
           details: {
             action: "order",
             decision_summary: "BTC momentum and available collateral support a small policy-compliant entry.",
+            prompt: "DO_NOT_RENDER_PRIVATE_PROMPT",
+            receipt_hash: "DO_NOT_RENDER_PRIVATE_HASH",
             proposal: {
               symbol: "BTC",
               side: "buy",
@@ -180,17 +203,22 @@ describe("Crow Agent shell", () => {
 
     render(<App />);
     screen.getByRole("button", { name: /Trades/ }).click();
-    expect(await screen.findByRole("heading", { name: "TRADES" })).toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: /paused \/ 1 fills/i })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "FILL" })).toBeInTheDocument();
+    expect(await screen.findByLabelText("Paper run")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Portfolio, treasury, and profit and loss" })).toBeInTheDocument();
+    expect(screen.getByText("1,001.473289 USDC")).toBeInTheDocument();
+    expect(screen.getByText("Open positions")).toBeInTheDocument();
     expect(screen.getAllByText("BTC").length).toBeGreaterThan(0);
-    expect(screen.getByText("0.02")).toBeInTheDocument();
-    expect(screen.getByText("Why the model acted—or did not")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Decision cycle: order" })).toBeInTheDocument();
     expect(screen.getAllByText("BTC momentum and available collateral support a small policy-compliant entry.").length).toBeGreaterThan(0);
-    expect(screen.getByText("FILLED")).toBeInTheDocument();
-    expect(screen.getByText("CHAIN RECEIPTED")).toBeInTheDocument();
-    expect(screen.getByText("PAUSED — RESUME BEFORE START")).toBeInTheDocument();
+    expect(screen.getAllByText("FILLED").length).toBeGreaterThan(0);
+    expect(screen.getByRole("heading", { name: "Activity log" })).toBeInTheDocument();
+    expect(screen.getByText("BTC fill")).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Trade journal filter" })).not.toBeInTheDocument();
+    expect(screen.queryByText("CHAIN RECEIPTED")).not.toBeInTheDocument();
+    expect(screen.queryByText("Cycles")).not.toBeInTheDocument();
     expect(screen.queryByText(/raw prompt/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("DO_NOT_RENDER_PRIVATE_PROMPT")).not.toBeInTheDocument();
+    expect(screen.queryByText("DO_NOT_RENDER_PRIVATE_HASH")).not.toBeInTheDocument();
   });
 
   it("renders a useful paused zero-trade journal state", async () => {
@@ -219,8 +247,9 @@ describe("Crow Agent shell", () => {
 
     render(<App />);
     screen.getByRole("button", { name: /Trades/ }).click();
-    expect(await screen.findByRole("heading", { name: /paused \/ no fills yet/i })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "No events in this filter yet." })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Waiting for the first cycle" })).toBeInTheDocument();
+    expect(screen.getByText("Portfolio snapshot pending.")).toBeInTheDocument();
+    expect(screen.getByText("No decisions recorded yet.")).toBeInTheDocument();
   });
 
   it("shows a receipt-backed model HOLD and the explicit reason no trade was sent", async () => {
@@ -276,12 +305,12 @@ describe("Crow Agent shell", () => {
 
     render(<App />);
     screen.getByRole("button", { name: /Trades/ }).click();
-    expect(await screen.findByRole("heading", { name: "NO TRADE" })).toBeInTheDocument();
-    expect(screen.getByText("HOLD")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Decision cycle: hold" })).toBeInTheDocument();
+    expect(screen.getAllByText("HOLD").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Signals conflict across BTC, ETH, and SOL, so the expected edge does not justify an entry.").length).toBeGreaterThan(0);
-    expect(screen.getByText("WHY NO TRADE")).toBeInTheDocument();
+    expect(screen.getByText("Why no trade")).toBeInTheDocument();
     expect(screen.getByText("Model abstained; there was no order for local policy or the venue to execute.")).toBeInTheDocument();
-    expect(screen.getByText("DECISION CHAIN RECEIPTED")).toBeInTheDocument();
+    expect(screen.queryByText("DECISION CHAIN RECEIPTED")).not.toBeInTheDocument();
   });
 
   it("labels legacy null proposals honestly instead of inventing model reasoning", () => {
