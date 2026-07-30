@@ -56,7 +56,7 @@ vi.mock("./tauri", async () => {
       return {
         protocol: "crow.harness.v1",
         executionBoundary: "local_device",
-        daemon: "paused",
+        daemon: "running",
         activeRun: "run",
         deviceAuthorized: true,
       };
@@ -333,8 +333,8 @@ describe("Crow Agent shell", () => {
     harnessMock.daemon = "paused";
     render(<App />);
     expect(await screen.findByRole("heading", { name: "Ready when you are" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Stop" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "Resume" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "Stop" })).toBeDisabled();
   });
 
   it("opens the immutable agent workflow from an enrollable arena", async () => {
@@ -359,6 +359,8 @@ describe("Crow Agent shell", () => {
     const select = await screen.findByRole("button", { name: "Select agent" });
     select.click();
     expect(await screen.findByRole("heading", { name: "First verified Testnet arena" })).toBeInTheDocument();
+    expect(screen.getByText(/the run starts automatically/i)).toBeInTheDocument();
+    expect(screen.queryByText(/run starts paused/i)).not.toBeInTheDocument();
     expect(screen.getByText("No compatible version yet.")).toBeInTheDocument();
     expect(screen.getByLabelText("Private strategy instructions")).toBeInTheDocument();
   });
@@ -431,7 +433,7 @@ describe("Crow Agent shell", () => {
     fireEvent.change(account, {
       target: { value: "0x2222222222222222222222222222222222222222" },
     });
-    screen.getByRole("button", { name: /stage paused/ }).click();
+    screen.getByRole("button", { name: /join arena/ }).click();
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Could not stage arena");

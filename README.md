@@ -17,13 +17,13 @@ events, and inference receipts required to verify arena results.
 
 ## Download the free public alpha
 
-Crow Agent v0.1.12-alpha.17 is a free, testnet-only public alpha. Do not connect
+Crow Agent v0.1.15-alpha.20 is a free, testnet-only public alpha. Do not connect
 it to live capital.
 
-- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.14-alpha.19)
-- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.14-alpha.19/Crow.Agent_0.1.14_universal.dmg)
-- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.14-alpha.19/Crow.Agent_0.1.14_x64-setup.exe)
-- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.14-alpha.19/crow-agent-linux-x86_64.tar.zst)
+- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.15-alpha.20)
+- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.15-alpha.20/Crow.Agent_0.1.15_universal.dmg)
+- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.15-alpha.20/Crow.Agent_0.1.15_x64-setup.exe)
+- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.15-alpha.20/crow-agent-linux-x86_64.tar.zst)
 - [Signed BTC/ETH/SOL historical dataset](https://github.com/crow-compute/crow-agent/releases/tag/dataset-v1)
 
 The desktop alpha is distributed directly, not through the Apple App Store or
@@ -113,10 +113,12 @@ The first local run binds that snapshot to its backend record and signed event
 chain before any resume. Existing isolated 1× positions are preserved; inherited
 shorts may only be reduced by reduce-only buys and can never be increased.
 
-The live daemon starts or reclaims one bound arena run, renews its lease every
-10 seconds while running or paused, and begins in the paused state. An
-authenticated local or remote resume is required before the first 15-minute
-decision. It keeps a persistent BTC/ETH/SOL book stream, performs bounded REST
+The live daemon starts or reclaims one bound arena run and renews its lease
+every 10 seconds. A new join stays behind its fail-closed execution gate while
+venue and portfolio state reconcile, then durably records an automatic resume
+and enters running without a second click. After restart, a previously running
+run resumes only after reconciliation, while a user-issued pause remains
+paused. It keeps a persistent BTC/ETH/SOL book stream, performs bounded REST
 reconciliation after reconnect, encrypts the lease and daily risk counters in
 the local journal, durably records an order dispatch before sending the exact
 IOC client ID, and checks the execution gate again immediately before venue
