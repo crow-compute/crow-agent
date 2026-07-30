@@ -7,6 +7,7 @@ import {
   enrollArena,
   getAgentVersions,
   getAgentStatus,
+  getLocalRunJournal,
   getPublicArenas,
   getRemoteState,
   prepareHyperliquidWallet,
@@ -18,12 +19,15 @@ import {
   type AgentStatus,
   type DeviceAuthorization,
   type HyperliquidWalletSetup,
+  type LocalRunEvent,
+  type LocalRunJournal,
   type PublicArena,
   type RemoteState,
 } from "./tauri";
 
-type View = "overview" | "arenas" | "devices";
+type View = "overview" | "arenas" | "runs" | "devices";
 type ArenaSetupStep = "agent" | "venue";
+type JournalFilter = "all" | "trades" | "portfolio";
 
 const initial: AgentStatus = {
   protocol: "crow.harness.v1",
@@ -41,6 +45,17 @@ const safetyRules = [
   ["Drawdown", "10% stop"],
   ["Cadence", "15 minutes"],
 ];
+
+const tradeEventTypes = new Set([
+  "proposal",
+  "policy_outcome",
+  "order_submitted",
+  "venue_acknowledgement",
+  "fill",
+  "funding",
+]);
+
+const portfolioEventTypes = new Set(["portfolio_snapshot", "reconciliation", "handoff_snapshot"]);
 
 function shortId(value: string) {
   return `${value.slice(0, 7)}…${value.slice(-5)}`;
@@ -66,6 +81,55 @@ function arenaName(arena: PublicArena) {
 function arenaModels(arena: PublicArena) {
   const models = arena.manifest.eligible_models;
   return Array.isArray(models) ? models.filter((model): model is string => typeof model === "string") : [];
+}
+
+function eventName(value: string) {
+  return value.replaceAll("_", " ").toUpperCase();
+}
+
+function detailLabel(value: string) {
+  return value
+    .replaceAll("_", " ")
+    .replace(/\[(\d+)\]/g, " $1")
+    .toUpperCase();
+}
+
+function detailValue(key: string, value: unknown) {
+  if (typeof value === "boolean") return value ? "YES" : "NO";
+  if (typeof value !== "number") return value === null ? "—" : String(value);
+  if (key.endsWith("_micro_usdc")) {
+    return `${(value / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 6 })} USDC`;
+  }
+  if (key.endsWith("_bps")) return `${(value / 100).toLocaleString()}%`;
+  if (key.endsWith("_e8")) return (value / 100_000_000).toLocaleString(undefined, { maximumFractionDigits: 8 });
+  if (key.endsWith("_time_ms") || key === "time") {
+    const moment = new Date(value);
+    if (!Number.isNaN(moment.getTime())) return moment.toLocaleString();
+  }
+  return value.toLocaleString();
+}
+
+export function flattenJournalDetails(
+  value: unknown,
+  prefix = "",
+  depth = 0,
+): Array<[string, string]> {
+  if (depth > 4) return [];
+  if (value === null || typeof value !== "object") {
+    return prefix ? [[detailLabel(prefix), detailValue(prefix, value)]] : [];
+  }
+  const entries = Array.isArray(value)
+    ? value.map((item, index) => [`${prefix}[${index + 1}]`, item] as const)
+    : Object.entries(value).map(([key, item]) => [prefix ? `${prefix}.${key}` : key, item] as const);
+  return entries
+    .flatMap(([key, item]) => flattenJournalDetails(item, key, depth + 1))
+    .slice(0, 30);
+}
+
+function eventIsVisible(event: LocalRunEvent, filter: JournalFilter) {
+  if (filter === "trades") return tradeEventTypes.has(event.eventType);
+  if (filter === "portfolio") return portfolioEventTypes.has(event.eventType);
+  return true;
 }
 
 export function arenaAcceptsSetup(arena: PublicArena, now = Date.now()) {
@@ -150,6 +214,14 @@ export function App() {
   const [handoffSnapshot, setHandoffSnapshot] = useState("");
   const [walletSetup, setWalletSetup] = useState<HyperliquidWalletSetup | null>(null);
   const [arenaBusy, setArenaBusy] = useState(false);
+  const [journal, setJournal] = useState<LocalRunJournal>({
+    runs: [],
+    selectedRunId: null,
+    events: [],
+  });
+  const [journalFilter, setJournalFilter] = useState<JournalFilter>("all");
+  const [journalBusy, setJournalBusy] = useState(false);
+  const [journalNotice, setJournalNotice] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -184,6 +256,42 @@ export function App() {
       window.clearInterval(arenaInterval);
     };
   }, []);
+
+  useEffect(() => {
+    if (view !== "runs" || !status.deviceAuthorized) return;
+    let active = true;
+    const refreshJournal = async () => {
+      try {
+        const next = await getLocalRunJournal(journal.selectedRunId ?? status.activeRun);
+        if (!active) return;
+        setJournal(next);
+        setJournalNotice(null);
+      } catch {
+        if (active) setJournalNotice("The encrypted local run journal could not be read.");
+      } finally {
+        if (active) setJournalBusy(false);
+      }
+    };
+    setJournalBusy(true);
+    void refreshJournal();
+    const interval = window.setInterval(refreshJournal, 2_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [view, status.deviceAuthorized, status.activeRun, journal.selectedRunId]);
+
+  async function selectJournalRun(runId: string) {
+    setJournalBusy(true);
+    setJournalNotice(null);
+    try {
+      setJournal(await getLocalRunJournal(runId));
+    } catch {
+      setJournalNotice("The selected local run could not be read.");
+    } finally {
+      setJournalBusy(false);
+    }
+  }
 
   async function startAuthorization() {
     setAuthorizationBusy(true);
@@ -350,6 +458,10 @@ export function App() {
   );
   const localLive = Boolean(status.activeRun)
     && (status.daemon === "running" || status.daemon === "paused");
+  const selectedRun = journal.runs.find((run) => run.runId === journal.selectedRunId) ?? null;
+  const visibleJournalEvents = [...journal.events]
+    .filter((event) => eventIsVisible(event, journalFilter))
+    .reverse();
   const readiness = [
     { label: "Device", value: status.deviceAuthorized ? "Approved" : "Unlock required", ready: status.deviceAuthorized },
     { label: "Runtime", value: status.daemon, ready: status.daemon !== "stopped" && status.daemon !== "connecting" },
@@ -367,7 +479,8 @@ export function App() {
           {([
             ["overview", "01", "Command"],
             ["arenas", "02", "Paper arenas"],
-            ["devices", "03", "Devices"],
+            ["runs", "03", "Trades"],
+            ["devices", "04", "Devices"],
           ] as const).map(([target, index, label]) => (
             <button
               type="button"
@@ -396,8 +509,12 @@ export function App() {
       <section className="workspace">
         <header className="topbar">
           <div>
-            <span className="section-index">{view === "overview" ? "01" : view === "arenas" ? "02" : "03"}</span>
-            <span>{view === "overview" ? "COMMAND" : view === "arenas" ? "PAPER ARENAS" : "DEVICES"}</span>
+            <span className="section-index">
+              {view === "overview" ? "01" : view === "arenas" ? "02" : view === "runs" ? "03" : "04"}
+            </span>
+            <span>
+              {view === "overview" ? "COMMAND" : view === "arenas" ? "PAPER ARENAS" : view === "runs" ? "TRADES" : "DEVICES"}
+            </span>
           </div>
           <div className="runtime-chip">
             <i className={`state-dot state-${status.daemon}`} />
@@ -494,6 +611,9 @@ export function App() {
                       >
                         Stop
                       </button>
+                      <button type="button" disabled={!status.activeRun} onClick={() => setView("runs")}>
+                        View trades
+                      </button>
                     </>
                   )}
                 </div>
@@ -569,6 +689,154 @@ export function App() {
                 </article>
               )}
             </div>
+          </div>
+        ) : null}
+
+        {view === "runs" ? (
+          <div className="view">
+            <section className="view-heading journal-heading">
+              <div>
+                <p className="kicker"><span /> LOCAL STRUCTURED EVIDENCE</p>
+                <h1>TRADES</h1>
+              </div>
+              <p>Studio-style run detail from this machine’s encrypted journal: decisions, policy, orders, fills, fees, funding, and equity. Prompts, strategy text, credentials, signatures, and venue keys never reach this screen.</p>
+            </section>
+
+            {!status.deviceAuthorized ? (
+              <article className="authorize-card">
+                <span className="empty-glyph">◇</span>
+                <div>
+                  <p className="meta">JOURNAL LOCKED</p>
+                  <h2>Unlock this device to inspect trades</h2>
+                  <p>The journal key stays in the native credential vault. Reading trade evidence never sends private payloads into the WebView.</p>
+                </div>
+                <button className="primary-action" type="button" disabled={authorizationBusy} onClick={unlockCredentials}>
+                  <span>Unlock device</span><b>→</b>
+                </button>
+              </article>
+            ) : journal.runs.length ? (
+              <div className="journal-layout">
+                <aside className="run-index" aria-label="Local runs">
+                  <div className="journal-panel-title">
+                    <div><p className="meta">LOCAL RUNS</p><h2>Journal index</h2></div>
+                    <span>{journal.runs.length}</span>
+                  </div>
+                  <div className="run-index-list">
+                    {journal.runs.map((run) => (
+                      <button
+                        type="button"
+                        className={run.runId === journal.selectedRunId ? "run-index-item active" : "run-index-item"}
+                        aria-pressed={run.runId === journal.selectedRunId}
+                        onClick={() => void selectJournalRun(run.runId)}
+                        key={run.runId}
+                      >
+                        <span><i className={`state-dot state-${run.state}`} />{run.state}</span>
+                        <strong>{shortId(run.runId)}</strong>
+                        <small>{formatMoment(run.latestAt)} · {run.fillCount} fills</small>
+                      </button>
+                    ))}
+                  </div>
+                </aside>
+
+                <section className="journal-detail" aria-label="Selected run trade journal">
+                  {selectedRun ? (
+                    <>
+                      <header className="journal-run-header">
+                        <div>
+                          <p className="meta">RUN {shortId(selectedRun.runId)}</p>
+                          <h2>{selectedRun.state} / {selectedRun.fillCount ? `${selectedRun.fillCount} FILLS` : "NO FILLS YET"}</h2>
+                          <p>Arena {shortId(selectedRun.arenaId)} · started {formatMoment(selectedRun.startedAt)}</p>
+                        </div>
+                        <span className={selectedRun.allReceipted ? "receipt-state complete" : "receipt-state"}>
+                          {selectedRun.allReceipted ? "CHAIN RECEIPTED" : "RECEIPTS PENDING"}
+                        </span>
+                      </header>
+
+                      <dl className="journal-metrics">
+                        <div><dt>Cycles</dt><dd>{selectedRun.cycleCount}</dd></div>
+                        <div><dt>Orders</dt><dd>{selectedRun.orderCount}</dd></div>
+                        <div><dt>Fills</dt><dd>{selectedRun.fillCount}</dd></div>
+                        <div><dt>Events</dt><dd>{selectedRun.eventCount}</dd></div>
+                      </dl>
+
+                      <div className="journal-toolbar">
+                        <div role="group" aria-label="Trade journal filter">
+                          {(["all", "trades", "portfolio"] as const).map((filter) => (
+                            <button
+                              type="button"
+                              className={journalFilter === filter ? "active" : ""}
+                              aria-pressed={journalFilter === filter}
+                              onClick={() => setJournalFilter(filter)}
+                              key={filter}
+                            >
+                              {filter}
+                            </button>
+                          ))}
+                        </div>
+                        <span>{journalBusy ? "READING…" : `${visibleJournalEvents.length} SHOWN`}</span>
+                      </div>
+
+                      {journalNotice ? <div className="journal-error" role="alert">{journalNotice}</div> : null}
+
+                      <div className="event-timeline">
+                        {visibleJournalEvents.map((event) => {
+                          const details = flattenJournalDetails(event.details);
+                          const kind = tradeEventTypes.has(event.eventType)
+                            ? "trade"
+                            : portfolioEventTypes.has(event.eventType)
+                              ? "portfolio"
+                              : "lifecycle";
+                          return (
+                            <article className={`event-card event-${kind}`} key={`${event.sequence}:${event.eventType}`}>
+                              <div className="event-sequence">{String(event.sequence).padStart(3, "0")}</div>
+                              <div className="event-body">
+                                <header>
+                                  <div>
+                                    <span className="event-kind">{kind}</span>
+                                    <h3>{eventName(event.eventType)}</h3>
+                                  </div>
+                                  <div className="event-status">
+                                    <span className={event.receipted ? "receipted" : ""}>
+                                      {event.receipted ? "RECEIPTED" : "PENDING"}
+                                    </span>
+                                    <time>{formatMoment(event.occurredAt)}</time>
+                                  </div>
+                                </header>
+                                {event.cycleId ? <p className="cycle-label">CYCLE {shortId(event.cycleId)}</p> : null}
+                                {details.length ? (
+                                  <dl className="event-details">
+                                    {details.map(([label, value], index) => (
+                                      <div key={`${label}:${index}`}><dt>{label}</dt><dd>{value}</dd></div>
+                                    ))}
+                                  </dl>
+                                ) : (
+                                  <p className="event-empty">No private or display-safe fields are exposed for this event.</p>
+                                )}
+                              </div>
+                            </article>
+                          );
+                        })}
+                        {!visibleJournalEvents.length ? (
+                          <article className="empty-state compact">
+                            <span className="empty-glyph">00</span>
+                            <div><p className="meta">NO MATCHES</p><h2>No events in this filter yet.</h2><p>The journal will update automatically while the local runner is active.</p></div>
+                          </article>
+                        ) : null}
+                      </div>
+                    </>
+                  ) : null}
+                </section>
+              </div>
+            ) : (
+              <article className="empty-state">
+                <span className="empty-glyph">00</span>
+                <div>
+                  <p className="meta">JOURNAL CLEAR</p>
+                  <h2>No local run evidence yet.</h2>
+                  <p>Stage a paper arena and its paused reconciliation, proposals, policy decisions, orders, fills, funding, and portfolio snapshots will appear here automatically.</p>
+                </div>
+              </article>
+            )}
           </div>
         ) : null}
 

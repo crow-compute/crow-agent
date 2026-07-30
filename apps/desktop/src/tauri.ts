@@ -76,6 +76,34 @@ export type HyperliquidWalletSetup = {
   approvalUrl: string;
 };
 
+export type LocalRunSummary = {
+  runId: string;
+  arenaId: string;
+  state: "running" | "paused" | "stopped";
+  startedAt: string;
+  latestAt: string;
+  eventCount: number;
+  cycleCount: number;
+  orderCount: number;
+  fillCount: number;
+  allReceipted: boolean;
+};
+
+export type LocalRunEvent = {
+  sequence: number;
+  cycleId: string | null;
+  eventType: string;
+  occurredAt: string;
+  receipted: boolean;
+  details: unknown;
+};
+
+export type LocalRunJournal = {
+  runs: LocalRunSummary[];
+  selectedRunId: string | null;
+  events: LocalRunEvent[];
+};
+
 const fallbackStatus: AgentStatus = {
   protocol: "crow.harness.v1",
   executionBoundary: "local_device",
@@ -87,6 +115,15 @@ const fallbackStatus: AgentStatus = {
 export async function getAgentStatus(): Promise<AgentStatus> {
   if (!("__TAURI_INTERNALS__" in window)) return fallbackStatus;
   return invoke<AgentStatus>("get_agent_status");
+}
+
+export async function getLocalRunJournal(
+  runId: string | null = null,
+): Promise<LocalRunJournal> {
+  if (!("__TAURI_INTERNALS__" in window)) {
+    return { runs: [], selectedRunId: null, events: [] };
+  }
+  return invoke<LocalRunJournal>("get_local_run_journal", { runId });
 }
 
 export async function sendLocalCommand(

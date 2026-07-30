@@ -14,7 +14,7 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 base64.workspace = true
 chacha20poly1305.workspace = true
-crow-agent-protocol = { version = "=0.1.12", path = "../crow-agent-protocol" }
+crow-agent-protocol = { version = "=0.1.13", path = "../crow-agent-protocol" }
 ed25519-dalek.workspace = true
 futures-util.workspace = true
 hex.workspace = true
