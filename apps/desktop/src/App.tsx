@@ -27,7 +27,6 @@ import {
 
 type View = "overview" | "arenas" | "runs" | "devices";
 type ArenaSetupStep = "agent" | "venue";
-type JournalFilter = "all" | "trades" | "portfolio";
 
 const initial: AgentStatus = {
   protocol: "crow.harness.v1",
@@ -46,16 +45,16 @@ const safetyRules = [
   ["Cadence", "15 minutes"],
 ];
 
-const tradeEventTypes = new Set([
+const studioActivityEventTypes = new Set([
   "proposal",
   "policy_outcome",
   "order_submitted",
   "venue_acknowledgement",
   "fill",
   "funding",
+  "cycle_failed",
+  "cycle_missed",
 ]);
-
-const portfolioEventTypes = new Set(["portfolio_snapshot", "reconciliation", "handoff_snapshot"]);
 
 function shortId(value: string) {
   return `${value.slice(0, 7)}…${value.slice(-5)}`;
@@ -124,12 +123,6 @@ export function flattenJournalDetails(
   return entries
     .flatMap(([key, item]) => flattenJournalDetails(item, key, depth + 1))
     .slice(0, 30);
-}
-
-function eventIsVisible(event: LocalRunEvent, filter: JournalFilter) {
-  if (filter === "trades") return tradeEventTypes.has(event.eventType);
-  if (filter === "portfolio") return portfolioEventTypes.has(event.eventType);
-  return true;
 }
 
 function journalObject(value: unknown): Record<string, unknown> | null {
@@ -236,6 +229,113 @@ export function journalDecisions(events: LocalRunEvent[]): JournalDecision[] {
       } satisfies JournalDecision;
     })
     .reverse();
+}
+
+type StudioPosition = {
+  symbol: string;
+  quantityE8: number;
+  notionalMicroUsdc: number;
+  entryPriceMicroUsdc: number | null;
+  unrealizedPnlMicroUsdc: number;
+  leverage: number;
+};
+
+type StudioPortfolio = {
+  equityMicroUsdc: number | null;
+  positions: StudioPosition[];
+};
+
+function integerField(record: Record<string, unknown> | null, key: string) {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
+}
+
+function formatMicroUsdc(value: number | null, signed = false) {
+  if (value === null) return "—";
+  const amount = value / 1_000_000;
+  const prefix = signed && amount > 0 ? "+" : "";
+  return `${prefix}${amount.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 6,
+  })} USDC`;
+}
+
+function formatFixed(value: number | null, scale: number, maximumFractionDigits = 8) {
+  if (value === null) return "—";
+  return (value / scale).toLocaleString(undefined, { maximumFractionDigits });
+}
+
+function latestStudioPortfolio(events: LocalRunEvent[]): StudioPortfolio {
+  const snapshot = [...events]
+    .reverse()
+    .find((event) => event.eventType === "portfolio_snapshot");
+  const details = journalObject(snapshot?.details);
+  const rawPositions = journalObject(details?.positions);
+  const positions = Object.entries(rawPositions ?? {}).flatMap(([symbol, value]) => {
+    const position = journalObject(value);
+    const quantityE8 = integerField(position, "quantity_e8");
+    const notionalMicroUsdc = integerField(position, "notional_micro_usdc");
+    const unrealizedPnlMicroUsdc = integerField(position, "unrealized_pnl_micro_usdc");
+    if (quantityE8 === null || notionalMicroUsdc === null || unrealizedPnlMicroUsdc === null) return [];
+    return [{
+      symbol: typeof position?.symbol === "string" ? position.symbol : symbol,
+      quantityE8,
+      notionalMicroUsdc,
+      entryPriceMicroUsdc: integerField(position, "entry_price_micro_usdc"),
+      unrealizedPnlMicroUsdc,
+      leverage: integerField(position, "leverage") ?? 1,
+    }];
+  });
+  return {
+    equityMicroUsdc: integerField(details, "equity_micro_usdc"),
+    positions,
+  };
+}
+
+function activityAction(event: LocalRunEvent) {
+  if (event.eventType === "proposal") {
+    const details = journalObject(event.details);
+    return details?.action === "order" || details?.proposal ? "ORDER" : "HOLD";
+  }
+  if (event.eventType === "policy_outcome") {
+    return journalObject(event.details)?.allowed === false ? "BLOCKED" : "POLICY";
+  }
+  if (event.eventType === "fill") return "FILL";
+  if (event.eventType === "funding") return "FUNDING";
+  if (event.eventType === "cycle_failed") return "FAILED";
+  if (event.eventType === "cycle_missed") return "MISSED";
+  return eventName(event.eventType);
+}
+
+function activityTitle(event: LocalRunEvent, decisions: JournalDecision[]) {
+  if (event.eventType === "proposal") {
+    const decision = decisions.find((candidate) => candidate.sequence === event.sequence);
+    return decision ? `Decision cycle: ${decision.action}` : "Decision cycle";
+  }
+  if (event.eventType === "policy_outcome") {
+    const details = journalObject(event.details);
+    const reason = typeof details?.reason === "string" ? details.reason.replaceAll("_", " ") : "";
+    return details?.allowed === false
+      ? `Policy rejected${reason ? `: ${reason}` : ""}`
+      : reason === "model abstained"
+        ? "Policy recorded model abstention"
+        : "Policy approved";
+  }
+  if (event.eventType === "fill") {
+    const fills = journalObject(event.details)?.fills;
+    const first = Array.isArray(fills) ? journalObject(fills[0]) : null;
+    return typeof first?.coin === "string" ? `${first.coin} fill` : "Venue fill";
+  }
+  if (event.eventType === "cycle_failed") return "Decision cycle failed safely";
+  if (event.eventType === "cycle_missed") return "Scheduled decision was missed";
+  return eventName(event.eventType);
+}
+
+function safeActivityDetails(event: LocalRunEvent) {
+  const blocked = /(PROMPT|TRANSCRIPT|STRATEGY|CREDENTIAL|SIGNATURE|HASH|PRIVATE|SECRET|TOKEN|KEY)/;
+  return flattenJournalDetails(event.details)
+    .filter(([label]) => !blocked.test(label))
+    .slice(0, 16);
 }
 
 export function arenaAcceptsSetup(arena: PublicArena, now = Date.now()) {
@@ -421,7 +521,6 @@ export function App() {
     selectedRunId: null,
     events: [],
   });
-  const [journalFilter, setJournalFilter] = useState<JournalFilter>("all");
   const [journalBusy, setJournalBusy] = useState(false);
   const [journalNotice, setJournalNotice] = useState<string | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
@@ -672,10 +771,27 @@ export function App() {
     () => selectedRun ? nextDecisionCountdown(selectedRun, clockNow) : null,
     [selectedRun, clockNow],
   );
-  const visibleJournalEvents = [...journal.events]
-    .filter((event) => eventIsVisible(event, journalFilter))
-    .reverse();
   const decisionJournal = useMemo(() => journalDecisions(journal.events), [journal.events]);
+  const latestDecision = decisionJournal[0] ?? null;
+  const studioPortfolio = useMemo(() => latestStudioPortfolio(journal.events), [journal.events]);
+  const studioActivity = useMemo(
+    () => [...journal.events]
+      .filter((event) => studioActivityEventTypes.has(event.eventType))
+      .reverse(),
+    [journal.events],
+  );
+  const studioGrossExposure = studioPortfolio.positions.reduce(
+    (total, position) => total + Math.abs(position.notionalMicroUsdc),
+    0,
+  );
+  const studioMarginUsed = studioPortfolio.positions.reduce(
+    (total, position) => total + Math.round(Math.abs(position.notionalMicroUsdc) / Math.max(1, position.leverage)),
+    0,
+  );
+  const studioUnrealizedPnl = studioPortfolio.positions.reduce(
+    (total, position) => total + position.unrealizedPnlMicroUsdc,
+    0,
+  );
   const readiness = [
     { label: "Device", value: status.deviceAuthorized ? "Approved" : "Unlock required", ready: status.deviceAuthorized },
     { label: "Runtime", value: status.daemon, ready: status.daemon !== "stopped" && status.daemon !== "connecting" },
@@ -907,15 +1023,7 @@ export function App() {
         ) : null}
 
         {view === "runs" ? (
-          <div className="view">
-            <section className="view-heading journal-heading">
-              <div>
-                <p className="kicker"><span /> LOCAL STRUCTURED EVIDENCE</p>
-                <h1>TRADES</h1>
-              </div>
-              <p>Studio-style run detail from this machine’s encrypted journal: decisions, policy, orders, fills, fees, funding, and equity. Prompts, strategy text, credentials, signatures, and venue keys never reach this screen.</p>
-            </section>
-
+          <div className="view studio-trades-view">
             {!status.deviceAuthorized ? (
               <article className="authorize-card">
                 <span className="empty-glyph">◇</span>
@@ -929,178 +1037,219 @@ export function App() {
                 </button>
               </article>
             ) : journal.runs.length ? (
-              <div className="journal-layout">
-                <aside className="run-index" aria-label="Local runs">
-                  <div className="journal-panel-title">
-                    <div><p className="meta">LOCAL RUNS</p><h2>Journal index</h2></div>
-                    <span>{journal.runs.length}</span>
-                  </div>
-                  <div className="run-index-list">
-                    {journal.runs.map((run) => (
-                      <button
-                        type="button"
-                        className={run.runId === journal.selectedRunId ? "run-index-item active" : "run-index-item"}
-                        aria-pressed={run.runId === journal.selectedRunId}
-                        onClick={() => void selectJournalRun(run.runId)}
-                        key={run.runId}
+              selectedRun ? (
+                <div className="studio-monitor">
+                  <section className="studio-run-strip" aria-label="Selected paper run">
+                    <label>
+                      <span>Paper run</span>
+                      <select
+                        aria-label="Paper run"
+                        value={selectedRun.runId}
+                        disabled={journalBusy}
+                        onChange={(event) => void selectJournalRun(event.target.value)}
                       >
-                        <span><i className={`state-dot state-${run.state}`} />{run.state}</span>
-                        <strong>{shortId(run.runId)}</strong>
-                        <small>{formatMoment(run.latestAt)} · {run.fillCount} fills</small>
-                      </button>
-                    ))}
-                  </div>
-                </aside>
+                        {journal.runs.map((run) => (
+                          <option value={run.runId} key={run.runId}>
+                            {shortId(run.runId)} · {run.state}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="studio-run-identity">
+                      <span><i className={`state-dot state-${selectedRun.state}`} />{selectedRun.state}</span>
+                      <strong>Hyperliquid Testnet</strong>
+                      <small>BTC · ETH · SOL · 15-minute cycle</small>
+                    </div>
+                    {decisionCountdown ? (
+                      <div
+                        className={`studio-next-decision countdown-${decisionCountdown.tone}`}
+                        role="timer"
+                        aria-label={`${decisionCountdown.label}: ${decisionCountdown.value}`}
+                      >
+                        <span>{decisionCountdown.label}</span>
+                        <strong>{decisionCountdown.value}</strong>
+                        <small>{decisionCountdown.detail}</small>
+                      </div>
+                    ) : null}
+                  </section>
 
-                <section className="journal-detail" aria-label="Selected run trade journal">
-                  {selectedRun ? (
-                    <>
-                      <header className="journal-run-header">
-                        <div>
-                          <p className="meta">RUN {shortId(selectedRun.runId)}</p>
-                          <h2>{selectedRun.state} / {selectedRun.fillCount ? `${selectedRun.fillCount} FILLS` : "NO FILLS YET"}</h2>
-                          <p>Arena {shortId(selectedRun.arenaId)} · started {formatMoment(selectedRun.startedAt)}</p>
+                  {journalNotice ? <div className="journal-error" role="alert">{journalNotice}</div> : null}
+
+                  <section className="studio-finance-grid" aria-label="Portfolio, treasury, and profit and loss">
+                    <article className="studio-panel studio-finance-card studio-finance-primary">
+                      <div className="studio-portfolio-summary">
+                        <div className="studio-portfolio-balance">
+                          <span className="studio-label">Portfolio</span>
+                          <strong>{formatMicroUsdc(studioPortfolio.equityMicroUsdc)}</strong>
+                          <small>{studioPortfolio.equityMicroUsdc === null
+                            ? `${selectedRun.state} · snapshot pending`
+                            : `${selectedRun.state} · ${studioPortfolio.positions.length} open position${studioPortfolio.positions.length === 1 ? "" : "s"}`}</small>
+                          <dl>
+                            <div><dt>Gross exposure</dt><dd>{formatMicroUsdc(studioPortfolio.equityMicroUsdc === null ? null : studioGrossExposure)}</dd></div>
+                            <div><dt>Return</dt><dd>—</dd></div>
+                            <div><dt>Drawdown</dt><dd>—</dd></div>
+                            <div><dt>Orders / fills</dt><dd>{selectedRun.orderCount} / {selectedRun.fillCount}</dd></div>
+                          </dl>
                         </div>
-                        <div className="journal-run-signals">
-                          {decisionCountdown ? (
-                            <div
-                              className={`decision-countdown countdown-${decisionCountdown.tone}`}
-                              role="timer"
-                              aria-label={`${decisionCountdown.label}: ${decisionCountdown.value}`}
-                            >
-                              <span>{decisionCountdown.label}</span>
-                              <strong>{decisionCountdown.value}</strong>
-                              <small>{decisionCountdown.detail}</small>
+                        <div className="studio-portfolio-positions">
+                          <div className="studio-position-heading">
+                            <strong>Open positions</strong>
+                            <span>{studioPortfolio.positions.length} markets</span>
+                          </div>
+                          {studioPortfolio.positions.length ? studioPortfolio.positions.map((position) => (
+                            <article className="studio-position-row" key={position.symbol}>
+                              <div>
+                                <strong>{position.symbol}</strong>
+                                <small>{position.quantityE8 < 0 ? "Short" : "Long"} · {position.leverage}× isolated</small>
+                              </div>
+                              <dl>
+                                <div>
+                                  <dt>Size / USD</dt>
+                                  <dd>
+                                    <span>{formatFixed(position.quantityE8, 100_000_000)} {position.symbol}</span>
+                                    <small>{formatMicroUsdc(Math.abs(position.notionalMicroUsdc))} notional</small>
+                                  </dd>
+                                </div>
+                                <div><dt>Avg entry</dt><dd>{formatMicroUsdc(position.entryPriceMicroUsdc)}</dd></div>
+                                <div>
+                                  <dt>Unrealized P&amp;L</dt>
+                                  <dd className={position.unrealizedPnlMicroUsdc >= 0 ? "positive" : "negative"}>
+                                    {formatMicroUsdc(position.unrealizedPnlMicroUsdc, true)}
+                                  </dd>
+                                </div>
+                                <div><dt>Liquidation price</dt><dd>—</dd></div>
+                              </dl>
+                            </article>
+                          )) : (
+                            <div className="studio-position-empty">
+                              {studioPortfolio.equityMicroUsdc === null ? "Portfolio snapshot pending." : "No open positions."}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </article>
+
+                    <article className="studio-panel studio-finance-card">
+                      <span className="studio-label">Treasury</span>
+                      <strong>—</strong>
+                      <small>Available collateral</small>
+                      <div className="studio-margin-bar">
+                        <i style={{
+                          width: studioPortfolio.equityMicroUsdc && studioPortfolio.equityMicroUsdc > 0
+                            ? `${Math.min(100, (studioMarginUsed / studioPortfolio.equityMicroUsdc) * 100)}%`
+                            : "0%",
+                        }} />
+                      </div>
+                      <dl>
+                        <div><dt>Margin used</dt><dd>{formatMicroUsdc(studioPortfolio.equityMicroUsdc === null ? null : studioMarginUsed)}</dd></div>
+                        <div><dt>Reserve floor</dt><dd>10%</dd></div>
+                        <div>
+                          <dt>Utilization</dt>
+                          <dd>{studioPortfolio.equityMicroUsdc && studioPortfolio.equityMicroUsdc > 0
+                            ? `${((studioMarginUsed / studioPortfolio.equityMicroUsdc) * 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`
+                            : "—"}</dd>
+                        </div>
+                      </dl>
+                    </article>
+
+                    <article className="studio-panel studio-finance-card">
+                      <span className="studio-label">P&amp;L</span>
+                      <strong className={studioPortfolio.equityMicroUsdc === null ? "" : studioUnrealizedPnl >= 0 ? "positive" : "negative"}>
+                        {formatMicroUsdc(studioPortfolio.equityMicroUsdc === null ? null : studioUnrealizedPnl, true)}
+                      </strong>
+                      <small>Open-position P&amp;L</small>
+                      <dl>
+                        <div><dt>Unrealized</dt><dd>{formatMicroUsdc(studioPortfolio.equityMicroUsdc === null ? null : studioUnrealizedPnl, true)}</dd></div>
+                        <div><dt>Realized</dt><dd>—</dd></div>
+                        <div><dt>Funding / fees</dt><dd>—</dd></div>
+                      </dl>
+                    </article>
+                  </section>
+
+                  <section className="studio-panel studio-latest-decision" aria-label="Latest decision">
+                    {latestDecision ? (
+                      <>
+                        <div className="studio-decision-main">
+                          <div className="studio-decision-heading">
+                            <span className="studio-label">Latest decision</span>
+                            <span className={`studio-action action-${latestDecision.action}`}>{latestDecision.status}</span>
+                          </div>
+                          <h2>Decision cycle: {latestDecision.action}</h2>
+                          <p>{latestDecision.summary}</p>
+                          {latestDecision.noTradeReason ? (
+                            <div className="studio-decision-reason">
+                              <span>Why no trade</span>
+                              <strong>{latestDecision.noTradeReason}</strong>
                             </div>
                           ) : null}
-                          <span className={selectedRun.allReceipted ? "receipt-state complete" : "receipt-state"}>
-                            {selectedRun.allReceipted ? "CHAIN RECEIPTED" : "RECEIPTS PENDING"}
-                          </span>
                         </div>
-                      </header>
-
-                      <dl className="journal-metrics">
-                        <div><dt>Cycles</dt><dd>{selectedRun.cycleCount}</dd></div>
-                        <div><dt>Orders</dt><dd>{selectedRun.orderCount}</dd></div>
-                        <div><dt>Fills</dt><dd>{selectedRun.fillCount}</dd></div>
-                        <div><dt>Events</dt><dd>{selectedRun.eventCount}</dd></div>
-                      </dl>
-
-                      <section className="decision-ledger" aria-label="AI decision journal">
-                        <header>
-                          <div><p className="meta">AI DECISIONS</p><h3>Why the model acted—or did not</h3></div>
-                          <span>{decisionJournal.length} CYCLES</span>
-                        </header>
-                        {decisionJournal.length ? (
-                          <div className="decision-list">
-                            {decisionJournal.map((decision) => {
-                              const proposalDetails = flattenJournalDetails(decision.proposal);
-                              return (
-                                <article className={`decision-card decision-${decision.action}`} key={`${decision.sequence}:${decision.cycleId}`}>
-                                  <div className="decision-card-topline">
-                                    <p>{decision.cycleId ? `CYCLE ${shortId(decision.cycleId)}` : `EVENT ${decision.sequence}`}</p>
-                                    <span>{decision.status}</span>
-                                  </div>
-                                  <h4>{decision.action === "hold" ? "NO TRADE" : "ORDER DECISION"}</h4>
-                                  <blockquote>{decision.summary}</blockquote>
-                                  {decision.noTradeReason ? (
-                                    <div className="no-trade-reason">
-                                      <span>WHY NO TRADE</span>
-                                      <strong>{decision.noTradeReason}</strong>
-                                    </div>
-                                  ) : null}
-                                  {proposalDetails.length ? (
-                                    <dl className="decision-proposal">
-                                      {proposalDetails.map(([label, value], index) => (
-                                        <div key={`${label}:${index}`}><dt>{label}</dt><dd>{value}</dd></div>
-                                      ))}
-                                    </dl>
-                                  ) : null}
-                                  <small>{decision.receipted ? "DECISION CHAIN RECEIPTED" : "DECISION RECEIPT PENDING"}</small>
-                                </article>
-                              );
-                            })}
-                          </div>
-                        ) : (
-                          <p className="decision-empty">No model decision has completed yet. Lifecycle and reconciliation events remain visible below.</p>
-                        )}
-                      </section>
-
-                      <div className="journal-toolbar">
-                        <div role="group" aria-label="Trade journal filter">
-                          {(["all", "trades", "portfolio"] as const).map((filter) => (
-                            <button
-                              type="button"
-                              className={journalFilter === filter ? "active" : ""}
-                              aria-pressed={journalFilter === filter}
-                              onClick={() => setJournalFilter(filter)}
-                              key={filter}
-                            >
-                              {filter}
-                            </button>
-                          ))}
-                        </div>
-                        <span>{journalBusy ? "READING…" : `${visibleJournalEvents.length} SHOWN`}</span>
+                        <dl className="studio-decision-stats">
+                          <div><dt>Action</dt><dd>{latestDecision.action}</dd></div>
+                          <div><dt>Result</dt><dd>{latestDecision.status}</dd></div>
+                          <div><dt>Cycle</dt><dd>{latestDecision.cycleId ? shortId(latestDecision.cycleId) : "—"}</dd></div>
+                          <div><dt>Next cycle</dt><dd>{decisionCountdown?.boundaryAt ? formatMoment(decisionCountdown.boundaryAt) : "—"}</dd></div>
+                        </dl>
+                      </>
+                    ) : (
+                      <div className="studio-decision-main">
+                        <span className="studio-label">Latest decision</span>
+                        <h2>Waiting for the first cycle</h2>
                       </div>
+                    )}
+                  </section>
 
-                      {journalNotice ? <div className="journal-error" role="alert">{journalNotice}</div> : null}
-
-                      <div className="event-timeline">
-                        {visibleJournalEvents.map((event) => {
-                          const details = flattenJournalDetails(event.details);
-                          const kind = tradeEventTypes.has(event.eventType)
-                            ? "trade"
-                            : portfolioEventTypes.has(event.eventType)
-                              ? "portfolio"
-                              : "lifecycle";
-                          return (
-                            <article className={`event-card event-${kind}`} key={`${event.sequence}:${event.eventType}`}>
-                              <div className="event-sequence">{String(event.sequence).padStart(3, "0")}</div>
-                              <div className="event-body">
-                                <header>
-                                  <div>
-                                    <span className="event-kind">{kind}</span>
-                                    <h3>{eventName(event.eventType)}</h3>
-                                  </div>
-                                  <div className="event-status">
-                                    <span className={event.receipted ? "receipted" : ""}>
-                                      {event.receipted ? "RECEIPTED" : "PENDING"}
-                                    </span>
-                                    <time>{formatMoment(event.occurredAt)}</time>
-                                  </div>
-                                </header>
-                                {event.cycleId ? <p className="cycle-label">CYCLE {shortId(event.cycleId)}</p> : null}
-                                {details.length ? (
-                                  <dl className="event-details">
-                                    {details.map(([label, value], index) => (
-                                      <div key={`${label}:${index}`}><dt>{label}</dt><dd>{value}</dd></div>
-                                    ))}
-                                  </dl>
-                                ) : (
-                                  <p className="event-empty">No private or display-safe fields are exposed for this event.</p>
-                                )}
-                              </div>
-                            </article>
-                          );
-                        })}
-                        {!visibleJournalEvents.length ? (
-                          <article className="empty-state compact">
-                            <span className="empty-glyph">00</span>
-                            <div><p className="meta">NO MATCHES</p><h2>No events in this filter yet.</h2><p>The journal will update automatically while the local runner is active.</p></div>
-                          </article>
-                        ) : null}
+                  <section className="studio-panel studio-activity" aria-label="Activity log">
+                    <header>
+                      <div>
+                        <span className="studio-label">Decisions · orders · fills · policy</span>
+                        <h2>Activity log</h2>
                       </div>
-                    </>
-                  ) : null}
-                </section>
-              </div>
+                      <span>{journalBusy ? "Updating…" : "Live"}</span>
+                    </header>
+                    <div className="studio-activity-list">
+                      {studioActivity.length ? studioActivity.map((event) => {
+                        const details = safeActivityDetails(event);
+                        const action = activityAction(event);
+                        return (
+                          <details className="studio-activity-entry" key={`${event.sequence}:${event.eventType}`}>
+                            <summary>
+                              <time>{formatMoment(event.occurredAt)}</time>
+                              <span className={`studio-action action-${action.toLowerCase()}`}>{action}</span>
+                              <strong>{activityTitle(event, decisionJournal)}</strong>
+                              <span className="studio-activity-toggle">Details</span>
+                            </summary>
+                            <div className="studio-activity-body">
+                              {details.length ? (
+                                <dl>
+                                  {details.map(([label, value], index) => (
+                                    <div key={`${label}:${index}`}><dt>{label}</dt><dd>{value}</dd></div>
+                                  ))}
+                                </dl>
+                              ) : (
+                                <p>No additional display-safe details were recorded.</p>
+                              )}
+                            </div>
+                          </details>
+                        );
+                      }) : (
+                        <div className="studio-activity-empty">No decisions recorded yet.</div>
+                      )}
+                    </div>
+                  </section>
+                </div>
+              ) : (
+                <article className="empty-state">
+                  <span className="empty-glyph">00</span>
+                  <div><p className="meta">RUN UNAVAILABLE</p><h2>Select a local paper run.</h2></div>
+                </article>
+              )
             ) : (
               <article className="empty-state">
                 <span className="empty-glyph">00</span>
                 <div>
-                  <p className="meta">JOURNAL CLEAR</p>
-                  <h2>No local run evidence yet.</h2>
-                  <p>Join a paper arena and its reconciliation, proposals, policy decisions, orders, fills, funding, and portfolio snapshots will appear here automatically.</p>
+                  <p className="meta">NO PAPER RUN</p>
+                  <h2>No local run yet.</h2>
+                  <p>Join a paper arena to start monitoring decisions and trades.</p>
                 </div>
               </article>
             )}
