@@ -13,6 +13,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MAX_TOOL_ROUNDS: u8 = 4;
+pub const MAX_DECISION_SUMMARY_CHARS: usize = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +52,9 @@ pub struct ModelTurnRequest {
 pub struct ModelTurn {
     pub tool_calls: Vec<ToolCall>,
     pub proposal: Option<Proposal>,
+    /// Concise user-facing explanation derived from observable cycle facts.
+    /// This is receipt-bound structured output, never raw chain-of-thought.
+    pub decision_summary: String,
 }
 
 #[derive(Debug, Clone)]
@@ -73,12 +77,34 @@ pub enum RuntimeError {
     AmbiguousTurn,
     #[error("model completed without an order proposal")]
     MissingProposal,
+    #[error("model returned an invalid decision summary")]
+    DecisionSummary,
     #[error("inference receipt does not bind the model turn")]
     ReceiptBinding,
     #[error("canonical serialization failed")]
     Protocol(#[from] ProtocolError),
     #[error("proposal violated local policy")]
     Policy(#[from] PolicyError),
+}
+
+impl RuntimeError {
+    /// Stable display-safe classification. It never includes model output,
+    /// prompt text, strategy instructions, credentials, or upstream details.
+    #[must_use]
+    pub const fn failure_class(&self) -> &'static str {
+        match self {
+            Self::Inference => "inference_failed",
+            Self::Tool => "tool_failed",
+            Self::ToolUnavailable => "tool_unavailable",
+            Self::ToolRoundLimit => "tool_round_limit",
+            Self::AmbiguousTurn => "ambiguous_model_turn",
+            Self::MissingProposal => "missing_proposal",
+            Self::DecisionSummary => "invalid_decision_summary",
+            Self::ReceiptBinding => "receipt_binding_failed",
+            Self::Protocol(_) => "protocol_validation_failed",
+            Self::Policy(_) => "policy_rejected",
+        }
+    }
 }
 
 #[async_trait]
@@ -112,6 +138,7 @@ pub struct CycleOutcome {
     /// permits venue execution.
     pub proposal: Option<Proposal>,
     pub order: Option<Result<OrderDecision, PolicyError>>,
+    pub decision_summary: String,
     pub receipts: Vec<ArenaInferenceReceiptV1>,
     pub tool_results: Vec<ToolResult>,
 }
@@ -187,6 +214,10 @@ where
             };
             let turn = self.inference.infer(&request).await?;
             validate_receipt(&request, &turn)?;
+            let decision_summary = validate_decision_summary(
+                &turn.output.decision_summary,
+                context.strategy_instructions,
+            )?;
             receipts.push(turn.receipt);
 
             if !turn.output.tool_calls.is_empty() && turn.output.proposal.is_some() {
@@ -212,6 +243,7 @@ where
                 return Ok(CycleOutcome {
                     proposal: Some(proposal),
                     order: Some(order),
+                    decision_summary,
                     receipts,
                     tool_results,
                 });
@@ -223,6 +255,7 @@ where
                 return Ok(CycleOutcome {
                     proposal: None,
                     order: None,
+                    decision_summary,
                     receipts,
                     tool_results,
                 });
@@ -242,6 +275,36 @@ where
         }
         Err(RuntimeError::ToolRoundLimit)
     }
+}
+
+fn validate_decision_summary(
+    summary: &str,
+    strategy_instructions: &str,
+) -> Result<String, RuntimeError> {
+    let summary = summary.trim();
+    let normalized = summary.to_ascii_lowercase();
+    let normalized_strategy = strategy_instructions.trim().to_ascii_lowercase();
+    if summary.is_empty()
+        || summary.chars().count() > MAX_DECISION_SUMMARY_CHARS
+        || summary.chars().any(char::is_control)
+        || [
+            "system prompt",
+            "strategy instruction",
+            "my instruction",
+            "prompt says",
+            "hidden reasoning",
+            "chain of thought",
+        ]
+        .iter()
+        .any(|private_reference| normalized.contains(private_reference))
+        || (normalized.chars().count() >= 24
+            && normalized_strategy.chars().count() >= 24
+            && (normalized.contains(&normalized_strategy)
+                || normalized_strategy.contains(&normalized)))
+    {
+        return Err(RuntimeError::DecisionSummary);
+    }
+    Ok(summary.to_owned())
 }
 
 fn validate_receipt(request: &ModelTurnRequest, turn: &InferenceTurn) -> Result<(), RuntimeError> {
@@ -290,6 +353,7 @@ mod tests {
                         arguments: json!({"limit": 32}),
                     }],
                     proposal: None,
+                    decision_summary: "Checking the latest approved candle evidence.".into(),
                 }
             } else {
                 ModelTurn {
@@ -301,6 +365,8 @@ mod tests {
                         limit_price_micro_usdc: 100_000_000,
                         reduce_only: false,
                     }),
+                    decision_summary: "BTC evidence supports a small policy-compliant long entry."
+                        .into(),
                 }
             };
             Ok(InferenceTurn {
@@ -333,6 +399,8 @@ mod tests {
             let output = ModelTurn {
                 tool_calls: Vec::new(),
                 proposal: None,
+                decision_summary:
+                    "Momentum is mixed and does not justify a policy-compliant entry.".into(),
             };
             Ok(InferenceTurn {
                 receipt: receipt_for(request, &output)?,
@@ -430,8 +498,90 @@ mod tests {
             .await?;
         assert!(outcome.proposal.is_none());
         assert!(outcome.order.is_none());
+        assert_eq!(
+            outcome.decision_summary,
+            "Momentum is mixed and does not justify a policy-compliant entry."
+        );
         assert_eq!(outcome.receipts.len(), 1);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn decision_summary_is_bounded_and_single_line() {
+        #[derive(Debug)]
+        struct InvalidSummaryInference;
+
+        #[async_trait]
+        impl InferenceProvider for InvalidSummaryInference {
+            async fn infer(
+                &self,
+                request: &ModelTurnRequest,
+            ) -> Result<InferenceTurn, RuntimeError> {
+                let output = ModelTurn {
+                    tool_calls: Vec::new(),
+                    proposal: None,
+                    decision_summary: "hidden\nreasoning".into(),
+                };
+                Ok(InferenceTurn {
+                    receipt: receipt_for(request, &output)?,
+                    output,
+                })
+            }
+        }
+
+        let runtime = AgentRuntime::new(InvalidSummaryInference);
+        let markets = BTreeMap::from([(
+            "BTC".into(),
+            MarketState {
+                symbol: "BTC".into(),
+                mark_price_micro_usdc: 100_000_000,
+                oracle_price_micro_usdc: 100_000_000,
+                spread_bps: 4,
+                book_age_seconds: 1,
+                ask_depth_micro_usdc: 10_000_000,
+                bid_depth_micro_usdc: 10_000_000,
+                size_decimals: 5,
+                delisted: false,
+            },
+        )]);
+        let portfolios = BTreeMap::from([(
+            "BTC".into(),
+            PortfolioState {
+                equity_micro_usdc: 1_000_000_000,
+                available_collateral_micro_usdc: 1_000_000_000,
+                trading_day_start_equity_micro_usdc: 1_000_000_000,
+                peak_equity_micro_usdc: 1_000_000_000,
+                symbol_position_micro_usdc: 0,
+                orders_today: 0,
+            },
+        )]);
+        let result = runtime
+            .execute_cycle(&CycleContext {
+                manifest: &manifest(),
+                run_id: Uuid::from_u128(30),
+                cycle_id: Uuid::from_u128(31),
+                model_id: ALLOWED_MODELS[0],
+                strategy_instructions: "Hold when evidence is weak.",
+                markets: &markets,
+                portfolios: &portfolios,
+                cycle_context: json!({"candle_closed_at": "2026-07-01T00:00:00Z"}),
+            })
+            .await;
+        assert!(matches!(result, Err(RuntimeError::DecisionSummary)));
+        assert!(matches!(
+            validate_decision_summary(
+                "My strategy instructions require this trade.",
+                "Only buy when every signal agrees."
+            ),
+            Err(RuntimeError::DecisionSummary)
+        ));
+        assert!(matches!(
+            validate_decision_summary(
+                "Hold when the expected edge is weak.",
+                "Hold when the expected edge is weak."
+            ),
+            Err(RuntimeError::DecisionSummary)
+        ));
     }
 
     fn receipt_for(

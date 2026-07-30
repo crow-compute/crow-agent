@@ -753,6 +753,7 @@ fn sanitize_journal_payload(event_type: &str, payload: &Value) -> Value {
             | "handoff_snapshot"
             | "cycle_started"
             | "cycle_completed"
+            | "cycle_failed"
             | "cycle_missed"
             | "proposal"
             | "policy_outcome"
@@ -2065,6 +2066,39 @@ mod tests {
                 &json!({"receipt_id": "not-for-webview"})
             ),
             json!({})
+        );
+        let decision = sanitize_journal_payload(
+            "proposal",
+            &json!({
+                "action": "hold",
+                "decision_summary": "BTC, ETH, and SOL signals are mixed, so no compliant entry is justified.",
+                "proposal": null,
+                "raw_reasoning": "private chain of thought",
+                "strategy_instructions": "private strategy"
+            }),
+        );
+        assert_eq!(decision["action"], "hold");
+        assert_eq!(
+            decision["decision_summary"],
+            "BTC, ETH, and SOL signals are mixed, so no compliant entry is justified."
+        );
+        assert!(decision.get("raw_reasoning").is_none());
+        assert!(decision.get("strategy_instructions").is_none());
+        assert_eq!(
+            sanitize_journal_payload(
+                "cycle_failed",
+                &json!({
+                    "stage": "model_decision",
+                    "reason": "receipt_binding_failed",
+                    "order_submitted": false,
+                    "raw_response": "private"
+                })
+            ),
+            json!({
+                "stage": "model_decision",
+                "reason": "receipt_binding_failed",
+                "order_submitted": false
+            })
         );
     }
 
