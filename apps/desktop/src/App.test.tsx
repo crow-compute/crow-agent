@@ -5,6 +5,7 @@ import {
   arenaAcceptsSetup,
   arenaLaunchFailure,
   credentialUnlockFailure,
+  nextDecisionCountdown,
   parseHandoffSnapshot,
 } from "./App";
 
@@ -124,6 +125,9 @@ describe("Crow Agent shell", () => {
         state: "paused",
         startedAt: "2026-07-30T01:00:00Z",
         latestAt: "2026-07-30T01:15:00Z",
+        arenaStartsAt: "2099-07-30T01:00:00Z",
+        arenaEndsAt: "2099-07-30T01:30:00Z",
+        decisionIntervalSeconds: 900,
         eventCount: 6,
         cycleCount: 1,
         orderCount: 1,
@@ -156,6 +160,7 @@ describe("Crow Agent shell", () => {
     expect(screen.getByText("BTC")).toBeInTheDocument();
     expect(screen.getByText("0.02")).toBeInTheDocument();
     expect(screen.getByText("CHAIN RECEIPTED")).toBeInTheDocument();
+    expect(screen.getByText("PAUSED — RESUME BEFORE START")).toBeInTheDocument();
     expect(screen.queryByText(/raw prompt/i)).not.toBeInTheDocument();
   });
 
@@ -170,6 +175,9 @@ describe("Crow Agent shell", () => {
         state: "paused",
         startedAt: "2026-07-30T02:00:00Z",
         latestAt: "2026-07-30T02:00:01Z",
+        arenaStartsAt: "2099-07-30T02:00:00Z",
+        arenaEndsAt: "2099-07-30T02:30:00Z",
+        decisionIntervalSeconds: 900,
         eventCount: 2,
         cycleCount: 0,
         orderCount: 0,
@@ -184,6 +192,101 @@ describe("Crow Agent shell", () => {
     screen.getByRole("button", { name: /Trades/ }).click();
     expect(await screen.findByRole("heading", { name: /paused \/ no fills yet/i })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "No events in this filter yet." })).toBeInTheDocument();
+  });
+
+  it("derives decision windows from the arena schedule and handles every lifecycle state", () => {
+    const run = {
+      runId: "00000000-0000-0000-0000-000000000020",
+      arenaId: "00000000-0000-0000-0000-000000000021",
+      state: "running" as const,
+      startedAt: "2026-07-30T03:55:00Z",
+      latestAt: "2026-07-30T03:55:00Z",
+      arenaStartsAt: "2026-07-30T04:00:00Z",
+      arenaEndsAt: "2026-07-30T04:45:00Z",
+      decisionIntervalSeconds: 900,
+      eventCount: 1,
+      cycleCount: 0,
+      orderCount: 0,
+      fillCount: 0,
+      allReceipted: true,
+    };
+    expect(nextDecisionCountdown(run, Date.parse("2026-07-30T03:59:59Z"))).toMatchObject({
+      label: "ARENA STARTS IN",
+      value: "00:01",
+      boundaryAt: "2026-07-30T04:00:00.000Z",
+    });
+    expect(nextDecisionCountdown(run, Date.parse("2026-07-30T04:00:00Z"))).toMatchObject({
+      label: "NEXT DECISION",
+      value: "15:00",
+      boundaryAt: "2026-07-30T04:15:00.000Z",
+    });
+    expect(nextDecisionCountdown(
+      { ...run, state: "paused" },
+      Date.parse("2026-07-30T04:05:00Z"),
+    )).toMatchObject({
+      label: "PAUSED — RESUME BEFORE NEXT WINDOW",
+      value: "10:00",
+    });
+    expect(nextDecisionCountdown(run, Date.parse("2026-07-30T04:15:00Z"))).toMatchObject({
+      label: "NEXT DECISION",
+      value: "15:00",
+      boundaryAt: "2026-07-30T04:30:00.000Z",
+    });
+    expect(nextDecisionCountdown(run, Date.parse("2026-07-30T04:30:00Z"))).toMatchObject({
+      label: "DECISION WINDOWS COMPLETE",
+      value: "00:00",
+    });
+    expect(nextDecisionCountdown(run, Date.parse("2026-07-30T04:45:00Z"))).toMatchObject({
+      label: "ARENA ENDED",
+      value: "00:00",
+    });
+    expect(nextDecisionCountdown(
+      { ...run, state: "stopped" },
+      Date.parse("2026-07-30T04:05:00Z"),
+    )).toMatchObject({ label: "RUN STOPPED", value: "—" });
+    expect(nextDecisionCountdown(
+      { ...run, arenaStartsAt: null },
+      Date.parse("2026-07-30T04:05:00Z"),
+    )).toMatchObject({ label: "SCHEDULE UNAVAILABLE", value: "—" });
+  });
+
+  it("ticks the selected run countdown once per second", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse("2026-07-30T03:59:58Z"));
+    harnessMock.authorized = true;
+    harnessMock.daemon = "running";
+    harnessMock.activeRun = "00000000-0000-0000-0000-000000000022";
+    harnessMock.journal = {
+      runs: [{
+        runId: harnessMock.activeRun,
+        arenaId: "00000000-0000-0000-0000-000000000023",
+        state: "running",
+        startedAt: "2026-07-30T03:55:00Z",
+        latestAt: "2026-07-30T03:55:00Z",
+        arenaStartsAt: "2026-07-30T04:00:00Z",
+        arenaEndsAt: "2026-07-30T04:30:00Z",
+        decisionIntervalSeconds: 900,
+        eventCount: 1,
+        cycleCount: 0,
+        orderCount: 0,
+        fillCount: 0,
+        allReceipted: true,
+      }],
+      selectedRunId: harnessMock.activeRun,
+      events: [],
+    };
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      screen.getByRole("button", { name: /Trades/ }).click();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByRole("timer")).toHaveAccessibleName("ARENA STARTS IN: 00:02");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(screen.getByRole("timer")).toHaveAccessibleName("ARENA STARTS IN: 00:01");
   });
 
   it("refreshes the arena catalog without restarting or reopening the credential vault", async () => {

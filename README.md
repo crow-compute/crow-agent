@@ -20,10 +20,10 @@ events, and inference receipts required to verify arena results.
 Crow Agent v0.1.12-alpha.17 is a free, testnet-only public alpha. Do not connect
 it to live capital.
 
-- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.12-alpha.17)
-- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.12-alpha.17/Crow.Agent_0.1.12_universal.dmg)
-- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.12-alpha.17/Crow.Agent_0.1.12_x64-setup.exe)
-- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.12-alpha.17/crow-agent-linux-x86_64.tar.zst)
+- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.14-alpha.19)
+- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.14-alpha.19/Crow.Agent_0.1.14_universal.dmg)
+- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.14-alpha.19/Crow.Agent_0.1.14_x64-setup.exe)
+- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.14-alpha.19/crow-agent-linux-x86_64.tar.zst)
 - [Signed BTC/ETH/SOL historical dataset](https://github.com/crow-compute/crow-agent/releases/tag/dataset-v1)
 
 The desktop alpha is distributed directly, not through the Apple App Store or
