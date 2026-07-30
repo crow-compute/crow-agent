@@ -50,7 +50,6 @@ vi.mock("./tauri", async () => {
       address: "0x1111111111111111111111111111111111111111",
       approvalUrl: "https://app.hyperliquid-testnet.xyz/API",
     }),
-    enrollArena: async () => undefined,
     startLocalArena: async () => {
       if (harnessMock.launchFailure) throw new Error(harnessMock.launchFailure);
       return {
@@ -393,6 +392,12 @@ describe("Crow Agent shell", () => {
   it("renders bounded launch diagnostics without leaking raw errors", () => {
     expect(arenaLaunchFailure("device_authorization_failed")).toMatch(/Reauthorize/);
     expect(arenaLaunchFailure(new Error("agent_version_invalid"))).toMatch(/encrypted agent version/);
+    expect(arenaLaunchFailure("hyperliquid_account_state_unavailable")).toMatch(
+      /abstraction mode and collateral/,
+    );
+    expect(arenaLaunchFailure("hyperliquid_testnet_collateral_required")).toMatch(
+      /Unified-account USDC is supported/,
+    );
     expect(arenaLaunchFailure("unexpected secret-shaped detail")).toBe(
       "Arena launch failed closed. No order was submitted.",
     );
