@@ -17,6 +17,11 @@ const harnessMock = vi.hoisted(() => ({
   unlockCalls: 0,
   versions: [] as Array<Record<string, unknown>>,
   launchFailure: "",
+  journal: {
+    runs: [] as Array<Record<string, unknown>>,
+    selectedRunId: null as string | null,
+    events: [] as Array<Record<string, unknown>>,
+  },
 }));
 
 vi.mock("./tauri", async () => {
@@ -35,6 +40,10 @@ vi.mock("./tauri", async () => {
       return { arenas: harnessMock.arenas };
     },
     getRemoteState: async () => ({ devices: [], runs: [] }),
+    getLocalRunJournal: async (runId: string | null) => ({
+      ...harnessMock.journal,
+      selectedRunId: runId ?? harnessMock.journal.selectedRunId,
+    }),
     getAgentVersions: async () => ({ versions: harnessMock.versions }),
     prepareHyperliquidWallet: async () => ({
       address: "0x1111111111111111111111111111111111111111",
@@ -68,6 +77,7 @@ describe("Crow Agent shell", () => {
     harnessMock.unlockCalls = 0;
     harnessMock.versions = [];
     harnessMock.launchFailure = "";
+    harnessMock.journal = { runs: [], selectedRunId: null, events: [] };
     vi.useRealTimers();
   });
 
@@ -101,6 +111,79 @@ describe("Crow Agent shell", () => {
     });
     expect(await screen.findByRole("heading", { name: "PAPER ARENAS" })).toBeInTheDocument();
     expect(screen.getByText("No arena manifest is open.")).toBeInTheDocument();
+  });
+
+  it("shows Studio-style local trade evidence without private payload fields", async () => {
+    harnessMock.authorized = true;
+    harnessMock.daemon = "paused";
+    harnessMock.activeRun = "00000000-0000-0000-0000-000000000007";
+    harnessMock.journal = {
+      runs: [{
+        runId: harnessMock.activeRun,
+        arenaId: "00000000-0000-0000-0000-000000000008",
+        state: "paused",
+        startedAt: "2026-07-30T01:00:00Z",
+        latestAt: "2026-07-30T01:15:00Z",
+        eventCount: 6,
+        cycleCount: 1,
+        orderCount: 1,
+        fillCount: 1,
+        allReceipted: true,
+      }],
+      selectedRunId: harnessMock.activeRun,
+      events: [{
+        sequence: 6,
+        cycleId: "00000000-0000-0000-0000-000000000009",
+        eventType: "fill",
+        occurredAt: "2026-07-30T01:15:00Z",
+        receipted: true,
+        details: {
+          fills: [{
+            coin: "BTC",
+            px: "118000",
+            sz: "0.001",
+            fee: "0.02",
+          }],
+        },
+      }],
+    };
+
+    render(<App />);
+    screen.getByRole("button", { name: /Trades/ }).click();
+    expect(await screen.findByRole("heading", { name: "TRADES" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /paused \/ 1 fills/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "FILL" })).toBeInTheDocument();
+    expect(screen.getByText("BTC")).toBeInTheDocument();
+    expect(screen.getByText("0.02")).toBeInTheDocument();
+    expect(screen.getByText("CHAIN RECEIPTED")).toBeInTheDocument();
+    expect(screen.queryByText(/raw prompt/i)).not.toBeInTheDocument();
+  });
+
+  it("renders a useful paused zero-trade journal state", async () => {
+    harnessMock.authorized = true;
+    harnessMock.daemon = "paused";
+    harnessMock.activeRun = "00000000-0000-0000-0000-000000000010";
+    harnessMock.journal = {
+      runs: [{
+        runId: harnessMock.activeRun,
+        arenaId: "00000000-0000-0000-0000-000000000011",
+        state: "paused",
+        startedAt: "2026-07-30T02:00:00Z",
+        latestAt: "2026-07-30T02:00:01Z",
+        eventCount: 2,
+        cycleCount: 0,
+        orderCount: 0,
+        fillCount: 0,
+        allReceipted: true,
+      }],
+      selectedRunId: harnessMock.activeRun,
+      events: [],
+    };
+
+    render(<App />);
+    screen.getByRole("button", { name: /Trades/ }).click();
+    expect(await screen.findByRole("heading", { name: /paused \/ no fills yet/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "No events in this filter yet." })).toBeInTheDocument();
   });
 
   it("refreshes the arena catalog without restarting or reopening the credential vault", async () => {

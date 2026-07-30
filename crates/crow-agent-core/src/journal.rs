@@ -163,6 +163,40 @@ impl EncryptedJournal {
         Ok(events)
     }
 
+    pub fn public_events(&self) -> Result<Vec<RunEventEnvelopeV1>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT public_envelope,server_receipt FROM run_events
+             ORDER BY run_id,sequence",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut events = Vec::new();
+        let mut previous_run = None;
+        let mut previous_sequence = 0_u64;
+        let mut previous_hash = String::new();
+        for row in rows {
+            let (envelope, server_receipt) = row?;
+            let mut event = serde_json::from_str::<RunEventEnvelopeV1>(&envelope)?;
+            event.verify().map_err(|_| JournalError::Event)?;
+            if previous_run == Some(event.run_id) {
+                if event.sequence != previous_sequence + 1
+                    || event.previous_event_sha256 != previous_hash
+                {
+                    return Err(JournalError::Sequence);
+                }
+            } else if event.sequence != 1 || event.previous_event_sha256 != "0".repeat(64) {
+                return Err(JournalError::Sequence);
+            }
+            previous_run = Some(event.run_id);
+            previous_sequence = event.sequence;
+            previous_hash.clone_from(&event.event_sha256);
+            event.server_receipt = server_receipt;
+            events.push(event);
+        }
+        Ok(events)
+    }
+
     pub fn acknowledge_event(
         &self,
         event_id: uuid::Uuid,
@@ -432,6 +466,49 @@ mod tests {
                 .acknowledge_event(first.event_id, "different-receipt")
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn public_events_verify_chains_and_include_receipt_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("journal.db");
+        let identity = DeviceIdentity::generate();
+        let arena_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let first = RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            None,
+            1,
+            "0".repeat(64),
+            "run_started".into(),
+            OffsetDateTime::now_utc(),
+            json!({"mode": "hyperliquid_testnet"}),
+        )?;
+        let second = RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            Some(Uuid::new_v4()),
+            2,
+            first.event_sha256.clone(),
+            "proposal".into(),
+            OffsetDateTime::now_utc(),
+            json!({"symbol": "BTC", "side": "buy", "notional_bps": 100}),
+        )?;
+        let mut journal = EncryptedJournal::open(&path, [29_u8; 32])?;
+        journal.append(&first, &json!({"raw_prompt": "private"}))?;
+        journal.append(&second, &json!({"raw_transcript": "private"}))?;
+        journal.acknowledge_event(first.event_id, "receipt-1")?;
+
+        let events = journal.public_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].server_receipt.as_deref(), Some("receipt-1"));
+        assert!(events[1].server_receipt.is_none());
+        assert_eq!(events[1].event_type, "proposal");
         Ok(())
     }
 }

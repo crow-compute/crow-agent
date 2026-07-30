@@ -2,9 +2,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use crow_agent_core::{
     AgentVersionRecipient, CompanionActionV1, CompanionRequestV1, CompanionResponseV1,
     DeviceAuthorizationClient, DeviceAuthorizationError, DeviceAuthorizationSession,
-    DeviceEncryptionKey, DeviceTokens, MAX_COMPANION_MESSAGE_BYTES, REQUIRED_STRATEGY_TOOLS,
-    StrategyBundleV1, decode_device_encryption_public_key, hyperliquid_api_wallet_address,
-    open_agent_version, seal_agent_version,
+    DeviceEncryptionKey, DeviceTokens, EncryptedJournal, MAX_COMPANION_MESSAGE_BYTES,
+    REQUIRED_STRATEGY_TOOLS, StrategyBundleV1, decode_device_encryption_public_key,
+    hyperliquid_api_wallet_address, open_agent_version, seal_agent_version,
 };
 use crow_agent_protocol::{
     AgentVersionEnvelopeV1, DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1,
@@ -215,6 +215,40 @@ struct HyperliquidWalletSetup {
     approval_url: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalRunSummary {
+    run_id: String,
+    arena_id: String,
+    state: String,
+    started_at: String,
+    latest_at: String,
+    event_count: u64,
+    cycle_count: u64,
+    order_count: u64,
+    fill_count: u64,
+    all_receipted: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalRunEvent {
+    sequence: u64,
+    cycle_id: Option<String>,
+    event_type: String,
+    occurred_at: String,
+    receipted: bool,
+    details: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalRunJournal {
+    runs: Vec<LocalRunSummary>,
+    selected_run_id: Option<String>,
+    events: Vec<LocalRunEvent>,
+}
+
 #[derive(Debug)]
 enum DesktopError {
     Credential,
@@ -227,6 +261,7 @@ enum DesktopError {
     AgentVersion,
     Arena,
     Venue,
+    Journal,
 }
 
 impl DesktopError {
@@ -242,6 +277,7 @@ impl DesktopError {
             Self::AgentVersion => "agent_version_invalid",
             Self::Arena => "arena_operation_failed",
             Self::Venue => "hyperliquid_api_wallet_unavailable",
+            Self::Journal => "local_journal_unavailable",
         }
     }
 }
@@ -535,6 +571,199 @@ async fn get_agent_status(
             .map(|run_id| run_id.to_string()),
         device_authorized,
     })
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn get_local_run_journal(
+    app: tauri::AppHandle,
+    run_id: Option<String>,
+    state: State<'_, DesktopState>,
+) -> Result<LocalRunJournal, String> {
+    if !state.device_authorized() {
+        return Err(DesktopError::NoAuthorization.code().to_owned());
+    }
+    let path = desktop_runtime_directory(&app)
+        .map_err(|_| DesktopError::Journal.code().to_owned())?
+        .join("state/journal.db");
+    if !path.exists() {
+        return Ok(LocalRunJournal {
+            runs: Vec::new(),
+            selected_run_id: None,
+            events: Vec::new(),
+        });
+    }
+    let key =
+        load_secret_32(JOURNAL_KEY_ACCOUNT).map_err(|_| DesktopError::Journal.code().to_owned())?;
+    let journal =
+        EncryptedJournal::open(&path, *key).map_err(|_| DesktopError::Journal.code().to_owned())?;
+    let public_events = journal
+        .public_events()
+        .map_err(|_| DesktopError::Journal.code().to_owned())?;
+    Ok(build_local_run_journal(&public_events, run_id.as_deref()))
+}
+
+fn build_local_run_journal(
+    public_events: &[crow_agent_protocol::RunEventEnvelopeV1],
+    requested_run_id: Option<&str>,
+) -> LocalRunJournal {
+    let mut runs = Vec::<LocalRunSummary>::new();
+    for event in public_events {
+        let run_id = event.run_id.to_string();
+        let occurred_at = event.occurred_at.to_string();
+        let summary_index =
+            if let Some(index) = runs.iter().position(|summary| summary.run_id == run_id) {
+                index
+            } else {
+                runs.push(LocalRunSummary {
+                    run_id: run_id.clone(),
+                    arena_id: event.arena_id.to_string(),
+                    state: "running".into(),
+                    started_at: occurred_at.clone(),
+                    latest_at: occurred_at.clone(),
+                    event_count: 0,
+                    cycle_count: 0,
+                    order_count: 0,
+                    fill_count: 0,
+                    all_receipted: true,
+                });
+                runs.len() - 1
+            };
+        let summary = &mut runs[summary_index];
+        summary.event_count += 1;
+        summary.latest_at = occurred_at;
+        summary.all_receipted &= event.server_receipt.is_some();
+        match event.event_type.as_str() {
+            "run_started" | "run_resumed" => summary.state = "running".into(),
+            "run_paused" => summary.state = "paused".into(),
+            "run_stopped" => summary.state = "stopped".into(),
+            "cycle_started" => summary.cycle_count += 1,
+            "order_submitted" => summary.order_count += 1,
+            "fill" => {
+                summary.fill_count += event
+                    .payload
+                    .get("fills")
+                    .and_then(Value::as_array)
+                    .map_or(0, |fills| u64::try_from(fills.len()).unwrap_or(u64::MAX));
+            }
+            _ => {}
+        }
+    }
+    runs.sort_by(|left, right| right.latest_at.cmp(&left.latest_at));
+    let selected_run_id = requested_run_id
+        .filter(|requested| runs.iter().any(|summary| summary.run_id == *requested))
+        .map(str::to_owned)
+        .or_else(|| runs.first().map(|summary| summary.run_id.clone()));
+    let events = selected_run_id
+        .as_deref()
+        .map_or_else(Vec::new, |selected| {
+            public_events
+                .iter()
+                .filter(|event| event.run_id.to_string() == selected)
+                .map(|event| LocalRunEvent {
+                    sequence: event.sequence,
+                    cycle_id: event.cycle_id.map(|cycle_id| cycle_id.to_string()),
+                    event_type: event.event_type.clone(),
+                    occurred_at: event.occurred_at.to_string(),
+                    receipted: event.server_receipt.is_some(),
+                    details: sanitize_journal_payload(&event.event_type, &event.payload),
+                })
+                .collect()
+        });
+    LocalRunJournal {
+        runs,
+        selected_run_id,
+        events,
+    }
+}
+
+fn sanitize_journal_payload(event_type: &str, payload: &Value) -> Value {
+    let permitted = matches!(
+        event_type,
+        "run_started"
+            | "run_paused"
+            | "run_resumed"
+            | "run_stopped"
+            | "handoff_snapshot"
+            | "cycle_started"
+            | "cycle_completed"
+            | "cycle_missed"
+            | "proposal"
+            | "policy_outcome"
+            | "order_submitted"
+            | "venue_acknowledgement"
+            | "fill"
+            | "funding"
+            | "reconciliation"
+            | "portfolio_snapshot"
+    );
+    if !permitted {
+        return json!({});
+    }
+    bounded_public_value(payload, 0)
+}
+
+fn bounded_public_value(value: &Value, depth: usize) -> Value {
+    if depth >= 5 {
+        return Value::Null;
+    }
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+        Value::String(value) => Value::String(value.chars().take(256).collect()),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .take(50)
+                .map(|value| bounded_public_value(value, depth + 1))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .filter(|(key, _)| !private_journal_field(key))
+                .take(64)
+                .map(|(key, value)| (key.clone(), bounded_public_value(value, depth + 1)))
+                .collect(),
+        ),
+    }
+}
+
+fn private_journal_field(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "raw",
+        "prompt",
+        "transcript",
+        "instruction",
+        "strategy",
+        "secret",
+        "private",
+        "credential",
+        "authorization",
+        "ciphertext",
+        "signature",
+        "hash",
+        "receipt",
+        "nonce",
+        "address",
+        "wallet",
+    ]
+    .iter()
+    .any(|blocked| key.contains(blocked))
+        || matches!(
+            key.as_str(),
+            "token"
+                | "access_token"
+                | "refresh_token"
+                | "api_key"
+                | "private_key"
+                | "oid"
+                | "cloid"
+                | "tid"
+                | "client_order_id"
+                | "event_id"
+                | "device_id"
+        )
 }
 
 #[tauri::command]
@@ -1584,6 +1813,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_agent_status,
+            get_local_run_journal,
             unlock_device_credentials,
             send_local_command,
             begin_device_authorization,
@@ -1700,5 +1930,90 @@ mod tests {
         assert!(!debug.contains("refresh-sentinel"));
         assert!(!debug.contains("wallet-sentinel"));
         assert!(debug.contains("signing_seed_present: true"));
+    }
+
+    #[test]
+    fn journal_payload_view_is_bounded_and_redacts_private_fields() {
+        let sanitized = sanitize_journal_payload(
+            "fill",
+            &json!({
+                "fills": [{
+                    "coin": "BTC",
+                    "px": "118000",
+                    "fee": "0.02",
+                    "oid": 42,
+                    "wallet_address": "0xprivate",
+                    "raw_transcript": "private reasoning",
+                    "api_key": "private key"
+                }],
+                "device_signature": "private signature"
+            }),
+        );
+        assert_eq!(sanitized["fills"][0]["coin"], "BTC");
+        assert_eq!(sanitized["fills"][0]["fee"], "0.02");
+        assert!(sanitized["fills"][0].get("oid").is_none());
+        assert!(sanitized["fills"][0].get("wallet_address").is_none());
+        assert!(sanitized["fills"][0].get("raw_transcript").is_none());
+        assert!(sanitized["fills"][0].get("api_key").is_none());
+        assert!(sanitized.get("device_signature").is_none());
+        assert_eq!(
+            sanitize_journal_payload(
+                "inference_receipt",
+                &json!({"receipt_id": "not-for-webview"})
+            ),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn journal_summary_counts_trade_activity_and_lifecycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = DeviceIdentity::generate();
+        let arena_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let started = crow_agent_protocol::RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            None,
+            1,
+            "0".repeat(64),
+            "run_started".into(),
+            OffsetDateTime::now_utc(),
+            json!({"mode": "hyperliquid_testnet"}),
+        )?;
+        let mut fill = crow_agent_protocol::RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            Some(Uuid::new_v4()),
+            2,
+            started.event_sha256.clone(),
+            "fill".into(),
+            OffsetDateTime::now_utc(),
+            json!({"fills": [{"coin": "BTC"}, {"coin": "ETH"}]}),
+        )?;
+        fill.server_receipt = Some("server-receipt".into());
+        let paused = crow_agent_protocol::RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            None,
+            3,
+            fill.event_sha256.clone(),
+            "run_paused".into(),
+            OffsetDateTime::now_utc(),
+            json!({"source": "authenticated_control"}),
+        )?;
+
+        let events = [started, fill, paused];
+        let journal = build_local_run_journal(&events, Some(&run_id.to_string()));
+        assert_eq!(journal.runs.len(), 1);
+        assert_eq!(journal.runs[0].state, "paused");
+        assert_eq!(journal.runs[0].fill_count, 2);
+        assert!(!journal.runs[0].all_receipted);
+        assert_eq!(journal.events.len(), 3);
+        assert_eq!(journal.events[1].details["fills"][0]["coin"], "BTC");
+        Ok(())
     }
 }
