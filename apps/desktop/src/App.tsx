@@ -132,6 +132,112 @@ function eventIsVisible(event: LocalRunEvent, filter: JournalFilter) {
   return true;
 }
 
+function journalObject(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+export type JournalDecision = {
+  sequence: number;
+  cycleId: string | null;
+  action: "hold" | "order";
+  status: string;
+  summary: string;
+  noTradeReason: string | null;
+  proposal: unknown;
+  receipted: boolean;
+};
+
+export function journalDecisions(events: LocalRunEvent[]): JournalDecision[] {
+  return events
+    .filter((event) => ["proposal", "cycle_failed", "cycle_missed"].includes(event.eventType))
+    .map((event) => {
+      const details = journalObject(event.details);
+      if (event.eventType === "cycle_failed" || event.eventType === "cycle_missed") {
+        const failed = event.eventType === "cycle_failed";
+        const reason = typeof details?.reason === "string" ? details.reason : null;
+        return {
+          sequence: event.sequence,
+          cycleId: event.cycleId,
+          action: "hold",
+          status: failed ? "INFERENCE FAILED" : "MISSED CYCLE",
+          summary: failed
+            ? "The cycle ended before a valid receipt-bound model decision was available."
+            : "The scheduled decision window passed without a completed model decision.",
+          noTradeReason: reason
+            ? `No order was permitted because the cycle ended with ${reason.replaceAll("_", " ")}.`
+            : "No order was permitted because the cycle did not complete.",
+          proposal: null,
+          receipted: event.receipted,
+        } satisfies JournalDecision;
+      }
+      const legacyProposal = details?.symbol ? details : null;
+      const proposal = details?.proposal ?? legacyProposal;
+      const action = details?.action === "order" || proposal ? "order" : "hold";
+      const related = events.filter((candidate) => candidate.cycleId === event.cycleId);
+      const policyEvent = related.find((candidate) => candidate.eventType === "policy_outcome");
+      const policy = journalObject(policyEvent?.details);
+      const policyAllowed = typeof policy?.allowed === "boolean" ? policy.allowed : null;
+      const policyReason = typeof policy?.reason === "string" ? policy.reason : null;
+      const orderSubmitted = related.some((candidate) => candidate.eventType === "order_submitted");
+      const fillCount = related
+        .filter((candidate) => candidate.eventType === "fill")
+        .reduce((total, candidate) => {
+          const fills = journalObject(candidate.details)?.fills;
+          return total + (Array.isArray(fills) ? fills.length : 0);
+        }, 0);
+      const capturedSummary = typeof details?.decision_summary === "string"
+        ? details.decision_summary.trim()
+        : "";
+
+      if (action === "hold") {
+        return {
+          sequence: event.sequence,
+          cycleId: event.cycleId,
+          action,
+          status: "HOLD",
+          summary: capturedSummary || "The model selected HOLD. This older client cycle did not record a display-safe explanation.",
+          noTradeReason: policyReason === "model_abstained"
+            ? "Model abstained; there was no order for local policy or the venue to execute."
+            : "No order proposal was produced, so nothing was submitted.",
+          proposal: null,
+          receipted: event.receipted && (policyEvent?.receipted ?? true),
+        } satisfies JournalDecision;
+      }
+
+      const status = policyAllowed === false
+        ? "BLOCKED BY POLICY"
+        : fillCount > 0
+          ? "FILLED"
+          : orderSubmitted
+            ? "SUBMITTED / NO FILL"
+            : policyAllowed === true
+              ? "POLICY APPROVED"
+              : "ORDER PROPOSED";
+      const noTradeReason = policyAllowed === false
+        ? `Local policy rejected the proposal${policyReason ? `: ${policyReason}` : "."}`
+        : fillCount > 0
+          ? null
+          : orderSubmitted
+          ? "The IOC order reached the venue, but no fill is recorded."
+          : !orderSubmitted
+            ? "No venue submission is recorded for this proposal."
+            : null;
+      return {
+        sequence: event.sequence,
+        cycleId: event.cycleId,
+        action,
+        status,
+        summary: capturedSummary || "This older client cycle recorded the proposal without a display-safe model explanation.",
+        noTradeReason,
+        proposal,
+        receipted: event.receipted && (policyEvent?.receipted ?? true),
+      } satisfies JournalDecision;
+    })
+    .reverse();
+}
+
 export function arenaAcceptsSetup(arena: PublicArena, now = Date.now()) {
   const endsAt = new Date(arena.endsAt).getTime();
   return ["enrollment", "running"].includes(arena.state)
@@ -569,6 +675,7 @@ export function App() {
   const visibleJournalEvents = [...journal.events]
     .filter((event) => eventIsVisible(event, journalFilter))
     .reverse();
+  const decisionJournal = useMemo(() => journalDecisions(journal.events), [journal.events]);
   const readiness = [
     { label: "Device", value: status.deviceAuthorized ? "Approved" : "Unlock required", ready: status.deviceAuthorized },
     { label: "Runtime", value: status.daemon, ready: status.daemon !== "stopped" && status.daemon !== "connecting" },
@@ -878,6 +985,46 @@ export function App() {
                         <div><dt>Fills</dt><dd>{selectedRun.fillCount}</dd></div>
                         <div><dt>Events</dt><dd>{selectedRun.eventCount}</dd></div>
                       </dl>
+
+                      <section className="decision-ledger" aria-label="AI decision journal">
+                        <header>
+                          <div><p className="meta">AI DECISIONS</p><h3>Why the model acted—or did not</h3></div>
+                          <span>{decisionJournal.length} CYCLES</span>
+                        </header>
+                        {decisionJournal.length ? (
+                          <div className="decision-list">
+                            {decisionJournal.map((decision) => {
+                              const proposalDetails = flattenJournalDetails(decision.proposal);
+                              return (
+                                <article className={`decision-card decision-${decision.action}`} key={`${decision.sequence}:${decision.cycleId}`}>
+                                  <div className="decision-card-topline">
+                                    <p>{decision.cycleId ? `CYCLE ${shortId(decision.cycleId)}` : `EVENT ${decision.sequence}`}</p>
+                                    <span>{decision.status}</span>
+                                  </div>
+                                  <h4>{decision.action === "hold" ? "NO TRADE" : "ORDER DECISION"}</h4>
+                                  <blockquote>{decision.summary}</blockquote>
+                                  {decision.noTradeReason ? (
+                                    <div className="no-trade-reason">
+                                      <span>WHY NO TRADE</span>
+                                      <strong>{decision.noTradeReason}</strong>
+                                    </div>
+                                  ) : null}
+                                  {proposalDetails.length ? (
+                                    <dl className="decision-proposal">
+                                      {proposalDetails.map(([label, value], index) => (
+                                        <div key={`${label}:${index}`}><dt>{label}</dt><dd>{value}</dd></div>
+                                      ))}
+                                    </dl>
+                                  ) : null}
+                                  <small>{decision.receipted ? "DECISION CHAIN RECEIPTED" : "DECISION RECEIPT PENDING"}</small>
+                                </article>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="decision-empty">No model decision has completed yet. Lifecycle and reconciliation events remain visible below.</p>
+                        )}
+                      </section>
 
                       <div className="journal-toolbar">
                         <div role="group" aria-label="Trade journal filter">

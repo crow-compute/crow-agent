@@ -386,7 +386,7 @@ where
         "recent_candles": candles,
         "risk_state": risk,
     });
-    let outcome = runtime
+    let outcome = match runtime
         .execute_cycle(&crate::CycleContext {
             manifest,
             run_id,
@@ -397,7 +397,26 @@ where
             portfolios: &portfolios,
             cycle_context: cycle_context.clone(),
         })
-        .await?;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            writer
+                .append(
+                    Some(cycle_id),
+                    "cycle_failed",
+                    json!({
+                        "stage": "model_decision",
+                        "reason": error.failure_class(),
+                        "order_submitted": false,
+                    }),
+                    &Value::Null,
+                )
+                .await?;
+            store_live_risk_state_with_writer(&writer, run_id, risk)?;
+            return Err(error.into());
+        }
+    };
     for receipt in &outcome.receipts {
         writer
             .append(
@@ -408,11 +427,15 @@ where
             )
             .await?;
     }
-    let proposal_event = writer
+    writer
         .append(
             Some(cycle_id),
             "proposal",
-            serde_json::to_value(&outcome.proposal).map_err(|_| LiveCycleError::RiskState)?,
+            json!({
+                "action": if outcome.proposal.is_some() { "order" } else { "hold" },
+                "decision_summary": &outcome.decision_summary,
+                "proposal": &outcome.proposal,
+            }),
             &json!({
                 "cycle_context": cycle_context,
                 "tool_results": outcome.tool_results,
@@ -421,14 +444,27 @@ where
         .await?;
 
     let Some(proposal) = outcome.proposal else {
+        let policy_event = writer
+            .append(
+                Some(cycle_id),
+                "policy_outcome",
+                json!({
+                    "allowed": true,
+                    "action": "hold",
+                    "reason": "model_abstained",
+                    "order_submitted": false,
+                }),
+                &Value::Null,
+            )
+            .await?;
         store_live_risk_state_with_writer(&writer, run_id, risk)?;
         return Ok(LiveCycleResult {
             cycle_id,
             proposal_symbol: "HOLD".into(),
-            policy_allowed: false,
+            policy_allowed: true,
             order_submitted: false,
             client_order_id: None,
-            last_event_sha256: proposal_event.event_sha256,
+            last_event_sha256: policy_event.event_sha256,
         });
     };
     let proposal_symbol = proposal.symbol.clone();

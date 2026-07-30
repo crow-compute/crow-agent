@@ -5,6 +5,7 @@ import {
   arenaAcceptsSetup,
   arenaLaunchFailure,
   credentialUnlockFailure,
+  journalDecisions,
   nextDecisionCountdown,
   parseHandoffSnapshot,
 } from "./App";
@@ -134,21 +135,47 @@ describe("Crow Agent shell", () => {
         allReceipted: true,
       }],
       selectedRunId: harnessMock.activeRun,
-      events: [{
-        sequence: 6,
-        cycleId: "00000000-0000-0000-0000-000000000009",
-        eventType: "fill",
-        occurredAt: "2026-07-30T01:15:00Z",
-        receipted: true,
-        details: {
-          fills: [{
-            coin: "BTC",
-            px: "118000",
-            sz: "0.001",
-            fee: "0.02",
-          }],
+      events: [
+        {
+          sequence: 4,
+          cycleId: "00000000-0000-0000-0000-000000000009",
+          eventType: "proposal",
+          occurredAt: "2026-07-30T01:14:58Z",
+          receipted: true,
+          details: {
+            action: "order",
+            decision_summary: "BTC momentum and available collateral support a small policy-compliant entry.",
+            proposal: {
+              symbol: "BTC",
+              side: "buy",
+              notional_bps: 100,
+            },
+          },
         },
-      }],
+        {
+          sequence: 5,
+          cycleId: "00000000-0000-0000-0000-000000000009",
+          eventType: "policy_outcome",
+          occurredAt: "2026-07-30T01:14:59Z",
+          receipted: true,
+          details: { allowed: true },
+        },
+        {
+          sequence: 6,
+          cycleId: "00000000-0000-0000-0000-000000000009",
+          eventType: "fill",
+          occurredAt: "2026-07-30T01:15:00Z",
+          receipted: true,
+          details: {
+            fills: [{
+              coin: "BTC",
+              px: "118000",
+              sz: "0.001",
+              fee: "0.02",
+            }],
+          },
+        },
+      ],
     };
 
     render(<App />);
@@ -156,8 +183,11 @@ describe("Crow Agent shell", () => {
     expect(await screen.findByRole("heading", { name: "TRADES" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: /paused \/ 1 fills/i })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "FILL" })).toBeInTheDocument();
-    expect(screen.getByText("BTC")).toBeInTheDocument();
+    expect(screen.getAllByText("BTC").length).toBeGreaterThan(0);
     expect(screen.getByText("0.02")).toBeInTheDocument();
+    expect(screen.getByText("Why the model acted—or did not")).toBeInTheDocument();
+    expect(screen.getAllByText("BTC momentum and available collateral support a small policy-compliant entry.").length).toBeGreaterThan(0);
+    expect(screen.getByText("FILLED")).toBeInTheDocument();
     expect(screen.getByText("CHAIN RECEIPTED")).toBeInTheDocument();
     expect(screen.getByText("PAUSED — RESUME BEFORE START")).toBeInTheDocument();
     expect(screen.queryByText(/raw prompt/i)).not.toBeInTheDocument();
@@ -191,6 +221,99 @@ describe("Crow Agent shell", () => {
     screen.getByRole("button", { name: /Trades/ }).click();
     expect(await screen.findByRole("heading", { name: /paused \/ no fills yet/i })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "No events in this filter yet." })).toBeInTheDocument();
+  });
+
+  it("shows a receipt-backed model HOLD and the explicit reason no trade was sent", async () => {
+    harnessMock.authorized = true;
+    harnessMock.daemon = "running";
+    harnessMock.activeRun = "00000000-0000-0000-0000-000000000030";
+    const cycleId = "00000000-0000-0000-0000-000000000031";
+    harnessMock.journal = {
+      runs: [{
+        runId: harnessMock.activeRun,
+        arenaId: "00000000-0000-0000-0000-000000000032",
+        state: "running",
+        startedAt: "2026-07-30T03:00:00Z",
+        latestAt: "2026-07-30T03:15:00Z",
+        arenaStartsAt: "2099-07-30T03:00:00Z",
+        arenaEndsAt: "2099-07-30T03:30:00Z",
+        decisionIntervalSeconds: 900,
+        eventCount: 2,
+        cycleCount: 1,
+        orderCount: 0,
+        fillCount: 0,
+        allReceipted: true,
+      }],
+      selectedRunId: harnessMock.activeRun,
+      events: [
+        {
+          sequence: 1,
+          cycleId,
+          eventType: "proposal",
+          occurredAt: "2026-07-30T03:15:00Z",
+          receipted: true,
+          details: {
+            action: "hold",
+            decision_summary: "Signals conflict across BTC, ETH, and SOL, so the expected edge does not justify an entry.",
+            proposal: null,
+          },
+        },
+        {
+          sequence: 2,
+          cycleId,
+          eventType: "policy_outcome",
+          occurredAt: "2026-07-30T03:15:01Z",
+          receipted: true,
+          details: {
+            allowed: true,
+            action: "hold",
+            reason: "model_abstained",
+            order_submitted: false,
+          },
+        },
+      ],
+    };
+
+    render(<App />);
+    screen.getByRole("button", { name: /Trades/ }).click();
+    expect(await screen.findByRole("heading", { name: "NO TRADE" })).toBeInTheDocument();
+    expect(screen.getByText("HOLD")).toBeInTheDocument();
+    expect(screen.getAllByText("Signals conflict across BTC, ETH, and SOL, so the expected edge does not justify an entry.").length).toBeGreaterThan(0);
+    expect(screen.getByText("WHY NO TRADE")).toBeInTheDocument();
+    expect(screen.getByText("Model abstained; there was no order for local policy or the venue to execute.")).toBeInTheDocument();
+    expect(screen.getByText("DECISION CHAIN RECEIPTED")).toBeInTheDocument();
+  });
+
+  it("labels legacy null proposals honestly instead of inventing model reasoning", () => {
+    const decisions = journalDecisions([{
+      sequence: 1,
+      cycleId: "00000000-0000-0000-0000-000000000040",
+      eventType: "proposal",
+      occurredAt: "2026-07-30T04:15:00Z",
+      receipted: true,
+      details: null,
+    }]);
+    expect(decisions[0].status).toBe("HOLD");
+    expect(decisions[0].summary).toMatch(/older client cycle/i);
+    expect(decisions[0].summary).not.toMatch(/momentum|signal|risk/i);
+  });
+
+  it("distinguishes an inference failure from a model HOLD", () => {
+    const decisions = journalDecisions([{
+      sequence: 1,
+      cycleId: "00000000-0000-0000-0000-000000000041",
+      eventType: "cycle_failed",
+      occurredAt: "2026-07-30T04:30:00Z",
+      receipted: true,
+      details: {
+        stage: "model_decision",
+        reason: "receipt_binding_failed",
+        order_submitted: false,
+      },
+    }]);
+    expect(decisions[0].status).toBe("INFERENCE FAILED");
+    expect(decisions[0].noTradeReason).toMatch(/receipt binding failed/i);
+    expect(decisions[0].summary).not.toMatch(/selected HOLD/i);
   });
 
   it("derives decision windows from the arena schedule and handles every lifecycle state", () => {
