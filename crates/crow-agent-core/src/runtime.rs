@@ -281,12 +281,16 @@ fn validate_decision_summary(
     summary: &str,
     strategy_instructions: &str,
 ) -> Result<String, RuntimeError> {
-    let summary = summary.trim();
+    if summary
+        .chars()
+        .any(|character| character.is_control() && !character.is_whitespace())
+    {
+        return Err(RuntimeError::DecisionSummary);
+    }
+    let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
     let normalized = summary.to_ascii_lowercase();
     let normalized_strategy = strategy_instructions.trim().to_ascii_lowercase();
     if summary.is_empty()
-        || summary.chars().count() > MAX_DECISION_SUMMARY_CHARS
-        || summary.chars().any(char::is_control)
         || [
             "system prompt",
             "strategy instruction",
@@ -304,7 +308,12 @@ fn validate_decision_summary(
     {
         return Err(RuntimeError::DecisionSummary);
     }
-    Ok(summary.to_owned())
+    Ok(summary
+        .chars()
+        .take(MAX_DECISION_SUMMARY_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_owned())
 }
 
 fn validate_receipt(request: &ModelTurnRequest, turn: &InferenceTurn) -> Result<(), RuntimeError> {
@@ -507,7 +516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decision_summary_is_bounded_and_single_line() {
+    async fn decision_summary_rejects_private_or_unsafe_content() {
         #[derive(Debug)]
         struct InvalidSummaryInference;
 
@@ -582,6 +591,37 @@ mod tests {
             ),
             Err(RuntimeError::DecisionSummary)
         ));
+        assert!(matches!(
+            validate_decision_summary(
+                "BTC evidence is mixed.\u{0000}",
+                "Hold when the expected edge is weak."
+            ),
+            Err(RuntimeError::DecisionSummary)
+        ));
+    }
+
+    #[test]
+    fn decision_summary_normalizes_whitespace_and_length() -> Result<(), RuntimeError> {
+        assert_eq!(
+            validate_decision_summary(
+                "  BTC momentum is mixed,\n\tso no compliant entry is justified.  ",
+                "Hold when the expected edge is weak."
+            )?,
+            "BTC momentum is mixed, so no compliant entry is justified."
+        );
+
+        let long_summary = format!("{} tail", "observable market evidence ".repeat(16));
+        let bounded =
+            validate_decision_summary(&long_summary, "Hold when the expected edge is weak.")?;
+        assert_eq!(bounded.chars().count(), MAX_DECISION_SUMMARY_CHARS);
+        assert!(!bounded.contains('\n'));
+        assert!(
+            bounded
+                .chars()
+                .last()
+                .is_some_and(|character| !character.is_whitespace())
+        );
+        Ok(())
     }
 
     fn receipt_for(
