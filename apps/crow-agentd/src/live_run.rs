@@ -144,7 +144,6 @@ pub(crate) async fn run_session(
         return Err(LiveRunError::Configuration);
     }
     let run_id = acquire_run(config, &journal, &api).await?;
-    *active_run.lock().map_err(|_| LiveRunError::State)? = Some(run_id);
     let venue = HyperliquidVenue::connect_testnet(api_wallet_key).await?;
 
     initialize_event_chain(config, run_id, &mut journal, &api, identity).await?;
@@ -186,6 +185,27 @@ pub(crate) async fn run_session(
         .into_iter()
         .map(|book| (book.symbol.clone(), book))
         .collect::<BTreeMap<_, _>>();
+    let resume_after_reconciliation = should_run_after_reconciliation(&journal, run_id)?;
+    let mut recorded_gate = "paused";
+    if resume_after_reconciliation {
+        if !execution_gate.apply(crow_agent_protocol::RemoteAction::Resume)
+            && !execution_gate.is_running()
+        {
+            return Err(LiveRunError::State);
+        }
+        append_lifecycle(
+            &mut journal,
+            &api,
+            identity,
+            manifest.arena_id,
+            run_id,
+            "run_resumed",
+            "automatic_after_reconciliation",
+        )
+        .await?;
+        recorded_gate = "running";
+    }
+    *active_run.lock().map_err(|_| LiveRunError::State)? = Some(run_id);
     let mut lease_tick = tokio::time::interval(Duration::from_secs(10));
     lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut lifecycle_tick = tokio::time::interval(Duration::from_millis(200));
@@ -195,9 +215,12 @@ pub(crate) async fn run_session(
         Duration::from_secs(u64::from(manifest.decision_interval_seconds)),
     );
     cycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut recorded_gate = "paused";
-
-    info!(arena_id = %manifest.arena_id, run_id = %run_id, "live arena session reconciled and fail-closed");
+    info!(
+        arena_id = %manifest.arena_id,
+        run_id = %run_id,
+        execution_state = recorded_gate,
+        "live arena session reconciled"
+    );
     loop {
         tokio::select! {
             _ = lease_tick.tick() => {
@@ -213,7 +236,15 @@ pub(crate) async fn run_session(
                         "stopped" => "run_stopped",
                         _ => return Err(LiveRunError::State),
                     };
-                    append_lifecycle(&mut journal, &api, identity, manifest.arena_id, run_id, event_type).await?;
+                    append_lifecycle(
+                        &mut journal,
+                        &api,
+                        identity,
+                        manifest.arena_id,
+                        run_id,
+                        event_type,
+                        "authenticated_control",
+                    ).await?;
                     recorded_gate = current;
                     if current == "stopped" {
                         journal.delete_secret(&run_id_key(manifest.arena_id))?;
@@ -229,7 +260,15 @@ pub(crate) async fn run_session(
                 // The immutable schedule and durable journal are authoritative:
                 // never begin more cycles than the manifest contains.
                 if completed_cycles >= expected_cycles || OffsetDateTime::now_utc() >= manifest.ends_at {
-                    append_lifecycle(&mut journal, &api, identity, manifest.arena_id, run_id, "run_stopped").await?;
+                    append_lifecycle(
+                        &mut journal,
+                        &api,
+                        identity,
+                        manifest.arena_id,
+                        run_id,
+                        "run_stopped",
+                        "arena_schedule",
+                    ).await?;
                     journal.delete_secret(&run_id_key(manifest.arena_id))?;
                     journal.delete_secret(&lease_key(manifest.arena_id))?;
                     *active_run.lock().map_err(|_| LiveRunError::State)? = None;
@@ -376,17 +415,38 @@ async fn append_lifecycle(
     arena_id: Uuid,
     run_id: Uuid,
     event_type: &str,
+    source: &str,
 ) -> Result<(), LiveRunError> {
     let mut writer = DurableRunEventWriter::new(journal, api, identity, arena_id, run_id);
     writer
-        .append(
-            None,
-            event_type,
-            json!({"source": "authenticated_control"}),
-            &Value::Null,
-        )
+        .append(None, event_type, json!({"source": source}), &Value::Null)
         .await?;
     Ok(())
+}
+
+fn should_run_after_reconciliation(
+    journal: &EncryptedJournal,
+    run_id: Uuid,
+) -> Result<bool, LiveRunError> {
+    let latest = journal
+        .public_events()?
+        .into_iter()
+        .filter(|event| {
+            event.run_id == run_id
+                && matches!(
+                    event.event_type.as_str(),
+                    "run_started" | "run_paused" | "run_resumed" | "run_stopped"
+                )
+        })
+        .max_by_key(|event| event.sequence);
+    Ok(match latest {
+        Some(event) if event.event_type == "run_started" => true,
+        Some(event) if event.event_type == "run_resumed" => true,
+        Some(event) if event.event_type == "run_paused" => {
+            event.payload.get("reason").and_then(Value::as_str) == Some("awaiting_explicit_resume")
+        }
+        _ => false,
+    })
 }
 
 fn duration_until_next_cycle(
@@ -456,6 +516,7 @@ fn unix_milliseconds(value: OffsetDateTime) -> Result<u64, LiveRunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn execution_account_is_strict_hex_address() {
@@ -475,6 +536,73 @@ mod tests {
             "positions": [{"symbol": "BTC", "quantity_e8": -42}]
         })));
         assert!(!fixed_point_value(&json!({"equity": 1.25})));
+    }
+
+    #[test]
+    fn reconciliation_resumes_initial_and_running_states_but_preserves_user_pause()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let identity = DeviceIdentity::generate();
+        let arena_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let mut journal =
+            EncryptedJournal::open(&directory.path().join("journal.db"), [47_u8; 32])?;
+        let started = crow_agent_protocol::RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            None,
+            1,
+            "0".repeat(64),
+            "run_started".into(),
+            OffsetDateTime::now_utc(),
+            json!({}),
+        )?;
+        journal.append(&started, &Value::Null)?;
+        assert!(should_run_after_reconciliation(&journal, run_id)?);
+
+        let initial_hold = crow_agent_protocol::RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            None,
+            2,
+            started.event_sha256.clone(),
+            "run_paused".into(),
+            OffsetDateTime::now_utc(),
+            json!({"reason": "awaiting_explicit_resume"}),
+        )?;
+        journal.append(&initial_hold, &Value::Null)?;
+        assert!(should_run_after_reconciliation(&journal, run_id)?);
+
+        let resumed = crow_agent_protocol::RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            None,
+            3,
+            initial_hold.event_sha256.clone(),
+            "run_resumed".into(),
+            OffsetDateTime::now_utc(),
+            json!({"source": "automatic_after_reconciliation"}),
+        )?;
+        journal.append(&resumed, &Value::Null)?;
+        assert!(should_run_after_reconciliation(&journal, run_id)?);
+
+        let user_pause = crow_agent_protocol::RunEventEnvelopeV1::sign(
+            identity.signing_key(),
+            arena_id,
+            run_id,
+            None,
+            4,
+            resumed.event_sha256.clone(),
+            "run_paused".into(),
+            OffsetDateTime::now_utc(),
+            json!({"source": "authenticated_control"}),
+        )?;
+        journal.append(&user_pause, &Value::Null)?;
+        assert!(!should_run_after_reconciliation(&journal, run_id)?);
+        Ok(())
     }
 
     #[test]

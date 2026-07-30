@@ -545,7 +545,7 @@ export function App() {
       setStatus(next);
       setSelectedArena(null);
       setView("overview");
-      setNotice("Local arena staged and reconciled in pause. Review the run, then Resume.");
+      setNotice("Local arena reconciled and running. The next scheduled decision will execute automatically.");
     } catch (error) {
       setArenaLaunchNotice(arenaLaunchFailure(error));
     } finally {
@@ -951,7 +951,7 @@ export function App() {
                 <div>
                   <p className="meta">JOURNAL CLEAR</p>
                   <h2>No local run evidence yet.</h2>
-                  <p>Stage a paper arena and its paused reconciliation, proposals, policy decisions, orders, fills, funding, and portfolio snapshots will appear here automatically.</p>
+                  <p>Join a paper arena and its reconciliation, proposals, policy decisions, orders, fills, funding, and portfolio snapshots will appear here automatically.</p>
                 </div>
               </article>
             )}
@@ -1037,12 +1037,12 @@ export function App() {
               <i />
               <span className={arenaSetupStep === "venue" ? "active" : ""}><b>02</b> VENUE</span>
               <i />
-              <span><b>03</b> PAUSED</span>
+              <span><b>03</b> RUNNING</span>
             </div>
             <p className="meta">LOCAL ARENA PROVISIONING</p>
             <h2 id="arena-setup-title">{arenaName(selectedArena)}</h2>
             <p className="setup-intro">
-              Strategy plaintext and the venue signing key stay inside this machine. The run starts paused after Crow and Hyperliquid reconciliation.
+              Strategy plaintext and the venue signing key stay inside this machine. After Crow and Hyperliquid reconciliation succeeds, the run starts automatically.
             </p>
             {arenaLaunchNotice ? (
               <div className="setup-error" role="alert">
@@ -1154,7 +1154,7 @@ export function App() {
                 </label>
                 <div className="launch-contract">
                   <span>ON LAUNCH</span>
-                  <p>Enroll one wallet entry, verify the signed arena and encrypted version, bind any explicit handoff snapshot, start the local companion, reconcile positions/fills/funding, and remain paused. Zero orders are permitted until Resume.</p>
+                  <p>Enroll one wallet entry, verify the signed arena and encrypted version, bind any explicit handoff snapshot, start the local companion, reconcile positions/fills/funding, then enter running automatically. Any failed check remains fail-closed with zero orders.</p>
                 </div>
                 <div className="setup-actions">
                   <button type="button" disabled={arenaBusy} onClick={() => setArenaSetupStep("agent")}>Back</button>
@@ -1164,7 +1164,7 @@ export function App() {
                     disabled={arenaBusy || !/^0x[0-9a-fA-F]{40}$/.test(executionAccount)}
                     onClick={() => void launchArena()}
                   >
-                    <span>{arenaBusy ? "Reconciling…" : "I registered it — stage paused"}</span><b>→</b>
+                    <span>{arenaBusy ? "Reconciling…" : "I registered it — join arena"}</span><b>→</b>
                   </button>
                 </div>
               </div>
