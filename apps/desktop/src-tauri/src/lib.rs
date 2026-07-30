@@ -272,6 +272,8 @@ enum DesktopError {
     AgentVersion,
     Arena,
     Venue,
+    VenueAccount,
+    VenueCollateral,
     Journal,
 }
 
@@ -288,6 +290,8 @@ impl DesktopError {
             Self::AgentVersion => "agent_version_invalid",
             Self::Arena => "arena_operation_failed",
             Self::Venue => "hyperliquid_api_wallet_unavailable",
+            Self::VenueAccount => "hyperliquid_account_state_unavailable",
+            Self::VenueCollateral => "hyperliquid_testnet_collateral_required",
             Self::Journal => "local_journal_unavailable",
         }
     }
@@ -1132,6 +1136,16 @@ async fn start_local_arena(
     if !valid_execution_account(&execution_account) {
         return Err(DesktopError::Venue.code().into());
     }
+    let api_wallet_key =
+        load_or_create_hyperliquid_api_wallet_key().map_err(|error| error.code().to_owned())?;
+    let venue = crow_agent_core::HyperliquidVenue::connect_testnet(&api_wallet_key)
+        .await
+        .map_err(|_| DesktopError::VenueAccount.code().to_owned())?;
+    let account = venue
+        .account_snapshot(&execution_account)
+        .await
+        .map_err(|_| DesktopError::VenueAccount.code().to_owned())?;
+    validate_launch_account(&account).map_err(|error| error.code().to_owned())?;
     let arena_id = Uuid::parse_str(&arena_id).map_err(|_| DesktopError::Arena.code().to_owned())?;
     let agent_version_id = Uuid::parse_str(&agent_version_id)
         .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
@@ -1247,6 +1261,13 @@ async fn start_local_arena(
     }
     state.stop_owned_companion();
     Err(DesktopError::Companion.code().into())
+}
+
+fn validate_launch_account(account: &crow_agent_core::AccountSnapshot) -> Result<(), DesktopError> {
+    if account.equity_micro_usdc <= 0 || account.withdrawable_micro_usdc <= 0 {
+        return Err(DesktopError::VenueCollateral);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1952,6 +1973,26 @@ mod tests {
         reserve_companion_slot(&spawned);
         assert!(!claim_companion_slot(&spawned));
         assert!(spawned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn arena_launch_requires_positive_verified_collateral() {
+        let account = crow_agent_core::AccountSnapshot {
+            venue_time_ms: 1,
+            equity_micro_usdc: 1_001_473_289,
+            withdrawable_micro_usdc: 1_001_473_289,
+            positions: BTreeMap::new(),
+        };
+        assert!(validate_launch_account(&account).is_ok());
+        let empty = crow_agent_core::AccountSnapshot {
+            equity_micro_usdc: 0,
+            withdrawable_micro_usdc: 0,
+            ..account
+        };
+        assert!(matches!(
+            validate_launch_account(&empty),
+            Err(DesktopError::VenueCollateral)
+        ));
     }
 
     #[test]

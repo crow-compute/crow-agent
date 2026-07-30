@@ -4,7 +4,6 @@ import {
   beginDeviceAuthorization,
   completeDeviceAuthorization,
   createAgentVersion,
-  enrollArena,
   getAgentVersions,
   getAgentStatus,
   getLocalRunJournal,
@@ -263,9 +262,13 @@ export function arenaLaunchFailure(error: unknown) {
     case "arena_operation_failed":
       return "Crow rejected the enrollment or immutable arena prerequisite. No order was submitted.";
     case "local_companion_unavailable":
-      return "The signed local companion did not reach a paused reconciled run. No order was submitted.";
+      return "The signed local companion exited before reconciliation. No order was submitted.";
     case "hyperliquid_api_wallet_unavailable":
       return "The Hyperliquid execution account or local API wallet is unavailable.";
+    case "hyperliquid_account_state_unavailable":
+      return "Crow could not verify this Hyperliquid Testnet account's abstraction mode and collateral. Confirm the master account address and retry.";
+    case "hyperliquid_testnet_collateral_required":
+      return "This Hyperliquid Testnet account has no available trading collateral. Unified-account USDC is supported; no Spot-to-Perps transfer is required.";
     default:
       return "Arena launch failed closed. No order was submitted.";
   }
@@ -535,7 +538,6 @@ export function App() {
     setNotice(null);
     try {
       const parsedHandoff = parseHandoffSnapshot(handoffSnapshot);
-      await enrollArena(selectedArena.id, version.id, version.modelId);
       const next = await startLocalArena(
         selectedArena.id,
         version.id,

@@ -7,8 +7,9 @@ use hypersdk::{
         self, CandleInterval, Cloid, HttpClient, NonceHandler, PerpMarket, PrivateKeySigner,
         WebSocket,
         types::{
-            BatchCancel, BatchOrder, Cancel, Incoming, OrderGrouping, OrderRequest,
-            OrderResponseStatus, OrderTypePlacement, PerpAssetCtx, Subscription, TimeInForce,
+            AbstractionMode, BatchCancel, BatchOrder, Cancel, Incoming, OrderGrouping,
+            OrderRequest, OrderResponseStatus, OrderTypePlacement, PerpAssetCtx, Subscription,
+            TimeInForce, UserBalance,
         },
         ws::Event,
     },
@@ -26,7 +27,9 @@ use zeroize::Zeroizing;
 const REST_WEIGHT_PER_MINUTE: u16 = 1_000;
 const INFO_META_WEIGHT: u16 = 20;
 const INFO_L2_WEIGHT: u16 = 2;
-const INFO_USER_WEIGHT: u16 = 20;
+const INFO_USER_MODE_WEIGHT: u16 = 20;
+const INFO_ACCOUNT_STATE_WEIGHT: u16 = 2;
+const INFO_USER_HISTORY_WEIGHT: u16 = 20;
 const INFO_CANDLE_WEIGHT: u16 = 20;
 
 #[derive(Debug, Error)]
@@ -285,7 +288,13 @@ impl HyperliquidVenue {
         execution_account: &str,
     ) -> Result<AccountSnapshot, HyperliquidError> {
         let account = parse_account(execution_account)?;
-        self.budget.consume(INFO_USER_WEIGHT)?;
+        self.budget
+            .consume(INFO_USER_MODE_WEIGHT + INFO_ACCOUNT_STATE_WEIGHT * 2)?;
+        let abstraction_mode = self
+            .client
+            .abstraction_mode(account)
+            .await
+            .map_err(|_| HyperliquidError::Snapshot)?;
         let state = self
             .client
             .clearinghouse_state(account, None)
@@ -313,10 +322,27 @@ impl HyperliquidVenue {
             };
             positions.insert(position.coin, snapshot);
         }
+        // Hyperliquid exposes unified-account and portfolio-margin balances and
+        // holds through spotClearinghouseState; their per-DEX margin summaries
+        // are not a valid source of account collateral.
+        let spot_balances = if abstraction_mode.is_standard() {
+            Vec::new()
+        } else {
+            self.client
+                .user_balances(account)
+                .await
+                .map_err(|_| HyperliquidError::Snapshot)?
+        };
+        let (equity_micro_usdc, withdrawable_micro_usdc) = account_collateral(
+            abstraction_mode,
+            state.margin_summary.account_value,
+            state.withdrawable,
+            &spot_balances,
+        )?;
         Ok(AccountSnapshot {
             venue_time_ms: state.time,
-            equity_micro_usdc: decimal_to_fixed(state.margin_summary.account_value, 6)?,
-            withdrawable_micro_usdc: decimal_to_fixed(state.withdrawable, 6)?,
+            equity_micro_usdc,
+            withdrawable_micro_usdc,
             positions,
         })
     }
@@ -439,7 +465,7 @@ impl HyperliquidVenue {
         end_time_ms: u64,
     ) -> Result<Value, HyperliquidError> {
         let account = parse_account(execution_account)?;
-        self.budget.consume(INFO_USER_WEIGHT)?;
+        self.budget.consume(INFO_USER_HISTORY_WEIGHT)?;
         let fills = self
             .client
             .user_fills_by_time(account, start_time_ms, Some(end_time_ms))
@@ -458,7 +484,7 @@ impl HyperliquidVenue {
         end_time_ms: u64,
     ) -> Result<Value, HyperliquidError> {
         let account = parse_account(execution_account)?;
-        self.budget.consume(INFO_USER_WEIGHT)?;
+        self.budget.consume(INFO_USER_HISTORY_WEIGHT)?;
         let funding = self
             .client
             .user_funding(account, start_time_ms, Some(end_time_ms))
@@ -685,6 +711,31 @@ fn decimal_to_fixed(value: Decimal, scale: u8) -> Result<i64, HyperliquidError> 
     decimal_string_to_fixed(&value.normalize().to_string(), scale)
 }
 
+fn account_collateral(
+    mode: AbstractionMode,
+    standard_equity: Decimal,
+    standard_withdrawable: Decimal,
+    spot_balances: &[UserBalance],
+) -> Result<(i64, i64), HyperliquidError> {
+    if mode.is_standard() {
+        return Ok((
+            decimal_to_fixed(standard_equity, 6)?,
+            decimal_to_fixed(standard_withdrawable, 6)?,
+        ));
+    }
+    let usdc = spot_balances
+        .iter()
+        .find(|balance| balance.coin == "USDC")
+        .ok_or(HyperliquidError::Snapshot)?;
+    if usdc.total.is_sign_negative() || usdc.hold.is_sign_negative() || usdc.hold > usdc.total {
+        return Err(HyperliquidError::Snapshot);
+    }
+    Ok((
+        decimal_to_fixed(usdc.total, 6)?,
+        decimal_to_fixed(usdc.available(), 6)?,
+    ))
+}
+
 fn decimal_string_to_fixed(value: &str, scale: u8) -> Result<i64, HyperliquidError> {
     let negative = value.starts_with('-');
     let unsigned = value.strip_prefix('-').unwrap_or(value);
@@ -767,5 +818,62 @@ mod tests {
             }
         ));
         Ok(())
+    }
+
+    #[test]
+    fn standard_account_uses_only_perpetual_collateral() -> Result<(), HyperliquidError> {
+        let spot = serde_json::from_value::<UserBalance>(json!({
+            "coin": "USDC",
+            "token": 0,
+            "hold": "1.0",
+            "total": "1001.473289",
+            "entryNtl": "0.0"
+        }))
+        .map_err(|_| HyperliquidError::Snapshot)?;
+        assert_eq!(
+            account_collateral(
+                AbstractionMode::Standard,
+                "25.5".parse().map_err(|_| HyperliquidError::Numeric)?,
+                "20.25".parse().map_err(|_| HyperliquidError::Numeric)?,
+                &[spot],
+            )?,
+            (25_500_000, 20_250_000)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unified_account_uses_verified_usdc_total_and_available() -> Result<(), HyperliquidError> {
+        let spot = serde_json::from_value::<UserBalance>(json!({
+            "coin": "USDC",
+            "token": 0,
+            "hold": "1.0",
+            "total": "1001.473289",
+            "entryNtl": "0.0"
+        }))
+        .map_err(|_| HyperliquidError::Snapshot)?;
+        assert_eq!(
+            account_collateral(
+                AbstractionMode::UnifiedAccount,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                &[spot],
+            )?,
+            (1_001_473_289, 1_000_473_289)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unified_account_fails_closed_without_valid_usdc() {
+        assert!(matches!(
+            account_collateral(
+                AbstractionMode::UnifiedAccount,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                &[],
+            ),
+            Err(HyperliquidError::Snapshot)
+        ));
     }
 }
