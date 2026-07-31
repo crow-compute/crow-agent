@@ -55,6 +55,8 @@ pub struct RiskRulesV1 {
     pub max_order_bps: u16,
     pub max_position_bps: u16,
     pub max_spread_bps: u16,
+    /// Backward-compatible signed manifest field. Local execution does not use
+    /// mark/oracle divergence as an order-approval gate.
     pub max_oracle_gap_bps: u16,
     pub book_max_age_seconds: u16,
     pub max_orders_day: u16,
@@ -91,7 +93,6 @@ impl RiskRulesV1 {
             && self.max_order_bps <= ceiling.max_order_bps
             && self.max_position_bps <= ceiling.max_position_bps
             && self.max_spread_bps <= ceiling.max_spread_bps
-            && self.max_oracle_gap_bps <= ceiling.max_oracle_gap_bps
             && self.book_max_age_seconds <= ceiling.book_max_age_seconds
             && self.max_orders_day <= ceiling.max_orders_day
             && self.isolated_leverage == 1
@@ -1034,6 +1035,18 @@ mod tests {
             penalties: PenaltyRulesV1::default(),
             ticket: TicketConfigV1::default(),
         }
+    }
+
+    #[test]
+    fn oracle_gap_field_is_signature_compatible_not_a_ceiling() -> Result<(), ProtocolError> {
+        let mut rules = RiskRulesV1 {
+            max_oracle_gap_bps: u16::MAX,
+            ..RiskRulesV1::default()
+        };
+        rules.validate_ceiling()?;
+        rules.max_spread_bps = RiskRulesV1::default().max_spread_bps + 1;
+        assert!(rules.validate_ceiling().is_err());
+        Ok(())
     }
 
     #[test]
