@@ -584,6 +584,13 @@ export function App() {
   }, [view, status.deviceAuthorized, status.activeRun, journal.selectedRunId]);
 
   useEffect(() => {
+    if (!status.activeRun) return;
+    setJournal((current) => current.selectedRunId === status.activeRun
+      ? current
+      : { ...current, selectedRunId: status.activeRun });
+  }, [status.activeRun]);
+
+  useEffect(() => {
     if (view !== "runs") return;
     setClockNow(Date.now());
     const interval = window.setInterval(() => setClockNow(Date.now()), 1_000);

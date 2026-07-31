@@ -440,6 +440,62 @@ describe("Crow Agent shell", () => {
     expect(screen.getByRole("timer")).toHaveAccessibleName("ARENA STARTS IN: 00:01");
   });
 
+  it("follows a newly active run instead of retaining a stopped selection", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse("2026-07-31T06:10:00Z"));
+    harnessMock.authorized = true;
+    harnessMock.daemon = "running";
+    const stoppedRun = "00000000-0000-0000-0000-000000000040";
+    const activeRun = "00000000-0000-0000-0000-000000000041";
+    harnessMock.activeRun = activeRun;
+    harnessMock.journal = {
+      runs: [
+        {
+          runId: activeRun,
+          arenaId: "00000000-0000-0000-0000-000000000042",
+          state: "running",
+          startedAt: "2026-07-31T05:48:41Z",
+          latestAt: "2026-07-31T06:00:42Z",
+          arenaStartsAt: "2026-07-31T06:00:00Z",
+          arenaEndsAt: "2026-07-31T06:30:00Z",
+          decisionIntervalSeconds: 900,
+          eventCount: 17,
+          cycleCount: 1,
+          orderCount: 0,
+          fillCount: 0,
+          allReceipted: true,
+        },
+        {
+          runId: stoppedRun,
+          arenaId: "00000000-0000-0000-0000-000000000043",
+          state: "stopped",
+          startedAt: "2026-07-31T05:30:00Z",
+          latestAt: "2026-07-31T05:45:14Z",
+          arenaStartsAt: "2026-07-31T05:30:00Z",
+          arenaEndsAt: "2026-07-31T06:30:00Z",
+          decisionIntervalSeconds: 900,
+          eventCount: 15,
+          cycleCount: 1,
+          orderCount: 0,
+          fillCount: 0,
+          allReceipted: true,
+        },
+      ],
+      selectedRunId: stoppedRun,
+      events: [],
+    };
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      screen.getByRole("button", { name: /Trades/ }).click();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(screen.getByLabelText("Paper run")).toHaveValue(activeRun);
+    expect(screen.getByRole("timer")).toHaveAccessibleName("NEXT DECISION: 05:00");
+  });
+
   it("refreshes the arena catalog without restarting or reopening the credential vault", async () => {
     vi.useFakeTimers();
     render(<App />);
