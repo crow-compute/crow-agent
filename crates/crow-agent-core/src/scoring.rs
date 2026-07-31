@@ -39,8 +39,8 @@ pub struct ScoredRun {
 #[must_use]
 pub fn score_runs(
     runs: &[RunScoreInput],
-    weights: &ScoringWeightsV1,
-    penalties: &PenaltyRulesV1,
+    _weights: &ScoringWeightsV1,
+    _penalties: &PenaltyRulesV1,
 ) -> Vec<ScoredRun> {
     let eligible = runs
         .iter()
@@ -68,36 +68,16 @@ pub fn score_runs(
                     .collect::<Vec<_>>(),
                 run.net_return_micros,
             );
-            let sortino = percentile(
-                &eligible
-                    .iter()
-                    .map(|candidate| candidate.sortino_micros)
-                    .collect::<Vec<_>>(),
-                run.sortino_micros,
-            );
-            let inverse_drawdown = percentile(
-                &eligible
-                    .iter()
-                    .map(|candidate| -candidate.max_drawdown_micros)
-                    .collect::<Vec<_>>(),
-                -run.max_drawdown_micros,
-            );
-            let weighted = (i64::from(weights.net_return) * net
-                + i64::from(weights.sortino) * sortino
-                + i64::from(weights.inverse_drawdown) * inverse_drawdown)
-                / 1_000;
-            let penalty = (i64::from(run.policy_rejections)
-                * i64::from(penalties.policy_rejection_millis)
-                + i64::from(run.missed_cycles) * i64::from(penalties.missed_cycle_millis))
-            .min(i64::from(penalties.cap_millis));
             ScoredRun {
                 run_id: run.run_id,
                 rank: None,
-                score_millis: (weighted - penalty).clamp(0, MAX_SCORE_MILLIS),
+                // Compatibility score mirrors the P&L percentile. Rank is determined
+                // directly by net P&L, never by configurable weights or penalties.
+                score_millis: (net / 10).clamp(0, MAX_SCORE_MILLIS),
                 net_return_percentile_micros: net,
-                sortino_percentile_micros: sortino,
-                inverse_drawdown_percentile_micros: inverse_drawdown,
-                penalty_millis: penalty,
+                sortino_percentile_micros: 0,
+                inverse_drawdown_percentile_micros: 0,
+                penalty_millis: 0,
                 disqualified_reason: None,
             }
         })
@@ -118,19 +98,9 @@ pub fn score_runs(
         }
         let left_input = inputs[&left.run_id];
         let right_input = inputs[&right.run_id];
-        right
-            .score_millis
-            .cmp(&left.score_millis)
-            .then_with(|| {
-                left_input
-                    .max_drawdown_micros
-                    .cmp(&right_input.max_drawdown_micros)
-            })
-            .then_with(|| {
-                right_input
-                    .net_return_micros
-                    .cmp(&left_input.net_return_micros)
-            })
+        right_input
+            .net_return_micros
+            .cmp(&left_input.net_return_micros)
             .then_with(|| left.run_id.to_string().cmp(&right.run_id.to_string()))
     });
     let mut rank = 1_u32;
@@ -223,7 +193,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scores_are_deterministic_and_penalized() {
+    fn scores_and_ranks_are_pnl_only() {
         let first = Uuid::from_u128(1);
         let second = Uuid::from_u128(2);
         let scored = score_runs(
@@ -253,6 +223,7 @@ mod tests {
         assert_eq!(scored[0].score_millis, 100_000);
         assert_eq!(scored[0].rank, Some(1));
         assert_eq!(scored[1].score_millis, 0);
+        assert_eq!(scored[1].penalty_millis, 0);
     }
 
     #[test]
@@ -280,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn ties_use_drawdown_then_return_then_lexical_run_id() {
+    fn pnl_ties_use_lexical_run_id_only() {
         let best_drawdown = Uuid::from_u128(3);
         let lexical_first = Uuid::from_u128(1);
         let lexical_second = Uuid::from_u128(2);
@@ -319,7 +290,7 @@ mod tests {
         );
         assert_eq!(
             scored.iter().map(|run| run.run_id).collect::<Vec<_>>(),
-            vec![best_drawdown, lexical_first, lexical_second]
+            vec![lexical_first, lexical_second, best_drawdown]
         );
     }
 

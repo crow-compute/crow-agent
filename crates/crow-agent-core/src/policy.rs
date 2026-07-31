@@ -50,6 +50,9 @@ pub struct PolicyContext<'a> {
     pub rules: &'a RiskRulesV1,
     pub market: &'a MarketState,
     pub portfolio: &'a PortfolioState,
+    /// Equal arena capital chosen by the host. Wallet equity above this amount
+    /// cannot increase order or position sizing.
+    pub starting_capital_micro_usdc: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,8 +78,6 @@ pub enum PolicyError {
     StaleBook,
     #[error("spread exceeds arena policy")]
     Spread,
-    #[error("long-only policy rejected a non-reducing sell")]
-    LongOnly,
     #[error("reduce-only order would increase or exceed the current position")]
     ReduceOnly,
     #[error("daily loss limit reached")]
@@ -105,6 +106,9 @@ pub fn evaluate_proposal(
     let rules = context.rules;
     let market = context.market;
     let portfolio = context.portfolio;
+    let capital = portfolio
+        .equity_micro_usdc
+        .min(context.starting_capital_micro_usdc);
     if !ALLOWED_SYMBOLS.contains(&proposal.symbol.as_str()) || proposal.symbol != market.symbol {
         return Err(PolicyError::Symbol);
     }
@@ -113,6 +117,7 @@ pub fn evaluate_proposal(
         || proposal.limit_price_micro_usdc <= 0
         || market.size_decimals > 8
         || portfolio.equity_micro_usdc <= 0
+        || capital <= 0
     {
         return Err(PolicyError::Market);
     }
@@ -124,15 +129,6 @@ pub fn evaluate_proposal(
     }
     if market.spread_bps > rules.max_spread_bps {
         return Err(PolicyError::Spread);
-    }
-    if proposal.side == Side::Sell && rules.long_only && !proposal.reduce_only {
-        return Err(PolicyError::LongOnly);
-    }
-    if rules.long_only
-        && portfolio.symbol_position_micro_usdc < 0
-        && !(proposal.side == Side::Buy && proposal.reduce_only)
-    {
-        return Err(PolicyError::LongOnly);
     }
     let reduces_position = match proposal.side {
         Side::Buy => portfolio.symbol_position_micro_usdc < 0,
@@ -159,10 +155,7 @@ pub fn evaluate_proposal(
         return Err(PolicyError::OrderLimit);
     }
 
-    let requested = bps_amount(
-        portfolio.equity_micro_usdc,
-        i64::from(proposal.notional_bps),
-    )?;
+    let requested = bps_amount(capital, i64::from(proposal.notional_bps))?;
     let normalized = requested.max(MIN_ORDER_MICRO_USDC);
     let raw_quantity = ceil_div(
         i128::from(normalized) * i128::from(QUANTITY_SCALE),
@@ -180,7 +173,7 @@ pub fn evaluate_proposal(
             / i128::from(QUANTITY_SCALE),
     )
     .map_err(|_| PolicyError::Overflow)?;
-    if actual_notional > bps_amount(portfolio.equity_micro_usdc, i64::from(rules.max_order_bps))? {
+    if actual_notional > bps_amount(capital, i64::from(rules.max_order_bps))? {
         return Err(PolicyError::OrderSize);
     }
     if !proposal.reduce_only {
@@ -194,11 +187,8 @@ pub fn evaluate_proposal(
         }
         .ok_or(PolicyError::Overflow)?;
         if projected_position.unsigned_abs()
-            > u64::try_from(bps_amount(
-                portfolio.equity_micro_usdc,
-                i64::from(rules.max_position_bps),
-            )?)
-            .map_err(|_| PolicyError::Overflow)?
+            > u64::try_from(bps_amount(capital, i64::from(rules.max_position_bps))?)
+                .map_err(|_| PolicyError::Overflow)?
         {
             return Err(PolicyError::PositionSize);
         }
@@ -209,10 +199,7 @@ pub fn evaluate_proposal(
     {
         return Err(PolicyError::ReduceOnly);
     }
-    let reserve = bps_amount(
-        portfolio.equity_micro_usdc,
-        i64::from(rules.cash_reserve_bps),
-    )?;
+    let reserve = bps_amount(capital, i64::from(rules.cash_reserve_bps))?;
     if !proposal.reduce_only
         && portfolio
             .available_collateral_micro_usdc
@@ -229,10 +216,7 @@ pub fn evaluate_proposal(
     if actual_notional > available_depth {
         return Err(PolicyError::Depth);
     }
-    let effective_bps = ceil_div(
-        i128::from(actual_notional) * 10_000,
-        i128::from(portfolio.equity_micro_usdc),
-    )?;
+    let effective_bps = ceil_div(i128::from(actual_notional) * 10_000, i128::from(capital))?;
     Ok(OrderDecision {
         symbol: proposal.symbol.clone(),
         side: proposal.side,
@@ -289,6 +273,7 @@ mod tests {
             rules,
             market,
             portfolio,
+            starting_capital_micro_usdc: portfolio.equity_micro_usdc,
         }
     }
 
@@ -330,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_reducing_sell() {
+    fn accepts_owner_strategy_short_open() -> Result<(), PolicyError> {
         let rules = RiskRulesV1::default();
         let market = MarketState {
             symbol: "BTC".into(),
@@ -361,7 +346,49 @@ mod tests {
             },
             &context(&rules, &market, &portfolio),
         );
-        assert_eq!(result, Err(PolicyError::LongOnly));
+        assert_eq!(result?.side, Side::Sell);
+        Ok(())
+    }
+
+    #[test]
+    fn arena_capital_caps_owner_order_sizing() -> Result<(), PolicyError> {
+        let rules = RiskRulesV1::default();
+        let market = MarketState {
+            symbol: "BTC".into(),
+            mark_price_micro_usdc: 50_000_000_000,
+            oracle_price_micro_usdc: 50_000_000_000,
+            spread_bps: 1,
+            book_age_seconds: 1,
+            ask_depth_micro_usdc: 1_000_000_000,
+            bid_depth_micro_usdc: 1_000_000_000,
+            size_decimals: 5,
+            delisted: false,
+        };
+        let portfolio = PortfolioState {
+            equity_micro_usdc: 10_000_000_000,
+            available_collateral_micro_usdc: 10_000_000_000,
+            trading_day_start_equity_micro_usdc: 10_000_000_000,
+            peak_equity_micro_usdc: 10_000_000_000,
+            symbol_position_micro_usdc: 0,
+            orders_today: 0,
+        };
+        let order = evaluate_proposal(
+            &Proposal {
+                symbol: "BTC".into(),
+                side: Side::Sell,
+                notional_bps: 200,
+                limit_price_micro_usdc: market.mark_price_micro_usdc,
+                reduce_only: false,
+            },
+            &PolicyContext {
+                rules: &rules,
+                market: &market,
+                portfolio: &portfolio,
+                starting_capital_micro_usdc: 1_000_000_000,
+            },
+        )?;
+        assert_eq!(order.actual_notional_micro_usdc, 20_000_000);
+        Ok(())
     }
 
     #[test]
@@ -437,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn inherited_short_can_only_be_reduced_by_a_reduce_only_buy() {
+    fn inherited_short_can_be_reduced_or_increased_by_owner_strategy() {
         let rules = RiskRulesV1::default();
         let market = MarketState {
             symbol: "BTC".into(),
@@ -470,9 +497,6 @@ mod tests {
             reduce_only: false,
             ..reducing
         };
-        assert_eq!(
-            evaluate_proposal(&increasing, &context(&rules, &market, &portfolio)),
-            Err(PolicyError::LongOnly)
-        );
+        assert!(evaluate_proposal(&increasing, &context(&rules, &market, &portfolio)).is_ok());
     }
 }

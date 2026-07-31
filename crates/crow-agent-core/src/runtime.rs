@@ -253,6 +253,10 @@ where
                         rules: &context.manifest.risk_rules,
                         market,
                         portfolio,
+                        starting_capital_micro_usdc: i64::try_from(
+                            context.manifest.starting_capital_micro_usdc,
+                        )
+                        .unwrap_or(i64::MAX),
                     },
                 );
                 return Ok(CycleOutcome {
@@ -677,6 +681,7 @@ mod tests {
             eligible_models: vec![ALLOWED_MODELS[0].into()],
             dataset_sha256: None,
             required_client_version: "0.1.0".into(),
+            starting_capital_micro_usdc: crow_agent_protocol::DEFAULT_STARTING_CAPITAL_MICRO_USDC,
             risk_rules: RiskRulesV1::default(),
             execution: ExecutionAssumptionsV1 {
                 half_spread_bps: 2,

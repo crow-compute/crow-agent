@@ -126,6 +126,7 @@ impl BacktestEngine {
                 rules: &self.rules,
                 market: &market,
                 portfolio,
+                starting_capital_micro_usdc: portfolio.equity_micro_usdc,
             },
         )?;
         let fee = i64::try_from(
