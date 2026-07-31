@@ -12,6 +12,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const HARNESS_PROTOCOL_V1: &str = "crow.harness.v1";
+pub const DEFAULT_STARTING_CAPITAL_MICRO_USDC: u64 = 1_000_000_000;
+pub const MIN_STARTING_CAPITAL_MICRO_USDC: u64 = 500_000_000;
+pub const MAX_STARTING_CAPITAL_MICRO_USDC: u64 = 1_000_000_000_000;
 pub const DATASET_SOURCE_V1: &str = "hyperliquid-mainnet-info-v1";
 pub const ALLOWED_SYMBOLS: [&str; 3] = ["BTC", "ETH", "SOL"];
 pub const ALLOWED_MODELS: [&str; 3] = [
@@ -78,7 +81,8 @@ impl Default for RiskRulesV1 {
             book_max_age_seconds: 10,
             max_orders_day: 20,
             isolated_leverage: 1,
-            long_only: true,
+            // Compatibility field only. Owner strategies may trade both directions.
+            long_only: false,
             ioc_only: true,
         }
     }
@@ -96,7 +100,6 @@ impl RiskRulesV1 {
             && self.book_max_age_seconds <= ceiling.book_max_age_seconds
             && self.max_orders_day <= ceiling.max_orders_day
             && self.isolated_leverage == 1
-            && self.long_only
             && self.ioc_only;
         if valid {
             Ok(())
@@ -118,28 +121,18 @@ pub struct ScoringWeightsV1 {
 impl Default for ScoringWeightsV1 {
     fn default() -> Self {
         Self {
-            net_return: 50,
-            sortino: 30,
-            inverse_drawdown: 20,
+            net_return: 100,
+            sortino: 0,
+            inverse_drawdown: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PenaltyRulesV1 {
     pub policy_rejection_millis: u32,
     pub missed_cycle_millis: u32,
     pub cap_millis: u32,
-}
-
-impl Default for PenaltyRulesV1 {
-    fn default() -> Self {
-        Self {
-            policy_rejection_millis: 1_000,
-            missed_cycle_millis: 250,
-            cap_millis: 15_000,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +182,8 @@ pub struct ArenaManifestV1 {
     pub eligible_models: Vec<String>,
     pub dataset_sha256: Option<String>,
     pub required_client_version: String,
+    #[serde(default = "default_starting_capital_micro_usdc")]
+    pub starting_capital_micro_usdc: u64,
     pub risk_rules: RiskRulesV1,
     pub execution: ExecutionAssumptionsV1,
     pub scoring: ScoringWeightsV1,
@@ -211,6 +206,13 @@ impl ArenaManifestV1 {
         if self.decision_interval_seconds != 900 {
             return Err(ProtocolError::InvalidManifest(
                 "v1 arenas require a 15-minute cadence".into(),
+            ));
+        }
+        if !(MIN_STARTING_CAPITAL_MICRO_USDC..=MAX_STARTING_CAPITAL_MICRO_USDC)
+            .contains(&self.starting_capital_micro_usdc)
+        {
+            return Err(ProtocolError::InvalidManifest(
+                "starting capital must be between 500 and 1,000,000 USDC".into(),
             ));
         }
         if self.symbols != ALLOWED_SYMBOLS.map(str::to_owned) {
@@ -256,6 +258,10 @@ impl ArenaManifestV1 {
         }
         self.risk_rules.validate_ceiling()
     }
+}
+
+const fn default_starting_capital_micro_usdc() -> u64 {
+    DEFAULT_STARTING_CAPITAL_MICRO_USDC
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1025,6 +1031,7 @@ mod tests {
             eligible_models: vec![ALLOWED_MODELS[0].into()],
             dataset_sha256: Some("a".repeat(64)),
             required_client_version: "0.1.0".into(),
+            starting_capital_micro_usdc: DEFAULT_STARTING_CAPITAL_MICRO_USDC,
             risk_rules: RiskRulesV1::default(),
             execution: ExecutionAssumptionsV1 {
                 half_spread_bps: 2,

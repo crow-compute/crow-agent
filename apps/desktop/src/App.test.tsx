@@ -198,6 +198,22 @@ describe("Crow Agent shell", () => {
             }],
           },
         },
+        {
+          sequence: 7,
+          cycleId: null,
+          eventType: "funding",
+          occurredAt: "2026-07-30T01:15:01Z",
+          receipted: true,
+          details: { source: "session_reconciliation", funding: [{ coin: "BTC" }] },
+        },
+        {
+          sequence: 8,
+          cycleId: null,
+          eventType: "fill",
+          occurredAt: "2026-07-30T01:15:02Z",
+          receipted: true,
+          details: { source: "session_reconciliation", fills: [{ coin: "ETH" }] },
+        },
       ],
     };
 
@@ -213,6 +229,8 @@ describe("Crow Agent shell", () => {
     expect(screen.getAllByText("FILLED").length).toBeGreaterThan(0);
     expect(screen.getByRole("heading", { name: "Activity log" })).toBeInTheDocument();
     expect(screen.getByText("BTC fill")).toBeInTheDocument();
+    expect(screen.queryByText("ETH fill")).not.toBeInTheDocument();
+    expect(screen.queryByText("FUNDING")).not.toBeInTheDocument();
     expect(screen.queryByRole("group", { name: "Trade journal filter" })).not.toBeInTheDocument();
     expect(screen.queryByText("CHAIN RECEIPTED")).not.toBeInTheDocument();
     expect(screen.queryByText("Cycles")).not.toBeInTheDocument();

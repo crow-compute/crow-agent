@@ -51,10 +51,19 @@ const studioActivityEventTypes = new Set([
   "order_submitted",
   "venue_acknowledgement",
   "fill",
-  "funding",
   "cycle_failed",
   "cycle_missed",
 ]);
+
+function isAgentActivity(event: LocalRunEvent) {
+  if (!studioActivityEventTypes.has(event.eventType)) return false;
+  const source = journalObject(event.details)?.source;
+  if (source === "session_reconciliation") return false;
+  if (["policy_outcome", "order_submitted", "venue_acknowledgement", "fill"].includes(event.eventType)) {
+    return Boolean(event.cycleId);
+  }
+  return true;
+}
 
 function shortId(value: string) {
   return `${value.slice(0, 7)}…${value.slice(-5)}`;
@@ -301,7 +310,6 @@ function activityAction(event: LocalRunEvent) {
     return journalObject(event.details)?.allowed === false ? "BLOCKED" : "POLICY";
   }
   if (event.eventType === "fill") return "FILL";
-  if (event.eventType === "funding") return "FUNDING";
   if (event.eventType === "cycle_failed") return "FAILED";
   if (event.eventType === "cycle_missed") return "MISSED";
   return eventName(event.eventType);
@@ -783,7 +791,7 @@ export function App() {
   const studioPortfolio = useMemo(() => latestStudioPortfolio(journal.events), [journal.events]);
   const studioActivity = useMemo(
     () => [...journal.events]
-      .filter((event) => studioActivityEventTypes.has(event.eventType))
+      .filter(isAgentActivity)
       .reverse(),
     [journal.events],
   );
@@ -1208,7 +1216,7 @@ export function App() {
                   <section className="studio-panel studio-activity" aria-label="Activity log">
                     <header>
                       <div>
-                        <span className="studio-label">Decisions · orders · fills · policy</span>
+                        <span className="studio-label">Agent decisions · orders · fills</span>
                         <h2>Activity log</h2>
                       </div>
                       <span>{journalBusy ? "Updating…" : "Live"}</span>

@@ -2236,6 +2236,7 @@ mod tests {
             eligible_models: vec![crow_agent_protocol::ALLOWED_MODELS[0].into()],
             dataset_sha256: None,
             required_client_version: "0.1.14".into(),
+            starting_capital_micro_usdc: crow_agent_protocol::DEFAULT_STARTING_CAPITAL_MICRO_USDC,
             risk_rules: crow_agent_protocol::RiskRulesV1::default(),
             execution: crow_agent_protocol::ExecutionAssumptionsV1 {
                 half_spread_bps: 2,
