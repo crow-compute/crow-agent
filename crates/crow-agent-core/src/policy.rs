@@ -75,8 +75,6 @@ pub enum PolicyError {
     StaleBook,
     #[error("spread exceeds arena policy")]
     Spread,
-    #[error("mark/oracle divergence exceeds arena policy")]
-    OracleGap,
     #[error("long-only policy rejected a non-reducing sell")]
     LongOnly,
     #[error("reduce-only order would increase or exceed the current position")]
@@ -126,10 +124,6 @@ pub fn evaluate_proposal(
     }
     if market.spread_bps > rules.max_spread_bps {
         return Err(PolicyError::Spread);
-    }
-    let oracle_gap = bps_difference(market.mark_price_micro_usdc, market.oracle_price_micro_usdc)?;
-    if oracle_gap > i64::from(rules.max_oracle_gap_bps) {
-        return Err(PolicyError::OracleGap);
     }
     if proposal.side == Side::Sell && rules.long_only && !proposal.reduce_only {
         return Err(PolicyError::LongOnly);
@@ -368,6 +362,43 @@ mod tests {
             &context(&rules, &market, &portfolio),
         );
         assert_eq!(result, Err(PolicyError::LongOnly));
+    }
+
+    #[test]
+    fn accepts_mark_oracle_divergence_as_strategy_evidence() -> Result<(), PolicyError> {
+        let rules = RiskRulesV1::default();
+        let market = MarketState {
+            symbol: "BTC".into(),
+            mark_price_micro_usdc: 60_000_000_000,
+            oracle_price_micro_usdc: 45_000_000_000,
+            spread_bps: 2,
+            book_age_seconds: 1,
+            ask_depth_micro_usdc: 1_000_000_000,
+            bid_depth_micro_usdc: 1_000_000_000,
+            size_decimals: 5,
+            delisted: false,
+        };
+        let portfolio = PortfolioState {
+            equity_micro_usdc: 1_000_000_000,
+            available_collateral_micro_usdc: 1_000_000_000,
+            trading_day_start_equity_micro_usdc: 1_000_000_000,
+            peak_equity_micro_usdc: 1_000_000_000,
+            symbol_position_micro_usdc: 0,
+            orders_today: 0,
+        };
+        let decision = evaluate_proposal(
+            &Proposal {
+                symbol: "BTC".into(),
+                side: Side::Buy,
+                notional_bps: 100,
+                limit_price_micro_usdc: market.mark_price_micro_usdc,
+                reduce_only: false,
+            },
+            &context(&rules, &market, &portfolio),
+        )?;
+        assert_eq!(decision.symbol, "BTC");
+        assert!(!decision.reduce_only);
+        Ok(())
     }
 
     #[test]
