@@ -67,6 +67,16 @@ pub struct InferenceTurn {
 pub enum RuntimeError {
     #[error("model inference failed")]
     Inference,
+    #[error("Crow gateway returned an unsuccessful status")]
+    GatewayStatus,
+    #[error("Crow gateway request timed out")]
+    GatewayTimeout,
+    #[error("Crow gateway transport failed")]
+    GatewayTransport,
+    #[error("Crow gateway receipt binding failed")]
+    GatewayReceiptBinding,
+    #[error("model returned an invalid structured turn")]
+    ModelTurnInvalid,
     #[error("tool execution failed")]
     Tool,
     #[error("model requested an unavailable tool")]
@@ -94,6 +104,11 @@ impl RuntimeError {
     pub const fn failure_class(&self) -> &'static str {
         match self {
             Self::Inference => "inference_failed",
+            Self::GatewayStatus => "gateway_http_status",
+            Self::GatewayTimeout => "gateway_timeout",
+            Self::GatewayTransport => "gateway_transport",
+            Self::GatewayReceiptBinding => "gateway_receipt_binding",
+            Self::ModelTurnInvalid => "invalid_model_turn",
             Self::Tool => "tool_failed",
             Self::ToolUnavailable => "tool_unavailable",
             Self::ToolRoundLimit => "tool_round_limit",

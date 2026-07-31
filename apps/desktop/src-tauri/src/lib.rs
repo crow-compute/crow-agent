@@ -33,7 +33,7 @@ use tauri_plugin_shell::{
     ShellExt as _,
     process::{CommandChild, CommandEvent},
 };
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
@@ -624,11 +624,8 @@ fn get_local_run_journal(
         .public_events()
         .map_err(|_| DesktopError::Journal.code().to_owned())?;
     let schedules = load_local_arena_schedules(&runtime_directory, &public_events);
-    Ok(build_local_run_journal(
-        &public_events,
-        run_id.as_deref(),
-        &schedules,
-    ))
+    build_local_run_journal(&public_events, run_id.as_deref(), &schedules)
+        .map_err(|_| DesktopError::Journal.code().to_owned())
 }
 
 fn load_local_arena_schedules(
@@ -675,11 +672,11 @@ fn build_local_run_journal(
     public_events: &[crow_agent_protocol::RunEventEnvelopeV1],
     requested_run_id: Option<&str>,
     schedules: &BTreeMap<Uuid, LocalArenaSchedule>,
-) -> LocalRunJournal {
+) -> Result<LocalRunJournal, time::error::Format> {
     let mut runs = Vec::<LocalRunSummary>::new();
     for event in public_events {
         let run_id = event.run_id.to_string();
-        let occurred_at = event.occurred_at.to_string();
+        let occurred_at = event.occurred_at.format(&Rfc3339)?;
         let summary_index = if let Some(index) =
             runs.iter().position(|summary| summary.run_id == run_id)
         {
@@ -728,27 +725,29 @@ fn build_local_run_journal(
         .filter(|requested| runs.iter().any(|summary| summary.run_id == *requested))
         .map(str::to_owned)
         .or_else(|| runs.first().map(|summary| summary.run_id.clone()));
-    let events = selected_run_id
-        .as_deref()
-        .map_or_else(Vec::new, |selected| {
-            public_events
-                .iter()
-                .filter(|event| event.run_id.to_string() == selected)
-                .map(|event| LocalRunEvent {
+    let events = if let Some(selected) = selected_run_id.as_deref() {
+        public_events
+            .iter()
+            .filter(|event| event.run_id.to_string() == selected)
+            .map(|event| {
+                Ok(LocalRunEvent {
                     sequence: event.sequence,
                     cycle_id: event.cycle_id.map(|cycle_id| cycle_id.to_string()),
                     event_type: event.event_type.clone(),
-                    occurred_at: event.occurred_at.to_string(),
+                    occurred_at: event.occurred_at.format(&Rfc3339)?,
                     receipted: event.server_receipt.is_some(),
                     details: sanitize_journal_payload(&event.event_type, &event.payload),
                 })
-                .collect()
-        });
-    LocalRunJournal {
+            })
+            .collect::<Result<Vec<_>, time::error::Format>>()?
+    } else {
+        Vec::new()
+    };
+    Ok(LocalRunJournal {
         runs,
         selected_run_id,
         events,
-    }
+    })
 }
 
 fn sanitize_journal_payload(event_type: &str, payload: &Value) -> Value {
@@ -2205,13 +2204,16 @@ mod tests {
         )?;
 
         let events = [started, fill, paused];
-        let journal = build_local_run_journal(&events, Some(&run_id.to_string()), &BTreeMap::new());
+        let journal =
+            build_local_run_journal(&events, Some(&run_id.to_string()), &BTreeMap::new())?;
         assert_eq!(journal.runs.len(), 1);
         assert_eq!(journal.runs[0].state, "paused");
         assert_eq!(journal.runs[0].fill_count, 2);
         assert!(!journal.runs[0].all_receipted);
         assert_eq!(journal.events.len(), 3);
         assert_eq!(journal.events[1].details["fills"][0]["coin"], "BTC");
+        assert!(journal.events[0].occurred_at.contains('T'));
+        assert!(journal.events[0].occurred_at.ends_with('Z'));
         Ok(())
     }
 
