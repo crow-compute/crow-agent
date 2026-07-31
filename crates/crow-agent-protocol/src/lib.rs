@@ -128,21 +128,11 @@ impl Default for ScoringWeightsV1 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PenaltyRulesV1 {
     pub policy_rejection_millis: u32,
     pub missed_cycle_millis: u32,
     pub cap_millis: u32,
-}
-
-impl Default for PenaltyRulesV1 {
-    fn default() -> Self {
-        Self {
-            policy_rejection_millis: 0,
-            missed_cycle_millis: 0,
-            cap_millis: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
