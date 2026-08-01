@@ -1,8 +1,8 @@
 use crate::{
     AccountSnapshot, AgentRuntime, AllowedTool, BookSnapshot, DurableRunEventError,
     DurableRunEventWriter, EncryptedJournal, HyperliquidError, HyperliquidVenue, InferenceProvider,
-    LocalTool, MarketSnapshot, OrderDecision, PortfolioState, RunEventSink, RuntimeError,
-    VenueSubmission,
+    LocalTool, MarketSnapshot, OrderDecision, PolicyContext, PortfolioState, Proposal,
+    RunEventSink, RuntimeError, VenueSubmission, evaluate_proposal,
 };
 use async_trait::async_trait;
 use crow_agent_protocol::{ArenaManifestV1, DeviceIdentity};
@@ -468,7 +468,24 @@ where
         });
     };
     let proposal_symbol = proposal.symbol.clone();
-    let order = match outcome.order.ok_or(LiveCycleError::RiskState)? {
+    let marketable_proposal = marketable_proposal(&proposal, &snapshots)?;
+    let market = markets
+        .get(&proposal_symbol)
+        .ok_or(LiveCycleError::RiskState)?;
+    let portfolio = portfolios
+        .get(&proposal_symbol)
+        .ok_or(LiveCycleError::RiskState)?;
+    let normalized_order = evaluate_proposal(
+        &marketable_proposal,
+        &PolicyContext {
+            rules: &manifest.risk_rules,
+            market,
+            portfolio,
+            starting_capital_micro_usdc: i64::try_from(manifest.starting_capital_micro_usdc)
+                .map_err(|_| LiveCycleError::RiskState)?,
+        },
+    );
+    let order = match normalized_order {
         Ok(order) => order,
         Err(policy_error) => {
             let policy_event = writer
@@ -604,6 +621,20 @@ where
     })
 }
 
+fn marketable_proposal(
+    proposal: &Proposal,
+    snapshots: &BTreeMap<String, MarketSnapshot>,
+) -> Result<Proposal, LiveCycleError> {
+    let snapshot = snapshots
+        .get(&proposal.symbol)
+        .ok_or(LiveCycleError::RiskState)?;
+    let mut normalized = proposal.clone();
+    normalized.limit_price_micro_usdc = snapshot
+        .book
+        .marketable_limit_price_micro_usdc(proposal.side)?;
+    Ok(normalized)
+}
+
 fn update_risk_state(state: &mut LiveRiskState, account: &AccountSnapshot, today: Date) {
     if state.trading_day != today {
         state.trading_day = today;
@@ -636,6 +667,48 @@ mod tests {
     use crow_agent_protocol::ALLOWED_SYMBOLS;
     use std::sync::Mutex;
     use tempfile::tempdir;
+
+    #[test]
+    fn normalizes_the_observed_unmarketable_iocs_to_the_opposing_top() -> Result<(), LiveCycleError>
+    {
+        let eth = MarketSnapshot {
+            market: crate::MarketState {
+                symbol: "ETH".into(),
+                mark_price_micro_usdc: 1_873_000_000,
+                oracle_price_micro_usdc: 1_873_600_000,
+                spread_bps: 1,
+                book_age_seconds: 3,
+                ask_depth_micro_usdc: 100_000_000,
+                bid_depth_micro_usdc: 100_000_000,
+                size_decimals: 4,
+                delisted: false,
+            },
+            book: BookSnapshot {
+                symbol: "ETH".into(),
+                venue_time_ms: 1,
+                bids: vec![crate::BookLevel {
+                    price: "1872.9".into(),
+                    size: "1".into(),
+                    order_count: 1,
+                }],
+                asks: vec![crate::BookLevel {
+                    price: "1873.1".into(),
+                    size: "1".into(),
+                    order_count: 1,
+                }],
+            },
+        };
+        let proposal = Proposal {
+            symbol: "ETH".into(),
+            side: crate::Side::Buy,
+            notional_bps: 100,
+            limit_price_micro_usdc: 1_873_000_000,
+            reduce_only: false,
+        };
+        let normalized = marketable_proposal(&proposal, &BTreeMap::from([("ETH".into(), eth)]))?;
+        assert_eq!(normalized.limit_price_micro_usdc, 1_873_100_000);
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct ReconciliationVenue {

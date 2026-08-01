@@ -116,6 +116,21 @@ impl BookSnapshot {
             && now_ms - self.venue_time_ms
                 <= u64::try_from(maximum_age.as_millis()).unwrap_or(u64::MAX)
     }
+
+    /// Returns the opposing top-of-book price that makes an IOC immediately
+    /// marketable. A buy crosses the best ask; a sell crosses the best bid.
+    pub fn marketable_limit_price_micro_usdc(&self, side: Side) -> Result<i64, HyperliquidError> {
+        let level = match side {
+            Side::Buy => self.asks.first(),
+            Side::Sell => self.bids.first(),
+        }
+        .ok_or(HyperliquidError::Book)?;
+        let price = decimal_string_to_fixed(&level.price, 6)?;
+        if price <= 0 {
+            return Err(HyperliquidError::Book);
+        }
+        Ok(price)
+    }
 }
 
 #[derive(Debug)]
@@ -242,6 +257,7 @@ impl HyperliquidVenue {
                 json!({
                     "accepted": status.is_ok(),
                     "order_id": status.oid().map(|value| value.to_string()),
+                    "reason": status.error().map(display_safe_venue_rejection),
                     "state": if status.is_err() {
                         "venue_rejected"
                     } else if status.oid().is_some() {
@@ -494,6 +510,25 @@ impl HyperliquidVenue {
             .filter(|entry| ALLOWED_SYMBOLS.contains(&entry.delta.coin.as_str()))
             .collect::<Vec<_>>();
         serde_json::to_value(funding).map_err(|_| HyperliquidError::Snapshot)
+    }
+}
+
+fn display_safe_venue_rejection(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("immediately match") || message.contains("would not fill") {
+        "ioc_would_not_fill"
+    } else if message.contains("insufficient margin") {
+        "insufficient_margin"
+    } else if message.contains("reduce only") || message.contains("reduce-only") {
+        "invalid_reduce_only"
+    } else if message.contains("minimum") && message.contains("notional") {
+        "minimum_notional"
+    } else if message.contains("price") {
+        "invalid_price"
+    } else if message.contains("size") {
+        "invalid_size"
+    } else {
+        "venue_rejected"
     }
 }
 
@@ -818,6 +853,51 @@ mod tests {
             }
         ));
         Ok(())
+    }
+
+    #[test]
+    fn ioc_limit_crosses_the_opposing_top_of_book() -> Result<(), HyperliquidError> {
+        let book = BookSnapshot {
+            symbol: "BTC".into(),
+            venue_time_ms: 1,
+            bids: vec![BookLevel {
+                price: "63443".into(),
+                size: "0.0268".into(),
+                order_count: 2,
+            }],
+            asks: vec![BookLevel {
+                price: "63469".into(),
+                size: "0.01265".into(),
+                order_count: 2,
+            }],
+        };
+        assert_eq!(
+            book.marketable_limit_price_micro_usdc(Side::Buy)?,
+            63_469_000_000
+        );
+        assert_eq!(
+            book.marketable_limit_price_micro_usdc(Side::Sell)?,
+            63_443_000_000
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn venue_errors_are_reduced_to_display_safe_reasons() {
+        assert_eq!(
+            display_safe_venue_rejection(
+                "Order could not immediately match against any resting orders."
+            ),
+            "ioc_would_not_fill"
+        );
+        assert_eq!(
+            display_safe_venue_rejection("Insufficient margin to place order."),
+            "insufficient_margin"
+        );
+        assert_eq!(
+            display_safe_venue_rejection("internal detail"),
+            "venue_rejected"
+        );
     }
 
     #[test]

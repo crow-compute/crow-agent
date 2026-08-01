@@ -95,6 +95,11 @@ struct AgentVersionListResponse {
     versions: Vec<AgentVersionEnvelopeV1>,
 }
 
+#[derive(Debug, Serialize)]
+struct SwitchRunStrategyRequest {
+    agent_version_id: Uuid,
+}
+
 pub struct HarnessApiClient {
     origin: Url,
     authorization: HeaderValue,
@@ -197,6 +202,24 @@ impl HarnessApiClient {
             .lease_expires_at)
     }
 
+    pub async fn switch_run_strategy(
+        &self,
+        run_id: Uuid,
+        agent_version_id: Uuid,
+    ) -> Result<(), HarnessApiError> {
+        if run_id == Uuid::nil() || agent_version_id == Uuid::nil() {
+            return Err(HarnessApiError::Response);
+        }
+        let path = format!("/api/v1/harness/runs/{run_id}/strategy");
+        let response = self
+            .patch_json(&path, &SwitchRunStrategyRequest { agent_version_id })
+            .await?;
+        if !response.status().is_success() {
+            return Err(HarnessApiError::Status(response.status().as_u16()));
+        }
+        Ok(())
+    }
+
     pub async fn append_event(
         &self,
         event: &RunEventEnvelopeV1,
@@ -226,6 +249,25 @@ impl HarnessApiClient {
         Ok(self
             .client
             .post(endpoint)
+            .header(AUTHORIZATION, self.authorization.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .json(body)
+            .send()
+            .await?)
+    }
+
+    async fn patch_json<T: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<reqwest::Response, HarnessApiError> {
+        let endpoint = self
+            .origin
+            .join(path)
+            .map_err(|_| HarnessApiError::Origin)?;
+        Ok(self
+            .client
+            .patch(endpoint)
             .header(AUTHORIZATION, self.authorization.clone())
             .header(CONTENT_TYPE, "application/json")
             .json(body)

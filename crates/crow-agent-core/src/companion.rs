@@ -1,3 +1,4 @@
+use crate::StrategyBundleV1;
 use crow_agent_protocol::{HARNESS_PROTOCOL_V1, canonical_json};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -5,7 +6,7 @@ use sha2::Sha256;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const MAX_COMPANION_MESSAGE_BYTES: usize = 8 * 1024;
+pub const MAX_COMPANION_MESSAGE_BYTES: usize = 16 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -24,6 +25,7 @@ pub struct CompanionRequestV1 {
     pub request_id: Uuid,
     pub nonce: u64,
     pub action: CompanionActionV1,
+    pub strategy: Option<StrategyBundleV1>,
     pub mac: String,
 }
 
@@ -55,6 +57,7 @@ struct UnsignedRequest<'a> {
     request_id: Uuid,
     nonce: u64,
     action: CompanionActionV1,
+    strategy: Option<&'a StrategyBundleV1>,
 }
 
 #[derive(Serialize)]
@@ -74,24 +77,51 @@ impl CompanionRequestV1 {
         nonce: u64,
         action: CompanionActionV1,
     ) -> Result<Self, CompanionIpcError> {
+        Self::sign_with_strategy(key, nonce, action, None)
+    }
+
+    pub fn sign_with_strategy(
+        key: &[u8; 32],
+        nonce: u64,
+        action: CompanionActionV1,
+        strategy: Option<StrategyBundleV1>,
+    ) -> Result<Self, CompanionIpcError> {
+        if strategy.is_some() && action != CompanionActionV1::Resume {
+            return Err(CompanionIpcError::Protocol);
+        }
+        if strategy
+            .as_ref()
+            .is_some_and(|value| value.validate().is_err())
+        {
+            return Err(CompanionIpcError::Protocol);
+        }
         let request_id = Uuid::new_v4();
         let unsigned = UnsignedRequest {
             protocol: HARNESS_PROTOCOL_V1,
             request_id,
             nonce,
             action,
+            strategy: strategy.as_ref(),
         };
+        let mac = sign_value(key, &unsigned)?;
         Ok(Self {
             protocol: HARNESS_PROTOCOL_V1.into(),
             request_id,
             nonce,
             action,
-            mac: sign_value(key, &unsigned)?,
+            strategy,
+            mac,
         })
     }
 
     pub fn verify(&self, key: &[u8; 32]) -> Result<(), CompanionIpcError> {
-        if self.protocol != HARNESS_PROTOCOL_V1 {
+        if self.protocol != HARNESS_PROTOCOL_V1
+            || (self.strategy.is_some() && self.action != CompanionActionV1::Resume)
+            || self
+                .strategy
+                .as_ref()
+                .is_some_and(|value| value.validate().is_err())
+        {
             return Err(CompanionIpcError::Protocol);
         }
         verify_value(
@@ -101,6 +131,7 @@ impl CompanionRequestV1 {
                 request_id: self.request_id,
                 nonce: self.nonce,
                 action: self.action,
+                strategy: self.strategy.as_ref(),
             },
             &self.mac,
         )
@@ -229,6 +260,29 @@ mod tests {
             None,
         )?;
         assert!(response.verify(&key, &other).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn strategy_switch_is_bound_to_a_resume_request() -> Result<(), CompanionIpcError> {
+        let key = [13_u8; 32];
+        let strategy = StrategyBundleV1 {
+            protocol: HARNESS_PROTOCOL_V1.into(),
+            version_id: Uuid::new_v4(),
+            model_id: "crow-qwen3-5-27b".into(),
+            name: "Degen".into(),
+            system_instructions: "Trade the owner strategy.".into(),
+            tools: crate::REQUIRED_STRATEGY_TOOLS.map(str::to_owned).to_vec(),
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let request = CompanionRequestV1::sign_with_strategy(
+            &key,
+            12,
+            CompanionActionV1::Resume,
+            Some(strategy),
+        )?;
+        request.verify(&key)?;
+        assert!(request.strategy.is_some());
         Ok(())
     }
 }

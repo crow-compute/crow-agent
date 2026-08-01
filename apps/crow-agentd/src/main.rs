@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 use crow_agent_core::{
     BacktestEngine, CompanionActionV1, CompanionIpcError, CompanionRequestV1, CompanionResponseV1,
     DeviceAuthorizationClient, DeviceAuthorizationError, DeviceEncryptionKey, EncryptedJournal,
-    MAX_COMPANION_MESSAGE_BYTES, ScheduledProposal, TlsProviderError, install_tls_crypto_provider,
-    read_verified_dataset,
+    MAX_COMPANION_MESSAGE_BYTES, ScheduledProposal, StrategyBundleV1, TlsProviderError,
+    install_tls_crypto_provider, read_verified_dataset,
 };
 use crow_agent_protocol::{
     DatasetManifestV1, DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1,
@@ -128,6 +128,8 @@ struct DesktopCredentials {
     api_wallet_key: Zeroizing<[u8; 32]>,
     refresh_token: Zeroizing<String>,
 }
+
+type PendingStrategy = Arc<Mutex<Option<StrategyBundleV1>>>;
 
 fn production_api_origin() -> String {
     "https://api.crowcompute.ai".into()
@@ -376,12 +378,14 @@ async fn main() -> Result<(), DaemonError> {
             )?;
             let execution_gate = ExecutionGate::new();
             let active_run = Arc::new(Mutex::new(None));
+            let pending_strategy = Arc::new(Mutex::new(None));
             tokio::select! {
                 result = run_companion_listener(
                     &ipc_name,
                     &credentials.companion_secret,
                     &execution_gate,
                     &active_run,
+                    &pending_strategy,
                 ) => result?,
                 result = run_relay(
                     &config,
@@ -394,6 +398,7 @@ async fn main() -> Result<(), DaemonError> {
                     Some(&credentials.api_wallet_key),
                     &execution_gate,
                     &active_run,
+                    &pending_strategy,
                 ) => result?,
             }
         }
@@ -424,6 +429,7 @@ async fn main() -> Result<(), DaemonError> {
             };
             let execution_gate = ExecutionGate::new();
             let active_run = Arc::new(Mutex::new(None));
+            let pending_strategy = Arc::new(Mutex::new(None));
             Box::pin(run_relay(
                 &config,
                 &identity,
@@ -435,6 +441,7 @@ async fn main() -> Result<(), DaemonError> {
                 api_wallet_key.as_ref(),
                 &execution_gate,
                 &active_run,
+                &pending_strategy,
             ))
             .await?;
         }
@@ -460,7 +467,15 @@ async fn run_companion(ipc_name: &str) -> Result<(), DaemonError> {
     std::io::stdin().lock().read_exact(secret.as_mut())?;
     let execution_gate = ExecutionGate::new();
     let active_run = Arc::new(Mutex::new(None));
-    run_companion_listener(ipc_name, &secret, &execution_gate, &active_run).await
+    let pending_strategy = Arc::new(Mutex::new(None));
+    run_companion_listener(
+        ipc_name,
+        &secret,
+        &execution_gate,
+        &active_run,
+        &pending_strategy,
+    )
+    .await
 }
 
 async fn run_companion_listener(
@@ -468,6 +483,7 @@ async fn run_companion_listener(
     secret: &[u8; 32],
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
+    pending_strategy: &PendingStrategy,
 ) -> Result<(), DaemonError> {
     let name = local_socket_name(ipc_name)?;
     let listener = ListenerOptions::new()
@@ -485,6 +501,7 @@ async fn run_companion_listener(
             &mut highest_nonce,
             execution_gate,
             active_run,
+            pending_strategy,
         )
         .await
         {
@@ -499,6 +516,7 @@ async fn handle_companion_connection(
     highest_nonce: &mut u64,
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
+    pending_strategy: &PendingStrategy,
 ) -> Result<(), DaemonError> {
     let reader = BufReader::new(&connection);
     let mut reader = reader.take((MAX_COMPANION_MESSAGE_BYTES + 1) as u64);
@@ -508,8 +526,14 @@ async fn handle_companion_connection(
         return Err(DaemonError::RemoteCommand);
     }
     let request = serde_json::from_str::<CompanionRequestV1>(raw.trim_end())?;
-    let response =
-        apply_companion_request(&request, secret, highest_nonce, execution_gate, active_run)?;
+    let response = apply_companion_request(
+        &request,
+        secret,
+        highest_nonce,
+        execution_gate,
+        active_run,
+        pending_strategy,
+    )?;
     let mut encoded = serde_json::to_vec(&response)?;
     encoded.push(b'\n');
     let mut sender = &connection;
@@ -523,6 +547,7 @@ fn apply_companion_request(
     highest_nonce: &mut u64,
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
+    pending_strategy: &PendingStrategy,
 ) -> Result<CompanionResponseV1, DaemonError> {
     request.verify(secret)?;
     if request.nonce <= *highest_nonce {
@@ -533,7 +558,30 @@ fn apply_companion_request(
     let accepted = match request.action {
         CompanionActionV1::Status => true,
         CompanionActionV1::Pause => execution_gate.apply(RemoteAction::Pause),
-        CompanionActionV1::Resume => execution_gate.apply(RemoteAction::Resume),
+        CompanionActionV1::Resume => {
+            if let Some(strategy) = request.strategy.clone() {
+                if execution_gate.label() != "paused"
+                    || active_run
+                        .lock()
+                        .map_err(|_| DaemonError::RemoteCommand)?
+                        .is_none()
+                {
+                    false
+                } else {
+                    let mut pending = pending_strategy
+                        .lock()
+                        .map_err(|_| DaemonError::RemoteCommand)?;
+                    if pending.is_some() {
+                        false
+                    } else {
+                        *pending = Some(strategy);
+                        true
+                    }
+                }
+            } else {
+                execution_gate.apply(RemoteAction::Resume)
+            }
+        }
         CompanionActionV1::Stop => execution_gate.apply(RemoteAction::Stop),
     };
     CompanionResponseV1::sign(
@@ -688,6 +736,7 @@ async fn run_relay(
     api_wallet_key: Option<&Zeroizing<[u8; 32]>>,
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
+    pending_strategy: &PendingStrategy,
 ) -> Result<(), DaemonError> {
     let url = Url::parse(&config.relay_url).map_err(|_| DaemonError::RelayUrl)?;
     if url.scheme() != "wss" {
@@ -734,6 +783,7 @@ async fn run_relay(
                     identity,
                     execution_gate,
                     active_run,
+                    pending_strategy,
                 ) => match result {
                     Ok(live_run::LiveSessionOutcome::Stopped) => Ok(()),
                     Err(error) => Err(DaemonError::LiveRun(error)),
@@ -1003,26 +1053,92 @@ mod tests {
         let gate = ExecutionGate::new();
         let run_id = Uuid::new_v4();
         let active_run = Arc::new(Mutex::new(Some(run_id)));
+        let pending_strategy = Arc::new(Mutex::new(None));
         let mut highest_nonce = 0;
         let request = CompanionRequestV1::sign(&secret, 1, CompanionActionV1::Resume)?;
-        let response =
-            apply_companion_request(&request, &secret, &mut highest_nonce, &gate, &active_run)?;
+        let response = apply_companion_request(
+            &request,
+            &secret,
+            &mut highest_nonce,
+            &gate,
+            &active_run,
+            &pending_strategy,
+        )?;
         response.verify(&secret, &request)?;
         assert!(response.accepted);
         assert_eq!(response.execution_state, "running");
         assert_eq!(response.active_run, Some(run_id));
         assert!(
-            apply_companion_request(&request, &secret, &mut highest_nonce, &gate, &active_run,)
-                .is_err()
+            apply_companion_request(
+                &request,
+                &secret,
+                &mut highest_nonce,
+                &gate,
+                &active_run,
+                &pending_strategy,
+            )
+            .is_err()
         );
 
         let mut tampered = CompanionRequestV1::sign(&secret, 2, CompanionActionV1::Pause)?;
         tampered.action = CompanionActionV1::Stop;
         assert!(
-            apply_companion_request(&tampered, &secret, &mut highest_nonce, &gate, &active_run,)
-                .is_err()
+            apply_companion_request(
+                &tampered,
+                &secret,
+                &mut highest_nonce,
+                &gate,
+                &active_run,
+                &pending_strategy,
+            )
+            .is_err()
         );
         assert_eq!(highest_nonce, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn companion_queues_strategy_without_opening_the_paused_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let secret = [23_u8; 32];
+        let gate = ExecutionGate::new();
+        let active_run = Arc::new(Mutex::new(Some(Uuid::new_v4())));
+        let pending_strategy = Arc::new(Mutex::new(None));
+        let strategy = StrategyBundleV1 {
+            protocol: HARNESS_PROTOCOL_V1.into(),
+            version_id: Uuid::new_v4(),
+            model_id: "crow-qwen3-5-27b".into(),
+            name: "Fast switch".into(),
+            system_instructions: "Trade both sides when the evidence supports it.".into(),
+            tools: crow_agent_core::REQUIRED_STRATEGY_TOOLS
+                .map(str::to_owned)
+                .to_vec(),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let request = CompanionRequestV1::sign_with_strategy(
+            &secret,
+            1,
+            CompanionActionV1::Resume,
+            Some(strategy.clone()),
+        )?;
+        let mut highest_nonce = 0;
+        let response = apply_companion_request(
+            &request,
+            &secret,
+            &mut highest_nonce,
+            &gate,
+            &active_run,
+            &pending_strategy,
+        )?;
+        assert!(response.accepted);
+        assert_eq!(response.execution_state, "paused");
+        assert_eq!(
+            pending_strategy
+                .lock()
+                .map_err(|_| "pending lock")?
+                .as_ref(),
+            Some(&strategy)
+        );
         Ok(())
     }
 

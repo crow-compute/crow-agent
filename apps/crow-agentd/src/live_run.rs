@@ -1,4 +1,4 @@
-use crate::ExecutionGate;
+use crate::{ExecutionGate, PendingStrategy};
 use crow_agent_core::{
     DeviceEncryptionKey, DurableRunEventWriter, EncryptedJournal, GatewayClient, HarnessApiClient,
     HyperliquidBookStream, HyperliquidVenue, LiveRiskState, StartHarnessRunV1, execute_live_cycle,
@@ -127,6 +127,7 @@ pub(crate) async fn run_session(
     identity: &DeviceIdentity,
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
+    pending_strategy: &PendingStrategy,
 ) -> Result<LiveSessionOutcome, LiveRunError> {
     let manifest = &config.signed.manifest;
     let now = OffsetDateTime::now_utc();
@@ -137,13 +138,17 @@ pub(crate) async fn run_session(
     let journal_path = state_directory.join("journal.db");
     let mut journal = EncryptedJournal::open(&journal_path, journal_key)?;
     let api = HarnessApiClient::new(api_origin, access_token.as_str())?;
-    let envelope = api.agent_version(config.agent_version_id).await?;
-    let strategy = open_agent_version(&envelope, device_id, device_encryption_key)
+    let run_id = acquire_run(config, &journal, &api).await?;
+    let active_strategy_version = journal
+        .secret(&strategy_key(run_id))?
+        .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<Uuid>().ok())
+        .unwrap_or(config.agent_version_id);
+    let envelope = api.agent_version(active_strategy_version).await?;
+    let mut strategy = open_agent_version(&envelope, device_id, device_encryption_key)
         .map_err(|_| LiveRunError::Configuration)?;
     if strategy.model_id != config.model_id {
         return Err(LiveRunError::Configuration);
     }
-    let run_id = acquire_run(config, &journal, &api).await?;
     let venue = HyperliquidVenue::connect_testnet(api_wallet_key).await?;
 
     initialize_event_chain(config, run_id, &mut journal, &api, identity).await?;
@@ -249,8 +254,49 @@ pub(crate) async fn run_session(
                     if current == "stopped" {
                         journal.delete_secret(&run_id_key(manifest.arena_id))?;
                         journal.delete_secret(&lease_key(manifest.arena_id))?;
+                        journal.delete_secret(&strategy_key(run_id))?;
                         *active_run.lock().map_err(|_| LiveRunError::State)? = None;
                         return Ok(LiveSessionOutcome::Stopped);
+                    }
+                }
+                if execution_gate.label() == "paused" {
+                    let candidate = pending_strategy
+                        .lock()
+                        .map_err(|_| LiveRunError::State)?
+                        .clone();
+                    if let Some(candidate) = candidate {
+                        if candidate.model_id != config.model_id
+                            || candidate.validate().is_err()
+                            || !manifest.eligible_models.iter().any(|model| model == &candidate.model_id)
+                        {
+                            return Err(LiveRunError::Configuration);
+                        }
+                        api.switch_run_strategy(run_id, candidate.version_id).await?;
+                        journal.put_secret(
+                            &strategy_key(run_id),
+                            candidate.version_id.to_string().as_bytes(),
+                        )?;
+                        let mut writer = DurableRunEventWriter::new(
+                            &mut journal,
+                            &api,
+                            identity,
+                            manifest.arena_id,
+                            run_id,
+                        );
+                        writer.append(
+                            None,
+                            "strategy_changed",
+                            json!({
+                                "previous_agent_version_id": strategy.version_id,
+                                "agent_version_id": candidate.version_id,
+                            }),
+                            &Value::Null,
+                        ).await?;
+                        strategy = candidate;
+                        *pending_strategy.lock().map_err(|_| LiveRunError::State)? = None;
+                        if !execution_gate.apply(crow_agent_protocol::RemoteAction::Resume) {
+                            return Err(LiveRunError::State);
+                        }
                     }
                 }
             }
@@ -271,6 +317,7 @@ pub(crate) async fn run_session(
                     ).await?;
                     journal.delete_secret(&run_id_key(manifest.arena_id))?;
                     journal.delete_secret(&lease_key(manifest.arena_id))?;
+                    journal.delete_secret(&strategy_key(run_id))?;
                     *active_run.lock().map_err(|_| LiveRunError::State)? = None;
                     return Ok(LiveSessionOutcome::Stopped);
                 }
@@ -492,6 +539,10 @@ fn run_id_key(arena_id: Uuid) -> String {
 
 fn lease_key(arena_id: Uuid) -> String {
     format!("{RUN_LEASE_PREFIX}-{arena_id}")
+}
+
+fn strategy_key(run_id: Uuid) -> String {
+    format!("active-strategy-version-{run_id}")
 }
 
 fn valid_execution_account(value: &str) -> bool {

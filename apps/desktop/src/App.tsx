@@ -42,7 +42,7 @@ const safetyRules = [
   ["Position cap", "10% equity"],
   ["Daily loss", "2% stop"],
   ["Drawdown", "10% stop"],
-  ["Cadence", "15 minutes"],
+  ["Cadence", "Arena-defined"],
 ];
 
 const studioActivityEventTypes = new Set([
@@ -515,6 +515,7 @@ export function App() {
   const [arenaLaunchNotice, setArenaLaunchNotice] = useState<string | null>(null);
   const [agentVersions, setAgentVersions] = useState<AgentVersionSummary[]>([]);
   const [selectedVersionId, setSelectedVersionId] = useState("");
+  const [resumeVersionId, setResumeVersionId] = useState("");
   const [agentName, setAgentName] = useState("Measured momentum");
   const [agentInstructions, setAgentInstructions] = useState(
     "Trade only when current BTC, ETH, or SOL evidence is internally consistent. Prefer hold over weak conviction. Never exceed the arena policy and reduce inherited risk before adding exposure.",
@@ -687,14 +688,32 @@ export function App() {
     setLocalBusy(action);
     setNotice(null);
     try {
-      setStatus(await sendLocalCommand(action));
-      setNotice(`Local run ${action} accepted.`);
+      setStatus(await sendLocalCommand(action, action === "resume" ? resumeVersionId || undefined : undefined));
+      setNotice(
+        action === "resume" && resumeVersionId
+          ? "Strategy switch accepted locally. The daemon will bind and receipt it before resuming."
+          : `Local run ${action} accepted.`,
+      );
     } catch {
       setNotice(`Local ${action} was not accepted.`);
     } finally {
       setLocalBusy("");
     }
   }
+
+  useEffect(() => {
+    if (status.daemon !== "paused" || !status.activeRun) return;
+    let cancelled = false;
+    void getAgentVersions()
+      .then((value) => {
+        if (cancelled) return;
+        setAgentVersions(value.versions);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [status.daemon, status.activeRun]);
 
   async function openArenaSetup(arena: PublicArena) {
     setSelectedArena(arena);
@@ -733,6 +752,33 @@ export function App() {
       setNotice("The immutable agent version could not be created.");
     } finally {
       setArenaBusy(false);
+    }
+  }
+
+  async function createPausedStrategyVersion() {
+    const activeRemoteRun = remote.runs.find((run) => run.id === status.activeRun);
+    const currentVersion = agentVersions.find(
+      (version) => version.id === activeRemoteRun?.agentVersionId,
+    );
+    if (!currentVersion) {
+      setNotice("The active strategy model could not be resolved. Refresh the device state and try again.");
+      return;
+    }
+    setLocalBusy("strategy");
+    setNotice(null);
+    try {
+      const version = await createAgentVersion(
+        agentName,
+        currentVersion.modelId,
+        agentInstructions,
+      );
+      setAgentVersions((current) => [version, ...current]);
+      setResumeVersionId(version.id);
+      setNotice("New private strategy encrypted locally. Resume will bind this version to the paused run.");
+    } catch {
+      setNotice("The new private strategy version could not be created.");
+    } finally {
+      setLocalBusy("");
     }
   }
 
@@ -781,6 +827,13 @@ export function App() {
   );
   const localLive = Boolean(status.activeRun)
     && (status.daemon === "running" || status.daemon === "paused");
+  const activeRemoteRun = remote.runs.find((run) => run.id === status.activeRun);
+  const activeStrategyVersion = agentVersions.find(
+    (version) => version.id === activeRemoteRun?.agentVersionId,
+  );
+  const resumableVersions = activeStrategyVersion
+    ? agentVersions.filter((version) => version.modelId === activeStrategyVersion.modelId)
+    : agentVersions;
   const selectedRun = journal.runs.find((run) => run.runId === journal.selectedRunId) ?? null;
   const decisionCountdown = useMemo(
     () => selectedRun ? nextDecisionCountdown(selectedRun, clockNow) : null,
@@ -934,6 +987,21 @@ export function App() {
                     </>
                   ) : (
                     <>
+                      {status.activeRun && status.daemon === "paused" && resumableVersions.length ? (
+                        <select
+                          aria-label="Strategy for resume"
+                          value={resumeVersionId}
+                          onChange={(event) => setResumeVersionId(event.target.value)}
+                          disabled={Boolean(localBusy)}
+                        >
+                          <option value="">Keep current strategy</option>
+                          {resumableVersions.map((version) => (
+                            <option value={version.id} key={version.id}>
+                              {version.modelId} · v{version.version} · {shortId(version.configurationSha256)}
+                            </option>
+                          ))}
+                        </select>
+                      ) : null}
                       <button
                         type="button"
                         disabled={!status.activeRun || status.daemon !== "running" || Boolean(localBusy)}
@@ -962,6 +1030,33 @@ export function App() {
                     </>
                   )}
                 </div>
+
+                {status.activeRun && status.daemon === "paused" ? (
+                  <details className="paused-strategy-editor">
+                    <summary>Change private strategy before resume</summary>
+                    <label className="field-block">
+                      <span>Strategy name</span>
+                      <input value={agentName} maxLength={80} onChange={(event) => setAgentName(event.target.value)} />
+                    </label>
+                    <label className="field-block">
+                      <span>Private strategy instructions</span>
+                      <textarea
+                        value={agentInstructions}
+                        maxLength={8192}
+                        rows={5}
+                        onChange={(event) => setAgentInstructions(event.target.value)}
+                      />
+                      <small>{activeStrategyVersion?.modelId ?? "Current run model"} · {agentInstructions.length.toLocaleString()} / 8,192</small>
+                    </label>
+                    <button
+                      type="button"
+                      disabled={Boolean(localBusy) || !activeStrategyVersion || !agentName.trim() || !agentInstructions.trim()}
+                      onClick={() => void createPausedStrategyVersion()}
+                    >
+                      Encrypt & select for resume
+                    </button>
+                  </details>
+                ) : null}
               </article>
 
               <article className="policy-panel">
@@ -1073,7 +1168,9 @@ export function App() {
                     <div className="studio-run-identity">
                       <span><i className={`state-dot state-${selectedRun.state}`} />{selectedRun.state}</span>
                       <strong>Hyperliquid Testnet</strong>
-                      <small>BTC · ETH · SOL · 15-minute cycle</small>
+                      <small>BTC · ETH · SOL · {selectedRun.decisionIntervalSeconds
+                        ? `${selectedRun.decisionIntervalSeconds / 60}-minute cycle`
+                        : "signed arena cycle"}</small>
                     </div>
                     {decisionCountdown ? (
                       <div

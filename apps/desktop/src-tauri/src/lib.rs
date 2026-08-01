@@ -151,6 +151,7 @@ struct RemoteRun {
     id: String,
     arena_id: String,
     device_id: String,
+    agent_version_id: String,
     status: String,
     client_release: String,
     started_at: Option<String>,
@@ -538,6 +539,14 @@ impl DesktopState {
         &self,
         action: CompanionActionV1,
     ) -> Result<CompanionResponseV1, DesktopError> {
+        self.companion_request_with_strategy(action, None).await
+    }
+
+    async fn companion_request_with_strategy(
+        &self,
+        action: CompanionActionV1,
+        strategy: Option<StrategyBundleV1>,
+    ) -> Result<CompanionResponseV1, DesktopError> {
         // Nonces are ordered by issuance, so the matching IPC requests must
         // remain ordered through delivery and response verification as well.
         // The WebView status poll can overlap a user command or authorization
@@ -546,8 +555,9 @@ impl DesktopState {
         let _request_guard = self.companion_request_lock.lock().await;
         let credentials = self.companion_credentials()?;
         let nonce = next_companion_nonce(&self.companion_nonce)?;
-        let request = CompanionRequestV1::sign(&credentials.secret, nonce, action)
-            .map_err(|_| DesktopError::Companion)?;
+        let request =
+            CompanionRequestV1::sign_with_strategy(&credentials.secret, nonce, action, strategy)
+                .map_err(|_| DesktopError::Companion)?;
         tokio::time::timeout(
             COMPANION_TIMEOUT,
             send_companion_request(&credentials.ipc_name, &credentials.secret, &request),
@@ -877,6 +887,7 @@ async fn unlock_device_credentials(
 #[tauri::command]
 async fn send_local_command(
     action: String,
+    agent_version_id: Option<String>,
     state: State<'_, DesktopState>,
 ) -> Result<AgentStatus, String> {
     let action = match action.as_str() {
@@ -885,8 +896,40 @@ async fn send_local_command(
         "stop" => CompanionActionV1::Stop,
         _ => return Err(DesktopError::Companion.code().into()),
     };
+    let strategy = if action == CompanionActionV1::Resume {
+        if let Some(version_id) = agent_version_id {
+            let version_id = Uuid::parse_str(&version_id)
+                .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
+            let token = state
+                .device_tokens()
+                .await
+                .map_err(|error| error.code().to_owned())?;
+            let envelope = list_agent_version_envelopes(&token.access_token)
+                .await
+                .map_err(|error| error.code().to_owned())?
+                .into_iter()
+                .find(|version| version.version_id == version_id)
+                .ok_or_else(|| DesktopError::AgentVersion.code().to_owned())?;
+            let device_id = Uuid::parse_str(
+                &load_password(DEVICE_ID_ACCOUNT).map_err(|error| error.code().to_owned())?,
+            )
+            .map_err(|_| DesktopError::Credential.code().to_owned())?;
+            let key = load_or_create_encryption_key().map_err(|error| error.code().to_owned())?;
+            Some(
+                open_agent_version(&envelope, device_id, &key)
+                    .map_err(|_| DesktopError::AgentVersion.code().to_owned())?,
+            )
+        } else {
+            None
+        }
+    } else {
+        if agent_version_id.is_some() {
+            return Err(DesktopError::Companion.code().into());
+        }
+        None
+    };
     let response = state
-        .companion_request(action)
+        .companion_request_with_strategy(action, strategy)
         .await
         .map_err(|error| error.code().to_owned())?;
     if !response.accepted {
