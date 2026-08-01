@@ -183,6 +183,13 @@ export function journalDecisions(events: LocalRunEvent[]): JournalDecision[] {
       const policyAllowed = typeof policy?.allowed === "boolean" ? policy.allowed : null;
       const policyReason = typeof policy?.reason === "string" ? policy.reason : null;
       const orderSubmitted = related.some((candidate) => candidate.eventType === "order_submitted");
+      const venueAcknowledgement = related.find((candidate) => candidate.eventType === "venue_acknowledgement");
+      const venueStatuses = journalObject(venueAcknowledgement?.details)?.statuses;
+      const rejectedStatus = Array.isArray(venueStatuses)
+        ? venueStatuses.map(journalObject).find((status) => status?.accepted === false || status?.state === "venue_rejected")
+        : null;
+      const venueRejected = rejectedStatus != null;
+      const venueReason = typeof rejectedStatus?.reason === "string" ? rejectedStatus.reason : null;
       const fillCount = related
         .filter((candidate) => candidate.eventType === "fill")
         .reduce((total, candidate) => {
@@ -212,6 +219,8 @@ export function journalDecisions(events: LocalRunEvent[]): JournalDecision[] {
         ? "BLOCKED BY POLICY"
         : fillCount > 0
           ? "FILLED"
+          : venueRejected
+            ? "VENUE REJECTED"
           : orderSubmitted
             ? "SUBMITTED / NO FILL"
             : policyAllowed === true
@@ -221,6 +230,12 @@ export function journalDecisions(events: LocalRunEvent[]): JournalDecision[] {
         ? `Local policy rejected the proposal${policyReason ? `: ${policyReason}` : "."}`
         : fillCount > 0
           ? null
+          : venueRejected
+            ? venueReason === "ioc_would_not_fill"
+              ? "Hyperliquid rejected the IOC because it could not immediately match current resting liquidity."
+              : venueReason
+                ? `Hyperliquid rejected the IOC: ${venueReason.replaceAll("_", " ")}.`
+                : "Hyperliquid rejected the IOC; this client cycle did not retain a more specific display-safe reason."
           : orderSubmitted
           ? "The IOC order reached the venue, but no fill is recorded."
           : !orderSubmitted

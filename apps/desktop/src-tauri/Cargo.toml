@@ -17,8 +17,8 @@ tauri-build = { version = "2.5.1", features = [] }
 
 [dependencies]
 base64.workspace = true
-crow-agent-core = { version = "=0.1.23", path = "../../../crates/crow-agent-core" }
-crow-agent-protocol = { version = "=0.1.23", path = "../../../crates/crow-agent-protocol" }
+crow-agent-core = { version = "=0.1.24", path = "../../../crates/crow-agent-core" }
+crow-agent-protocol = { version = "=0.1.24", path = "../../../crates/crow-agent-protocol" }
 hex.workspace = true
 interprocess.workspace = true
 keyring.workspace = true
