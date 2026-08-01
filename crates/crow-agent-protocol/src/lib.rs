@@ -15,6 +15,7 @@ pub const HARNESS_PROTOCOL_V1: &str = "crow.harness.v1";
 pub const DEFAULT_STARTING_CAPITAL_MICRO_USDC: u64 = 1_000_000_000;
 pub const MIN_STARTING_CAPITAL_MICRO_USDC: u64 = 500_000_000;
 pub const MAX_STARTING_CAPITAL_MICRO_USDC: u64 = 1_000_000_000_000;
+pub const MIN_LIVE_DECISION_INTERVAL_SECONDS: u32 = 60;
 pub const DATASET_SOURCE_V1: &str = "hyperliquid-mainnet-info-v1";
 pub const ALLOWED_SYMBOLS: [&str; 3] = ["BTC", "ETH", "SOL"];
 pub const ALLOWED_MODELS: [&str; 3] = [
@@ -203,10 +204,28 @@ impl ArenaManifestV1 {
                 "arena time window is empty".into(),
             ));
         }
-        if self.decision_interval_seconds != 900 {
+        let duration_seconds = (self.ends_at - self.starts_at).whole_seconds();
+        if duration_seconds <= 0
+            || duration_seconds % i64::from(self.decision_interval_seconds.max(1)) != 0
+        {
             return Err(ProtocolError::InvalidManifest(
-                "v1 arenas require a 15-minute cadence".into(),
+                "arena duration must contain a whole number of decision cycles".into(),
             ));
+        }
+        match self.mode {
+            ArenaMode::HistoricalBacktest if self.decision_interval_seconds != 900 => {
+                return Err(ProtocolError::InvalidManifest(
+                    "historical arenas require the dataset's 15-minute cadence".into(),
+                ));
+            }
+            ArenaMode::HyperliquidTestnet
+                if self.decision_interval_seconds < MIN_LIVE_DECISION_INTERVAL_SECONDS =>
+            {
+                return Err(ProtocolError::InvalidManifest(
+                    "live arena cadence must be at least one minute".into(),
+                ));
+            }
+            _ => {}
         }
         if !(MIN_STARTING_CAPITAL_MICRO_USDC..=MAX_STARTING_CAPITAL_MICRO_USDC)
             .contains(&self.starting_capital_micro_usdc)
@@ -1054,6 +1073,26 @@ mod tests {
         rules.max_spread_bps = RiskRulesV1::default().max_spread_bps + 1;
         assert!(rules.validate_ceiling().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn live_manifest_accepts_custom_cadence_and_duration_beyond_one_day() {
+        let mut manifest = valid_manifest();
+        manifest.mode = ArenaMode::HyperliquidTestnet;
+        manifest.dataset_sha256 = None;
+        manifest.ends_at = manifest.starts_at + time::Duration::days(30);
+        manifest.decision_interval_seconds = 300;
+        assert!(manifest.validate().is_ok());
+
+        manifest.decision_interval_seconds = 59;
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn historical_manifest_keeps_dataset_cadence() {
+        let mut manifest = valid_manifest();
+        manifest.decision_interval_seconds = 300;
+        assert!(manifest.validate().is_err());
     }
 
     #[test]

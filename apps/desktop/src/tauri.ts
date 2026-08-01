@@ -31,6 +31,7 @@ export type RemoteRun = {
   id: string;
   arenaId: string;
   deviceId: string;
+  agentVersionId: string;
   status: "pending" | "running" | "paused" | "stopped" | "completed" | "disqualified";
   clientRelease: string;
   startedAt: string | null;
@@ -131,8 +132,9 @@ export async function getLocalRunJournal(
 
 export async function sendLocalCommand(
   action: "pause" | "resume" | "stop",
+  agentVersionId?: string,
 ): Promise<AgentStatus> {
-  return invoke<AgentStatus>("send_local_command", { action });
+  return invoke<AgentStatus>("send_local_command", { action, agentVersionId });
 }
 
 export async function beginDeviceAuthorization(
