@@ -31,6 +31,9 @@ const INFO_USER_MODE_WEIGHT: u16 = 20;
 const INFO_ACCOUNT_STATE_WEIGHT: u16 = 2;
 const INFO_USER_HISTORY_WEIGHT: u16 = 20;
 const INFO_CANDLE_WEIGHT: u16 = 20;
+const MARKET_IOC_SLIPPAGE_BPS: i128 = 500;
+const BPS_SCALE: i128 = 10_000;
+const QUANTITY_E8_SCALE: i128 = 100_000_000;
 
 #[derive(Debug, Error)]
 pub enum HyperliquidError {
@@ -117,19 +120,76 @@ impl BookSnapshot {
                 <= u64::try_from(maximum_age.as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Returns the opposing top-of-book price that makes an IOC immediately
-    /// marketable. A buy crosses the best ask; a sell crosses the best bid.
+    /// Returns the deepest displayed opposing price inside Hyperliquid's
+    /// standard 5% market-order slippage ceiling. The returned price comes
+    /// directly from the venue book, so it already obeys that asset's tick
+    /// rules. An IOC may sweep better resting levels but can never rest.
     pub fn marketable_limit_price_micro_usdc(&self, side: Side) -> Result<i64, HyperliquidError> {
-        let level = match side {
-            Side::Buy => self.asks.first(),
-            Side::Sell => self.bids.first(),
-        }
-        .ok_or(HyperliquidError::Book)?;
-        let price = decimal_string_to_fixed(&level.price, 6)?;
-        if price <= 0 {
+        let levels = self.opposing_levels(side)?;
+        let top = decimal_string_to_fixed(&levels[0].price, 6)?;
+        if top <= 0 {
             return Err(HyperliquidError::Book);
         }
-        Ok(price)
+        let mut limit = top;
+        for level in levels {
+            let price = decimal_string_to_fixed(&level.price, 6)?;
+            if price <= 0 {
+                return Err(HyperliquidError::Book);
+            }
+            if !within_market_slippage(side, top, price) {
+                break;
+            }
+            limit = price;
+        }
+        Ok(limit)
+    }
+
+    fn marketable_depth_micro_usdc(&self, side: Side) -> Result<i64, HyperliquidError> {
+        let levels = self.opposing_levels(side)?;
+        let top = decimal_string_to_fixed(&levels[0].price, 6)?;
+        if top <= 0 {
+            return Err(HyperliquidError::Book);
+        }
+        let mut depth = 0_i128;
+        for level in levels {
+            let price = decimal_string_to_fixed(&level.price, 6)?;
+            let level_quantity_e8 = decimal_string_to_fixed(&level.size, 8)?;
+            if price <= 0 || level_quantity_e8 <= 0 {
+                return Err(HyperliquidError::Book);
+            }
+            if !within_market_slippage(side, top, price) {
+                break;
+            }
+            depth = depth
+                .checked_add(
+                    i128::from(price)
+                        .checked_mul(i128::from(level_quantity_e8))
+                        .ok_or(HyperliquidError::Numeric)?
+                        / QUANTITY_E8_SCALE,
+                )
+                .ok_or(HyperliquidError::Numeric)?;
+        }
+        i64::try_from(depth).map_err(|_| HyperliquidError::Numeric)
+    }
+
+    fn opposing_levels(&self, side: Side) -> Result<&[BookLevel], HyperliquidError> {
+        let levels = match side {
+            Side::Buy => &self.asks,
+            Side::Sell => &self.bids,
+        };
+        if levels.is_empty() {
+            return Err(HyperliquidError::Book);
+        }
+        Ok(levels)
+    }
+}
+
+fn within_market_slippage(side: Side, top: i64, candidate: i64) -> bool {
+    let candidate = i128::from(candidate) * BPS_SCALE;
+    let top = i128::from(top);
+    match side {
+        Side::Buy => candidate <= top * (BPS_SCALE + MARKET_IOC_SLIPPAGE_BPS),
+        Side::Sell => candidate >= top * (BPS_SCALE - MARKET_IOC_SLIPPAGE_BPS),
     }
 }
 
@@ -534,22 +594,8 @@ fn market_snapshot_from_parts(
             / i128::from(midpoint),
     )
     .map_err(|_| HyperliquidError::Numeric)?;
-    let bid_size = decimal_string_to_fixed(&bid.size, 8)?;
-    let ask_size = decimal_string_to_fixed(&ask.size, 8)?;
-    let bid_depth = i64::try_from(
-        i128::from(bid_price)
-            .checked_mul(i128::from(bid_size))
-            .ok_or(HyperliquidError::Numeric)?
-            / 100_000_000,
-    )
-    .map_err(|_| HyperliquidError::Numeric)?;
-    let ask_depth = i64::try_from(
-        i128::from(ask_price)
-            .checked_mul(i128::from(ask_size))
-            .ok_or(HyperliquidError::Numeric)?
-            / 100_000_000,
-    )
-    .map_err(|_| HyperliquidError::Numeric)?;
+    let bid_depth = book.marketable_depth_micro_usdc(Side::Sell)?;
+    let ask_depth = book.marketable_depth_micro_usdc(Side::Buy)?;
     Ok(MarketSnapshot {
         market: crate::MarketState {
             symbol: asset.symbol.clone(),
@@ -933,6 +979,60 @@ mod tests {
             book.marketable_limit_price_micro_usdc(Side::Sell)?,
             63_443_000_000
         );
+        Ok(())
+    }
+
+    #[test]
+    fn market_ioc_uses_displayed_depth_inside_the_five_percent_ceiling()
+    -> Result<(), HyperliquidError> {
+        let book = BookSnapshot {
+            symbol: "BTC".into(),
+            venue_time_ms: 1,
+            bids: vec![
+                BookLevel {
+                    price: "63477".into(),
+                    size: "0.00024".into(),
+                    order_count: 1,
+                },
+                BookLevel {
+                    price: "63462".into(),
+                    size: "0.00155".into(),
+                    order_count: 1,
+                },
+                BookLevel {
+                    price: "50000".into(),
+                    size: "10".into(),
+                    order_count: 1,
+                },
+            ],
+            asks: vec![
+                BookLevel {
+                    price: "63490".into(),
+                    size: "0.00024".into(),
+                    order_count: 1,
+                },
+                BookLevel {
+                    price: "63498".into(),
+                    size: "0.00132".into(),
+                    order_count: 1,
+                },
+                BookLevel {
+                    price: "70000".into(),
+                    size: "10".into(),
+                    order_count: 1,
+                },
+            ],
+        };
+        assert_eq!(
+            book.marketable_limit_price_micro_usdc(Side::Buy)?,
+            63_498_000_000
+        );
+        assert_eq!(
+            book.marketable_limit_price_micro_usdc(Side::Sell)?,
+            63_462_000_000
+        );
+        assert_eq!(book.marketable_depth_micro_usdc(Side::Buy)?, 99_054_960);
+        assert_eq!(book.marketable_depth_micro_usdc(Side::Sell)?, 113_600_580);
         Ok(())
     }
 

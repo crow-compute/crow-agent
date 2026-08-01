@@ -715,8 +715,8 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn normalizes_the_observed_unmarketable_iocs_to_the_opposing_top() -> Result<(), LiveCycleError>
-    {
+    fn normalizes_the_observed_unmarketable_iocs_to_a_bounded_market_ioc()
+    -> Result<(), LiveCycleError> {
         let eth = MarketSnapshot {
             market: crate::MarketState {
                 symbol: "ETH".into(),
@@ -737,11 +737,18 @@ mod tests {
                     size: "1".into(),
                     order_count: 1,
                 }],
-                asks: vec![crate::BookLevel {
-                    price: "1873.1".into(),
-                    size: "1".into(),
-                    order_count: 1,
-                }],
+                asks: vec![
+                    crate::BookLevel {
+                        price: "1873.1".into(),
+                        size: "1".into(),
+                        order_count: 1,
+                    },
+                    crate::BookLevel {
+                        price: "1873.4".into(),
+                        size: "2".into(),
+                        order_count: 1,
+                    },
+                ],
             },
         };
         let proposal = Proposal {
@@ -752,13 +759,13 @@ mod tests {
             reduce_only: false,
         };
         let normalized = marketable_proposal(&proposal, &BTreeMap::from([("ETH".into(), eth)]))?;
-        assert_eq!(normalized.limit_price_micro_usdc, 1_873_100_000);
+        assert_eq!(normalized.limit_price_micro_usdc, 1_873_400_000);
         Ok(())
     }
 
     #[test]
     fn normalizes_the_failed_btc_ioc_to_the_refreshed_dispatch_ask() -> Result<(), LiveCycleError> {
-        let snapshot = |ask: &str| MarketSnapshot {
+        let snapshot = |asks: &[&str]| MarketSnapshot {
             market: crate::MarketState {
                 symbol: "BTC".into(),
                 mark_price_micro_usdc: 63_549_000_000,
@@ -778,11 +785,14 @@ mod tests {
                     size: "1".into(),
                     order_count: 1,
                 }],
-                asks: vec![crate::BookLevel {
-                    price: ask.into(),
-                    size: "1".into(),
-                    order_count: 1,
-                }],
+                asks: asks
+                    .iter()
+                    .map(|ask| crate::BookLevel {
+                        price: (*ask).into(),
+                        size: "1".into(),
+                        order_count: 1,
+                    })
+                    .collect(),
             },
         };
         let proposal = Proposal {
@@ -794,14 +804,14 @@ mod tests {
         };
         let stale = marketable_proposal(
             &proposal,
-            &BTreeMap::from([("BTC".into(), snapshot("63538"))]),
+            &BTreeMap::from([("BTC".into(), snapshot(&["63538"]))]),
         )?;
         let dispatch = marketable_proposal(
             &proposal,
-            &BTreeMap::from([("BTC".into(), snapshot("63550"))]),
+            &BTreeMap::from([("BTC".into(), snapshot(&["63550", "63558"]))]),
         )?;
         assert_eq!(stale.limit_price_micro_usdc, 63_538_000_000);
-        assert_eq!(dispatch.limit_price_micro_usdc, 63_550_000_000);
+        assert_eq!(dispatch.limit_price_micro_usdc, 63_558_000_000);
         assert_ne!(
             dispatch.limit_price_micro_usdc,
             stale.limit_price_micro_usdc
