@@ -345,6 +345,61 @@ describe("Crow Agent shell", () => {
     expect(decisions[0].summary).not.toMatch(/momentum|signal|risk/i);
   });
 
+  it("shows an explicit venue rejection instead of reporting a generic no-fill", () => {
+    const cycleId = "30ed70c7-e407-40a7-93d8-e58e418638b6";
+    const decisions = journalDecisions([
+      {
+        sequence: 1,
+        cycleId,
+        eventType: "proposal",
+        occurredAt: "2026-08-01T06:43:45Z",
+        receipted: true,
+        details: {
+          action: "order",
+          decision_summary: "BTC setup met the configured strategy criteria.",
+          proposal: { symbol: "BTC", side: "buy", notional_bps: 100 },
+        },
+      },
+      {
+        sequence: 2,
+        cycleId,
+        eventType: "policy_outcome",
+        occurredAt: "2026-08-01T06:44:05Z",
+        receipted: true,
+        details: { allowed: true },
+      },
+      {
+        sequence: 3,
+        cycleId,
+        eventType: "order_submitted",
+        occurredAt: "2026-08-01T06:44:06Z",
+        receipted: true,
+        details: { phase: "dispatching" },
+      },
+      {
+        sequence: 4,
+        cycleId,
+        eventType: "venue_acknowledgement",
+        occurredAt: "2026-08-01T06:44:06Z",
+        receipted: true,
+        details: {
+          statuses: [{ accepted: false, state: "venue_rejected", reason: "ioc_would_not_fill" }],
+        },
+      },
+      {
+        sequence: 5,
+        cycleId,
+        eventType: "fill",
+        occurredAt: "2026-08-01T06:44:07Z",
+        receipted: true,
+        details: { fills: [] },
+      },
+    ]);
+    expect(decisions[0].status).toBe("VENUE REJECTED");
+    expect(decisions[0].noTradeReason).toMatch(/could not immediately match/i);
+    expect(decisions[0].noTradeReason).not.toMatch(/reached the venue, but no fill/i);
+  });
+
   it("distinguishes an inference failure from a model HOLD", () => {
     const decisions = journalDecisions([{
       sequence: 1,

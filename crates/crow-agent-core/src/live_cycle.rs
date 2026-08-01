@@ -61,6 +61,12 @@ pub trait LiveVenue: Send + Sync {
         now_ms: u64,
     ) -> Result<BTreeMap<String, MarketSnapshot>, HyperliquidError>;
 
+    async fn fresh_market_snapshot(
+        &self,
+        symbol: &str,
+        now_ms: u64,
+    ) -> Result<MarketSnapshot, HyperliquidError>;
+
     async fn recent_candles(
         &self,
         start_time_ms: u64,
@@ -103,6 +109,14 @@ impl LiveVenue for HyperliquidVenue {
         now_ms: u64,
     ) -> Result<BTreeMap<String, MarketSnapshot>, HyperliquidError> {
         HyperliquidVenue::market_snapshots(self, books, now_ms).await
+    }
+
+    async fn fresh_market_snapshot(
+        &self,
+        symbol: &str,
+        now_ms: u64,
+    ) -> Result<MarketSnapshot, HyperliquidError> {
+        HyperliquidVenue::fresh_market_snapshot(self, symbol, now_ms).await
     }
 
     async fn recent_candles(
@@ -468,19 +482,51 @@ where
         });
     };
     let proposal_symbol = proposal.symbol.clone();
-    let marketable_proposal = marketable_proposal(&proposal, &snapshots)?;
-    let market = markets
-        .get(&proposal_symbol)
-        .ok_or(LiveCycleError::RiskState)?;
-    let portfolio = portfolios
-        .get(&proposal_symbol)
-        .ok_or(LiveCycleError::RiskState)?;
+    // Inference can take several seconds. Refresh account state first, then
+    // fetch the target book last so the IOC crosses dispatch-time liquidity.
+    let dispatch_account = venue.account_snapshot(execution_account).await?;
+    validate_account_policy(&dispatch_account)?;
+    update_risk_state(risk, &dispatch_account, now.date());
+    let dispatch_now_ms = unix_milliseconds(OffsetDateTime::now_utc())?;
+    let dispatch_snapshot = venue
+        .fresh_market_snapshot(&proposal_symbol, dispatch_now_ms)
+        .await?;
+    writer
+        .append(
+            Some(cycle_id),
+            "book_snapshot",
+            json!({ proposal_symbol.clone(): &dispatch_snapshot }),
+            &Value::Null,
+        )
+        .await?;
+    let marketable_proposal = marketable_proposal(
+        &proposal,
+        &BTreeMap::from([(proposal_symbol.clone(), dispatch_snapshot.clone())]),
+    )?;
+    let market = &dispatch_snapshot.market;
+    let portfolio = PortfolioState {
+        equity_micro_usdc: dispatch_account.equity_micro_usdc,
+        available_collateral_micro_usdc: dispatch_account.withdrawable_micro_usdc,
+        trading_day_start_equity_micro_usdc: risk.trading_day_start_equity_micro_usdc,
+        peak_equity_micro_usdc: risk.peak_equity_micro_usdc,
+        symbol_position_micro_usdc: dispatch_account.positions.get(&proposal_symbol).map_or(
+            0,
+            |position| {
+                if position.quantity_e8 < 0 {
+                    -position.notional_micro_usdc
+                } else {
+                    position.notional_micro_usdc
+                }
+            },
+        ),
+        orders_today: risk.orders_today,
+    };
     let normalized_order = evaluate_proposal(
         &marketable_proposal,
         &PolicyContext {
             rules: &manifest.risk_rules,
             market,
-            portfolio,
+            portfolio: &portfolio,
             starting_capital_micro_usdc: i64::try_from(manifest.starting_capital_micro_usdc)
                 .map_err(|_| LiveCycleError::RiskState)?,
         },
@@ -710,6 +756,59 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn normalizes_the_failed_btc_ioc_to_the_refreshed_dispatch_ask() -> Result<(), LiveCycleError> {
+        let snapshot = |ask: &str| MarketSnapshot {
+            market: crate::MarketState {
+                symbol: "BTC".into(),
+                mark_price_micro_usdc: 63_549_000_000,
+                oracle_price_micro_usdc: 63_549_000_000,
+                spread_bps: 1,
+                book_age_seconds: 0,
+                ask_depth_micro_usdc: 100_000_000,
+                bid_depth_micro_usdc: 100_000_000,
+                size_decimals: 5,
+                delisted: false,
+            },
+            book: BookSnapshot {
+                symbol: "BTC".into(),
+                venue_time_ms: 1,
+                bids: vec![crate::BookLevel {
+                    price: "63548".into(),
+                    size: "1".into(),
+                    order_count: 1,
+                }],
+                asks: vec![crate::BookLevel {
+                    price: ask.into(),
+                    size: "1".into(),
+                    order_count: 1,
+                }],
+            },
+        };
+        let proposal = Proposal {
+            symbol: "BTC".into(),
+            side: crate::Side::Buy,
+            notional_bps: 100,
+            limit_price_micro_usdc: 63_538_000_000,
+            reduce_only: false,
+        };
+        let stale = marketable_proposal(
+            &proposal,
+            &BTreeMap::from([("BTC".into(), snapshot("63538"))]),
+        )?;
+        let dispatch = marketable_proposal(
+            &proposal,
+            &BTreeMap::from([("BTC".into(), snapshot("63550"))]),
+        )?;
+        assert_eq!(stale.limit_price_micro_usdc, 63_538_000_000);
+        assert_eq!(dispatch.limit_price_micro_usdc, 63_550_000_000);
+        assert_ne!(
+            dispatch.limit_price_micro_usdc,
+            stale.limit_price_micro_usdc
+        );
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct ReconciliationVenue {
         account: AccountSnapshot,
@@ -729,6 +828,14 @@ mod tests {
             _books: Vec<BookSnapshot>,
             _now_ms: u64,
         ) -> Result<BTreeMap<String, MarketSnapshot>, HyperliquidError> {
+            unreachable!("market snapshots are not part of session reconciliation")
+        }
+
+        async fn fresh_market_snapshot(
+            &self,
+            _symbol: &str,
+            _now_ms: u64,
+        ) -> Result<MarketSnapshot, HyperliquidError> {
             unreachable!("market snapshots are not part of session reconciliation")
         }
 

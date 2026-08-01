@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -390,62 +390,59 @@ impl HyperliquidVenue {
             let context = contexts
                 .get(usize::try_from(asset.asset_index).map_err(|_| HyperliquidError::Snapshot)?)
                 .ok_or(HyperliquidError::Snapshot)?;
-            let book = books.get(symbol).ok_or(HyperliquidError::Book)?.clone();
-            let bid = book.bids.first().ok_or(HyperliquidError::Book)?;
-            let ask = book.asks.first().ok_or(HyperliquidError::Book)?;
-            let bid_price = decimal_string_to_fixed(&bid.price, 6)?;
-            let ask_price = decimal_string_to_fixed(&ask.price, 6)?;
-            if bid_price <= 0 || ask_price < bid_price || now_ms < book.venue_time_ms {
-                return Err(HyperliquidError::Book);
-            }
-            let midpoint = bid_price
-                .checked_add(ask_price)
-                .ok_or(HyperliquidError::Numeric)?
-                / 2;
-            let spread_bps = i64::try_from(
-                i128::from(ask_price - bid_price)
-                    .checked_mul(10_000)
-                    .ok_or(HyperliquidError::Numeric)?
-                    / i128::from(midpoint),
-            )
-            .map_err(|_| HyperliquidError::Numeric)?;
-            let bid_size = decimal_string_to_fixed(&bid.size, 8)?;
-            let ask_size = decimal_string_to_fixed(&ask.size, 8)?;
-            let bid_depth = i64::try_from(
-                i128::from(bid_price)
-                    .checked_mul(i128::from(bid_size))
-                    .ok_or(HyperliquidError::Numeric)?
-                    / 100_000_000,
-            )
-            .map_err(|_| HyperliquidError::Numeric)?;
-            let ask_depth = i64::try_from(
-                i128::from(ask_price)
-                    .checked_mul(i128::from(ask_size))
-                    .ok_or(HyperliquidError::Numeric)?
-                    / 100_000_000,
-            )
-            .map_err(|_| HyperliquidError::Numeric)?;
             snapshots.insert(
                 symbol.to_owned(),
-                MarketSnapshot {
-                    market: crate::MarketState {
-                        symbol: symbol.to_owned(),
-                        mark_price_micro_usdc: decimal_to_fixed(context.mark_px, 6)?,
-                        oracle_price_micro_usdc: decimal_to_fixed(context.oracle_px, 6)?,
-                        spread_bps: u16::try_from(spread_bps)
-                            .map_err(|_| HyperliquidError::Numeric)?,
-                        book_age_seconds: u16::try_from((now_ms - book.venue_time_ms) / 1_000)
-                            .unwrap_or(u16::MAX),
-                        ask_depth_micro_usdc: ask_depth,
-                        bid_depth_micro_usdc: bid_depth,
-                        size_decimals: asset.size_decimals,
-                        delisted: false,
-                    },
-                    book,
-                },
+                market_snapshot_from_parts(
+                    asset,
+                    context,
+                    books.get(symbol).ok_or(HyperliquidError::Book)?.clone(),
+                    now_ms,
+                )?,
             );
         }
         Ok(snapshots)
+    }
+
+    /// Fetches the target market metadata first and its L2 book last so an IOC
+    /// can be normalized and checked against dispatch-time liquidity.
+    pub async fn fresh_market_snapshot(
+        &self,
+        symbol: &str,
+        now_ms: u64,
+    ) -> Result<MarketSnapshot, HyperliquidError> {
+        let asset = self.assets.get(symbol).ok_or(HyperliquidError::Symbol)?;
+        self.budget.consume(INFO_META_WEIGHT)?;
+        let raw = self
+            .client
+            .meta_and_asset_ctxs(None)
+            .await
+            .map_err(|_| HyperliquidError::Sdk)?;
+        let values = raw.as_array().ok_or(HyperliquidError::Snapshot)?;
+        if values.len() != 2 {
+            return Err(HyperliquidError::Snapshot);
+        }
+        let contexts = serde_json::from_value::<Vec<PerpAssetCtx>>(values[1].clone())
+            .map_err(|_| HyperliquidError::Snapshot)?;
+        let context = contexts
+            .get(usize::try_from(asset.asset_index).map_err(|_| HyperliquidError::Snapshot)?)
+            .ok_or(HyperliquidError::Snapshot)?;
+
+        self.budget.consume(INFO_L2_WEIGHT)?;
+        let snapshot = self
+            .client
+            .l2_book(symbol.to_owned(), None, None)
+            .await
+            .map_err(|_| HyperliquidError::Sdk)?;
+        let book = BookSnapshot::try_from_parts(snapshot.coin, snapshot.time, &snapshot.levels)?;
+        let observed_at_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| HyperliquidError::Snapshot)?
+                .as_millis(),
+        )
+        .map_err(|_| HyperliquidError::Snapshot)?
+        .max(now_ms);
+        market_snapshot_from_parts(asset, context, book, observed_at_ms)
     }
 
     pub async fn recent_candles(
@@ -511,6 +508,63 @@ impl HyperliquidVenue {
             .collect::<Vec<_>>();
         serde_json::to_value(funding).map_err(|_| HyperliquidError::Snapshot)
     }
+}
+
+fn market_snapshot_from_parts(
+    asset: &CoreAsset,
+    context: &PerpAssetCtx,
+    book: BookSnapshot,
+    now_ms: u64,
+) -> Result<MarketSnapshot, HyperliquidError> {
+    let bid = book.bids.first().ok_or(HyperliquidError::Book)?;
+    let ask = book.asks.first().ok_or(HyperliquidError::Book)?;
+    let bid_price = decimal_string_to_fixed(&bid.price, 6)?;
+    let ask_price = decimal_string_to_fixed(&ask.price, 6)?;
+    if bid_price <= 0 || ask_price < bid_price || now_ms < book.venue_time_ms {
+        return Err(HyperliquidError::Book);
+    }
+    let midpoint = bid_price
+        .checked_add(ask_price)
+        .ok_or(HyperliquidError::Numeric)?
+        / 2;
+    let spread_bps = i64::try_from(
+        i128::from(ask_price - bid_price)
+            .checked_mul(10_000)
+            .ok_or(HyperliquidError::Numeric)?
+            / i128::from(midpoint),
+    )
+    .map_err(|_| HyperliquidError::Numeric)?;
+    let bid_size = decimal_string_to_fixed(&bid.size, 8)?;
+    let ask_size = decimal_string_to_fixed(&ask.size, 8)?;
+    let bid_depth = i64::try_from(
+        i128::from(bid_price)
+            .checked_mul(i128::from(bid_size))
+            .ok_or(HyperliquidError::Numeric)?
+            / 100_000_000,
+    )
+    .map_err(|_| HyperliquidError::Numeric)?;
+    let ask_depth = i64::try_from(
+        i128::from(ask_price)
+            .checked_mul(i128::from(ask_size))
+            .ok_or(HyperliquidError::Numeric)?
+            / 100_000_000,
+    )
+    .map_err(|_| HyperliquidError::Numeric)?;
+    Ok(MarketSnapshot {
+        market: crate::MarketState {
+            symbol: asset.symbol.clone(),
+            mark_price_micro_usdc: decimal_to_fixed(context.mark_px, 6)?,
+            oracle_price_micro_usdc: decimal_to_fixed(context.oracle_px, 6)?,
+            spread_bps: u16::try_from(spread_bps).map_err(|_| HyperliquidError::Numeric)?,
+            book_age_seconds: u16::try_from((now_ms - book.venue_time_ms) / 1_000)
+                .unwrap_or(u16::MAX),
+            ask_depth_micro_usdc: ask_depth,
+            bid_depth_micro_usdc: bid_depth,
+            size_decimals: asset.size_decimals,
+            delisted: false,
+        },
+        book,
+    })
 }
 
 fn display_safe_venue_rejection(message: &str) -> &'static str {
