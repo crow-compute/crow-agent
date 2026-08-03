@@ -144,6 +144,18 @@ impl BookSnapshot {
         Ok(limit)
     }
 
+    /// Returns the current best opposing quote. Quantity normalization uses
+    /// this executable price so the IOC remains at or above the venue's
+    /// minimum notional even when its protective limit is padded deeper.
+    pub fn opposing_top_price_micro_usdc(&self, side: Side) -> Result<i64, HyperliquidError> {
+        let levels = self.opposing_levels(side)?;
+        let top = decimal_string_to_fixed(&levels[0].price, 6)?;
+        if top <= 0 {
+            return Err(HyperliquidError::Book);
+        }
+        Ok(top)
+    }
+
     fn marketable_depth_micro_usdc(&self, side: Side) -> Result<i64, HyperliquidError> {
         let levels = self.opposing_levels(side)?;
         let top = decimal_string_to_fixed(&levels[0].price, 6)?;

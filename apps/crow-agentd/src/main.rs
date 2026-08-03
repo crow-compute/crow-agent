@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 use crow_agent_core::{
     BacktestEngine, CompanionActionV1, CompanionIpcError, CompanionRequestV1, CompanionResponseV1,
     DeviceAuthorizationClient, DeviceAuthorizationError, DeviceEncryptionKey, EncryptedJournal,
-    MAX_COMPANION_MESSAGE_BYTES, ScheduledProposal, StrategyBundleV1, TlsProviderError,
-    install_tls_crypto_provider, read_verified_dataset,
+    MAX_COMPANION_MESSAGE_BYTES, RotatingAccessToken, ScheduledProposal, StrategyBundleV1,
+    TlsProviderError, install_tls_crypto_provider, read_verified_dataset,
 };
 use crow_agent_protocol::{
     DatasetManifestV1, DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1,
@@ -248,6 +248,8 @@ enum DaemonError {
     Journal(#[from] crow_agent_core::JournalError),
     #[error("device token rotation failed")]
     DeviceAuthorization(#[from] crow_agent_core::DeviceAuthorizationError),
+    #[error("device access token is invalid")]
+    HarnessApi(#[from] crow_agent_core::HarnessApiError),
     #[error("device authorization was not completed before expiry")]
     AuthorizationExpired,
     #[error("remote command is invalid")]
@@ -724,7 +726,7 @@ fn read_secret_32(reader: &mut impl Read) -> Result<Zeroizing<[u8; 32]>, DaemonE
     Ok(value)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_relay(
     config: &DaemonConfig,
     identity: &DeviceIdentity,
@@ -744,18 +746,42 @@ async fn run_relay(
     }
     let authorization = DeviceAuthorizationClient::new(&config.api_origin)?;
     let mut backoff = Duration::from_secs(1);
-    loop {
-        let tokens = match authorization.rotate(&refresh_token, identity).await {
-            Ok(tokens) => tokens,
+    let mut tokens = loop {
+        match authorization.rotate(&refresh_token, identity).await {
+            Ok(tokens) => break tokens,
             Err(error) => {
                 warn!(error = %error, "device token rotation failed; no new decisions are permitted");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_mins(1));
-                continue;
             }
-        };
-        journal.put_secret(REFRESH_TOKEN_SECRET, tokens.refresh_token.as_bytes())?;
-        refresh_token = Zeroizing::new(tokens.refresh_token.to_string());
+        }
+    };
+    journal.put_secret(REFRESH_TOKEN_SECRET, tokens.refresh_token.as_bytes())?;
+    refresh_token = Zeroizing::new(tokens.refresh_token.to_string());
+    let access_token = RotatingAccessToken::new(tokens.access_token.as_str())?;
+    let mut live_session = if let (Some(live_arena), Some(api_wallet_key)) =
+        (live_arena, api_wallet_key)
+        && execution_gate.label() != "stopped"
+    {
+        Some(Box::pin(live_run::run_session(
+            live_arena,
+            &config.api_origin,
+            &config.state_directory,
+            journal_key,
+            api_wallet_key,
+            config.device_id,
+            device_encryption_key,
+            access_token.clone(),
+            identity,
+            execution_gate,
+            active_run,
+            pending_strategy,
+        )))
+    } else {
+        None
+    };
+
+    loop {
         let relay = relay_session(
             config,
             identity,
@@ -765,38 +791,42 @@ async fn run_relay(
             execution_gate,
             active_run,
         );
-        let session_result = if let (Some(live_arena), Some(api_wallet_key)) =
-            (live_arena, api_wallet_key)
-            && execution_gate.label() != "stopped"
-        {
+        let session_result = if let Some(live) = live_session.as_mut() {
             tokio::select! {
-                result = relay => result,
-                result = live_run::run_session(
-                    live_arena,
-                    &config.api_origin,
-                    &config.state_directory,
-                    journal_key,
-                    api_wallet_key,
-                    config.device_id,
-                    device_encryption_key,
-                    &tokens.access_token,
-                    identity,
-                    execution_gate,
-                    active_run,
-                    pending_strategy,
-                ) => match result {
-                    Ok(live_run::LiveSessionOutcome::Stopped) => Ok(()),
-                    Err(error) => Err(DaemonError::LiveRun(error)),
-                },
+                result = relay => SessionResult::Relay(result),
+                result = live => SessionResult::Live(result),
             }
         } else {
-            relay.await
+            SessionResult::Relay(relay.await)
         };
         match session_result {
-            Ok(()) => {
+            SessionResult::Relay(Ok(RelaySessionOutcome::Rotate)) => loop {
+                match authorization.rotate(&refresh_token, identity).await {
+                    Ok(next) => {
+                        journal.put_secret(REFRESH_TOKEN_SECRET, next.refresh_token.as_bytes())?;
+                        refresh_token = Zeroizing::new(next.refresh_token.to_string());
+                        access_token.replace(next.access_token.as_str())?;
+                        tokens = next;
+                        backoff = Duration::from_secs(1);
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "device token rotation failed; no new decisions are permitted");
+                        execution_gate
+                            .state
+                            .store(EXECUTION_PAUSED, Ordering::SeqCst);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_mins(1));
+                    }
+                }
+            },
+            SessionResult::Relay(Ok(RelaySessionOutcome::Shutdown)) => return Ok(()),
+            SessionResult::Live(Ok(live_run::LiveSessionOutcome::Stopped)) => {
+                live_session = None;
                 backoff = Duration::from_secs(1);
             }
-            Err(error) => {
+            SessionResult::Live(Err(error)) => return Err(DaemonError::LiveRun(error)),
+            SessionResult::Relay(Err(error)) => {
                 warn!(error = %error, "relay session ended; no new decisions are permitted");
                 execution_gate
                     .state
@@ -808,6 +838,17 @@ async fn run_relay(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelaySessionOutcome {
+    Rotate,
+    Shutdown,
+}
+
+enum SessionResult {
+    Relay(Result<RelaySessionOutcome, DaemonError>),
+    Live(Result<live_run::LiveSessionOutcome, live_run::LiveRunError>),
+}
+
 async fn relay_session(
     config: &DaemonConfig,
     identity: &DeviceIdentity,
@@ -816,7 +857,7 @@ async fn relay_session(
     access_expires_at: OffsetDateTime,
     execution_gate: &ExecutionGate,
     active_run: &Arc<std::sync::Mutex<Option<Uuid>>>,
-) -> Result<(), DaemonError> {
+) -> Result<RelaySessionOutcome, DaemonError> {
     let mut connection = connect_authenticated(config, identity, access_token).await?;
     info!(device_id = %config.device_id, "outbound relay authentication sent");
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
@@ -835,7 +876,7 @@ async fn relay_session(
                 // Give the relay handler time to release distributed device
                 // ownership before the next scoped token reconnects.
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                return Ok(());
+                return Ok(RelaySessionOutcome::Rotate);
             }
             _ = heartbeat.tick() => {
                 let active_run = *active_run
@@ -860,7 +901,7 @@ async fn relay_session(
                         let envelope = serde_json::from_str::<WireEnvelope>(&raw)?;
                         if envelope.protocol == HARNESS_PROTOCOL_V1 && envelope.kind == "shutdown" {
                             info!("relay requested shutdown");
-                            return Ok(());
+                            return Ok(RelaySessionOutcome::Shutdown);
                         }
                         let command_run = *active_run
                             .lock()

@@ -29,7 +29,8 @@ pub use companion::{
     MAX_COMPANION_MESSAGE_BYTES,
 };
 pub use control_plane::{
-    HarnessApiClient, HarnessApiError, HarnessRunV1, StartHarnessRunV1, StartedHarnessRunV1,
+    HarnessApiClient, HarnessApiError, HarnessRunV1, RotatingAccessToken, StartHarnessRunV1,
+    StartedHarnessRunV1,
 };
 pub use crypto::{BundleCiphertext, DeviceEncryptionKey, WrappedBundleKey};
 pub use dataset::{

@@ -529,6 +529,11 @@ where
             portfolio: &portfolio,
             starting_capital_micro_usdc: i64::try_from(manifest.starting_capital_micro_usdc)
                 .map_err(|_| LiveCycleError::RiskState)?,
+            quantity_reference_price_micro_usdc: Some(
+                dispatch_snapshot
+                    .book
+                    .opposing_top_price_micro_usdc(proposal.side)?,
+            ),
         },
     );
     let order = match normalized_order {

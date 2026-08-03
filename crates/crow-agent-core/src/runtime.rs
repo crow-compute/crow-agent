@@ -257,6 +257,7 @@ where
                             context.manifest.starting_capital_micro_usdc,
                         )
                         .unwrap_or(i64::MAX),
+                        quantity_reference_price_micro_usdc: None,
                     },
                 );
                 return Ok(CycleOutcome {
