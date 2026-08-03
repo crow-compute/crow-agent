@@ -127,6 +127,7 @@ impl BacktestEngine {
                 market: &market,
                 portfolio,
                 starting_capital_micro_usdc: portfolio.equity_micro_usdc,
+                quantity_reference_price_micro_usdc: None,
             },
         )?;
         let fee = i64::try_from(

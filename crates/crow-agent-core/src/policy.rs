@@ -53,6 +53,10 @@ pub struct PolicyContext<'a> {
     /// Equal arena capital chosen by the host. Wallet equity above this amount
     /// cannot increase order or position sizing.
     pub starting_capital_micro_usdc: i64,
+    /// Fresh opposing top-of-book price used only to derive the venue-minimum
+    /// quantity. The proposal limit remains the worst executable IOC price
+    /// used for every exposure and collateral check.
+    pub quantity_reference_price_micro_usdc: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +119,9 @@ pub fn evaluate_proposal(
     if market.mark_price_micro_usdc <= 0
         || market.oracle_price_micro_usdc <= 0
         || proposal.limit_price_micro_usdc <= 0
+        || context
+            .quantity_reference_price_micro_usdc
+            .is_some_and(|price| price <= 0)
         || market.size_decimals > 8
         || portfolio.equity_micro_usdc <= 0
         || capital <= 0
@@ -157,9 +164,12 @@ pub fn evaluate_proposal(
 
     let requested = bps_amount(capital, i64::from(proposal.notional_bps))?;
     let normalized = requested.max(MIN_ORDER_MICRO_USDC);
+    let quantity_reference_price = context
+        .quantity_reference_price_micro_usdc
+        .unwrap_or(proposal.limit_price_micro_usdc);
     let raw_quantity = ceil_div(
         i128::from(normalized) * i128::from(QUANTITY_SCALE),
-        i128::from(proposal.limit_price_micro_usdc),
+        i128::from(quantity_reference_price),
     )?;
     let step = 10_i64
         .checked_pow(u32::from(8 - market.size_decimals))
@@ -274,6 +284,7 @@ mod tests {
             market,
             portfolio,
             starting_capital_micro_usdc: portfolio.equity_micro_usdc,
+            quantity_reference_price_micro_usdc: None,
         }
     }
 
@@ -311,6 +322,47 @@ mod tests {
         )?;
         assert_eq!(order.quantity_e8, 500_000);
         assert_eq!(order.actual_notional_micro_usdc, 10_000_000);
+        Ok(())
+    }
+
+    #[test]
+    fn venue_minimum_uses_executable_quote_not_padded_limit() -> Result<(), PolicyError> {
+        let rules = RiskRulesV1::default();
+        let market = MarketState {
+            symbol: "ETH".into(),
+            mark_price_micro_usdc: 1_844_300_000,
+            oracle_price_micro_usdc: 1_844_300_000,
+            spread_bps: 2,
+            book_age_seconds: 1,
+            ask_depth_micro_usdc: 100_000_000,
+            bid_depth_micro_usdc: 100_000_000,
+            size_decimals: 4,
+            delisted: false,
+        };
+        let portfolio = PortfolioState {
+            equity_micro_usdc: 1_000_000_000,
+            available_collateral_micro_usdc: 1_000_000_000,
+            trading_day_start_equity_micro_usdc: 1_000_000_000,
+            peak_equity_micro_usdc: 1_000_000_000,
+            symbol_position_micro_usdc: 0,
+            orders_today: 0,
+        };
+        let mut policy = context(&rules, &market, &portfolio);
+        policy.quantity_reference_price_micro_usdc = Some(1_844_300_000);
+        let order = evaluate_proposal(
+            &Proposal {
+                symbol: "ETH".into(),
+                side: Side::Buy,
+                notional_bps: 1,
+                limit_price_micro_usdc: 1_853_300_000,
+                reduce_only: false,
+            },
+            &policy,
+        )?;
+        assert_eq!(order.quantity_e8, 550_000);
+        let executable_notional = order.quantity_e8 * 1_844_300_000 / QUANTITY_SCALE;
+        assert!(executable_notional >= MIN_ORDER_MICRO_USDC);
+        assert_eq!(order.actual_notional_micro_usdc, 10_193_150);
         Ok(())
     }
 
@@ -385,6 +437,7 @@ mod tests {
                 market: &market,
                 portfolio: &portfolio,
                 starting_capital_micro_usdc: 1_000_000_000,
+                quantity_reference_price_micro_usdc: None,
             },
         )?;
         assert_eq!(order.actual_notional_micro_usdc, 20_000_000);

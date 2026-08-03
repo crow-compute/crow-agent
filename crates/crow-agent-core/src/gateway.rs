@@ -1,9 +1,12 @@
-use crate::runtime::{
-    InferenceProvider, InferenceTurn, ModelTurn, ModelTurnRequest, RuntimeError, ToolResult,
+use crate::{
+    RotatingAccessToken,
+    runtime::{
+        InferenceProvider, InferenceTurn, ModelTurn, ModelTurnRequest, RuntimeError, ToolResult,
+    },
 };
 use async_trait::async_trait;
 use crow_agent_protocol::{ArenaInferenceReceiptV1, canonical_json, sha256};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
@@ -11,7 +14,6 @@ use thiserror::Error;
 use tracing::warn;
 use url::Url;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 const GATEWAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GATEWAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
@@ -102,31 +104,39 @@ struct ModelPrompt<'a> {
 #[derive(Debug)]
 pub struct GatewayClient {
     endpoint: Url,
-    token: Zeroizing<String>,
+    access_token: RotatingAccessToken,
     client: reqwest::Client,
 }
 
 impl GatewayClient {
     pub fn new(api_origin: &str, token: &str) -> Result<Self, GatewayError> {
-        Self::with_request_timeout(api_origin, token, GATEWAY_REQUEST_TIMEOUT)
+        let token = RotatingAccessToken::new(token).map_err(|_| GatewayError::Authorization)?;
+        Self::with_access_token(api_origin, token)
+    }
+
+    pub fn with_access_token(
+        api_origin: &str,
+        access_token: RotatingAccessToken,
+    ) -> Result<Self, GatewayError> {
+        Self::with_request_timeout(api_origin, access_token, GATEWAY_REQUEST_TIMEOUT)
     }
 
     fn with_request_timeout(
         api_origin: &str,
-        token: &str,
+        access_token: RotatingAccessToken,
         request_timeout: Duration,
     ) -> Result<Self, GatewayError> {
         let endpoint = Url::parse(api_origin)
             .map_err(|_| GatewayError::Url)?
             .join("/api/v1/harness/inference")
             .map_err(|_| GatewayError::Url)?;
-        if token.trim().is_empty() {
-            return Err(GatewayError::Authorization);
-        }
+        access_token
+            .authorization()
+            .map_err(|_| GatewayError::Authorization)?;
         let https_only = endpoint.scheme() == "https";
         Ok(Self {
             endpoint,
-            token: Zeroizing::new(token.to_owned()),
+            access_token,
             client: reqwest::Client::builder()
                 .https_only(https_only)
                 .connect_timeout(GATEWAY_CONNECT_TIMEOUT)
@@ -140,7 +150,9 @@ impl GatewayClient {
         &self,
         request: &InferenceRequest,
     ) -> Result<InferenceResponse, GatewayError> {
-        let authorization = HeaderValue::from_str(&format!("Bearer {}", self.token.as_str()))
+        let authorization = self
+            .access_token
+            .authorization()
             .map_err(|_| GatewayError::Authorization)?;
         let response = self
             .client
@@ -356,7 +368,7 @@ mod tests {
         });
         let client = GatewayClient::with_request_timeout(
             &format!("http://{address}"),
-            "test-token",
+            RotatingAccessToken::new("test-token")?,
             Duration::from_millis(25),
         )?;
         let request = InferenceRequest {

@@ -5,7 +5,10 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::time::Duration;
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 use url::Url;
@@ -100,9 +103,54 @@ struct SwitchRunStrategyRequest {
     agent_version_id: Uuid,
 }
 
+#[derive(Clone)]
+pub struct RotatingAccessToken {
+    inner: Arc<RwLock<Zeroizing<String>>>,
+}
+
+impl std::fmt::Debug for RotatingAccessToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("RotatingAccessToken")
+            .field(&"[REDACTED]")
+            .finish()
+    }
+}
+
+impl RotatingAccessToken {
+    pub fn new(token: &str) -> Result<Self, HarnessApiError> {
+        if token.trim().is_empty() {
+            return Err(HarnessApiError::Authorization);
+        }
+        Ok(Self {
+            inner: Arc::new(RwLock::new(Zeroizing::new(token.to_owned()))),
+        })
+    }
+
+    pub fn replace(&self, token: &str) -> Result<(), HarnessApiError> {
+        if token.trim().is_empty() {
+            return Err(HarnessApiError::Authorization);
+        }
+        *self
+            .inner
+            .write()
+            .map_err(|_| HarnessApiError::Authorization)? = Zeroizing::new(token.to_owned());
+        Ok(())
+    }
+
+    pub fn authorization(&self) -> Result<HeaderValue, HarnessApiError> {
+        let token = self
+            .inner
+            .read()
+            .map_err(|_| HarnessApiError::Authorization)?;
+        HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
+            .map_err(|_| HarnessApiError::Authorization)
+    }
+}
+
 pub struct HarnessApiClient {
     origin: Url,
-    authorization: HeaderValue,
+    access_token: RotatingAccessToken,
     client: Client,
 }
 
@@ -118,6 +166,13 @@ impl std::fmt::Debug for HarnessApiClient {
 
 impl HarnessApiClient {
     pub fn new(api_origin: &str, access_token: &str) -> Result<Self, HarnessApiError> {
+        Self::with_access_token(api_origin, RotatingAccessToken::new(access_token)?)
+    }
+
+    pub fn with_access_token(
+        api_origin: &str,
+        access_token: RotatingAccessToken,
+    ) -> Result<Self, HarnessApiError> {
         let origin = Url::parse(api_origin).map_err(|_| HarnessApiError::Origin)?;
         let host = origin.host_str().ok_or(HarnessApiError::Origin)?;
         if origin.scheme() != "https"
@@ -126,15 +181,10 @@ impl HarnessApiClient {
         {
             return Err(HarnessApiError::Origin);
         }
-        let token = access_token.trim();
-        if token.is_empty() {
-            return Err(HarnessApiError::Authorization);
-        }
-        let authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| HarnessApiError::Authorization)?;
+        access_token.authorization()?;
         Ok(Self {
             origin,
-            authorization,
+            access_token,
             client: Client::builder()
                 .https_only(true)
                 .timeout(REQUEST_TIMEOUT)
@@ -249,7 +299,7 @@ impl HarnessApiClient {
         Ok(self
             .client
             .post(endpoint)
-            .header(AUTHORIZATION, self.authorization.clone())
+            .header(AUTHORIZATION, self.access_token.authorization()?)
             .header(CONTENT_TYPE, "application/json")
             .json(body)
             .send()
@@ -268,7 +318,7 @@ impl HarnessApiClient {
         Ok(self
             .client
             .patch(endpoint)
-            .header(AUTHORIZATION, self.authorization.clone())
+            .header(AUTHORIZATION, self.access_token.authorization()?)
             .header(CONTENT_TYPE, "application/json")
             .json(body)
             .send()
@@ -283,7 +333,7 @@ impl HarnessApiClient {
         Ok(self
             .client
             .get(endpoint)
-            .header(AUTHORIZATION, self.authorization.clone())
+            .header(AUTHORIZATION, self.access_token.authorization()?)
             .send()
             .await?)
     }
@@ -325,6 +375,20 @@ mod tests {
         let debug = format!("{client:?}");
         assert!(!debug.contains("crow_device_access_do_not_log"));
         assert!(debug.contains("[REDACTED]"));
+        Ok(())
+    }
+
+    #[test]
+    fn rotating_access_token_changes_future_authorization_without_leaking()
+    -> Result<(), HarnessApiError> {
+        let token = RotatingAccessToken::new("first-secret")?;
+        let first = token.authorization()?;
+        token.replace("second-secret")?;
+        let second = token.authorization()?;
+        assert_eq!(first.to_str().ok(), Some("Bearer first-secret"));
+        assert_eq!(second.to_str().ok(), Some("Bearer second-secret"));
+        let debug = format!("{token:?}");
+        assert!(!debug.contains("first-secret") && !debug.contains("second-secret"));
         Ok(())
     }
 }

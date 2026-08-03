@@ -1,8 +1,9 @@
 use crate::{ExecutionGate, PendingStrategy};
 use crow_agent_core::{
     DeviceEncryptionKey, DurableRunEventWriter, EncryptedJournal, GatewayClient, HarnessApiClient,
-    HyperliquidBookStream, HyperliquidVenue, LiveRiskState, StartHarnessRunV1, execute_live_cycle,
-    load_live_risk_state, open_agent_version, reconcile_live_state, store_live_risk_state,
+    HyperliquidBookStream, HyperliquidVenue, LiveRiskState, RotatingAccessToken, StartHarnessRunV1,
+    execute_live_cycle, load_live_risk_state, open_agent_version, reconcile_live_state,
+    store_live_risk_state,
 };
 use crow_agent_protocol::{ArenaMode, DeviceIdentity, SignedArenaManifestV1};
 use serde::Deserialize;
@@ -123,7 +124,7 @@ pub(crate) async fn run_session(
     api_wallet_key: &Zeroizing<[u8; 32]>,
     device_id: Uuid,
     device_encryption_key: &DeviceEncryptionKey,
-    access_token: &Zeroizing<String>,
+    access_token: RotatingAccessToken,
     identity: &DeviceIdentity,
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
@@ -137,7 +138,7 @@ pub(crate) async fn run_session(
     let expected_cycles = expected_cycle_count(manifest)?;
     let journal_path = state_directory.join("journal.db");
     let mut journal = EncryptedJournal::open(&journal_path, journal_key)?;
-    let api = HarnessApiClient::new(api_origin, access_token.as_str())?;
+    let api = HarnessApiClient::with_access_token(api_origin, access_token.clone())?;
     let run_id = acquire_run(config, &journal, &api).await?;
     let active_strategy_version = journal
         .secret(&strategy_key(run_id))?
@@ -152,7 +153,10 @@ pub(crate) async fn run_session(
     let venue = HyperliquidVenue::connect_testnet(api_wallet_key).await?;
 
     initialize_event_chain(config, run_id, &mut journal, &api, identity).await?;
-    let mut completed_cycles = journal.event_count(run_id, "cycle_started")?;
+    let mut completed_cycles = journal
+        .event_count(run_id, "cycle_started")?
+        .checked_add(journal.event_count(run_id, "missed_cycle")?)
+        .ok_or(LiveRunError::State)?;
     if completed_cycles > expected_cycles {
         return Err(LiveRunError::State);
     }
@@ -184,6 +188,37 @@ pub(crate) async fn run_session(
         &mut risk,
     )
     .await?;
+    let due_cycles = due_cycle_count(manifest, OffsetDateTime::now_utc())?;
+    while completed_cycles < due_cycles {
+        append_missed_cycle(
+            &mut journal,
+            &api,
+            identity,
+            manifest.arena_id,
+            run_id,
+            scheduled_cycle_at(manifest, completed_cycles)?,
+            "companion_unavailable_at_boundary",
+        )
+        .await?;
+        completed_cycles = completed_cycles.checked_add(1).ok_or(LiveRunError::State)?;
+    }
+    if completed_cycles >= expected_cycles {
+        append_lifecycle(
+            &mut journal,
+            &api,
+            identity,
+            manifest.arena_id,
+            run_id,
+            "run_stopped",
+            "arena_schedule",
+        )
+        .await?;
+        journal.delete_secret(&run_id_key(manifest.arena_id))?;
+        journal.delete_secret(&lease_key(manifest.arena_id))?;
+        journal.delete_secret(&strategy_key(run_id))?;
+        *active_run.lock().map_err(|_| LiveRunError::State)? = None;
+        return Ok(LiveSessionOutcome::Stopped);
+    }
     let mut stream = HyperliquidBookStream::connect_testnet()?;
     let initial = stream.reconcile().await?;
     let mut books = initial
@@ -216,7 +251,7 @@ pub(crate) async fn run_session(
     let mut lifecycle_tick = tokio::time::interval(Duration::from_millis(200));
     lifecycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cycle_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + duration_until_next_cycle(manifest)?,
+        tokio::time::Instant::now() + duration_until_cycle(manifest, completed_cycles)?,
         Duration::from_secs(u64::from(manifest.decision_interval_seconds)),
     );
     cycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -322,10 +357,20 @@ pub(crate) async fn run_session(
                     return Ok(LiveSessionOutcome::Stopped);
                 }
                 if !execution_gate.is_running() {
+                    append_missed_cycle(
+                        &mut journal,
+                        &api,
+                        identity,
+                        manifest.arena_id,
+                        run_id,
+                        scheduled_cycle_at(manifest, completed_cycles)?,
+                        "execution_paused_at_boundary",
+                    ).await?;
+                    completed_cycles = completed_cycles.checked_add(1).ok_or(LiveRunError::State)?;
                     continue;
                 }
                 let snapshot_books = books.values().cloned().collect::<Vec<_>>();
-                let gateway = GatewayClient::new(api_origin, access_token.as_str())?;
+                let gateway = GatewayClient::with_access_token(api_origin, access_token.clone())?;
                 let result = execute_live_cycle(
                     &mut journal,
                     &api,
@@ -340,13 +385,20 @@ pub(crate) async fn run_session(
                     gateway,
                     &mut risk,
                     || execution_gate.is_running(),
-                ).await?;
-                info!(
-                    cycle_id = %result.cycle_id,
-                    symbol = result.proposal_symbol,
-                    submitted = result.order_submitted,
-                    "live arena cycle durably accepted"
-                );
+                ).await;
+                match result {
+                    Ok(result) => info!(
+                        cycle_id = %result.cycle_id,
+                        symbol = result.proposal_symbol,
+                        submitted = result.order_submitted,
+                        "live arena cycle durably accepted"
+                    ),
+                    Err(crow_agent_core::LiveCycleError::Runtime(error)) => warn!(
+                        failure_class = error.failure_class(),
+                        "live arena model decision failed safely; continuing on the signed schedule"
+                    ),
+                    Err(error) => return Err(error.into()),
+                }
                 completed_cycles = completed_cycles.checked_add(1).ok_or(LiveRunError::State)?;
             }
             snapshot = stream.next_snapshot() => {
@@ -471,6 +523,33 @@ async fn append_lifecycle(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn append_missed_cycle(
+    journal: &mut EncryptedJournal,
+    api: &HarnessApiClient,
+    identity: &DeviceIdentity,
+    arena_id: Uuid,
+    run_id: Uuid,
+    scheduled_at: OffsetDateTime,
+    reason: &str,
+) -> Result<(), LiveRunError> {
+    let cycle_id = Uuid::new_v4();
+    let mut writer = DurableRunEventWriter::new(journal, api, identity, arena_id, run_id);
+    writer
+        .append(
+            Some(cycle_id),
+            "missed_cycle",
+            json!({
+                "scheduled_at": scheduled_at,
+                "reason": reason,
+                "order_submitted": false,
+            }),
+            &Value::Null,
+        )
+        .await?;
+    Ok(())
+}
+
 fn should_run_after_reconciliation(
     journal: &EncryptedJournal,
     run_id: Uuid,
@@ -496,23 +575,44 @@ fn should_run_after_reconciliation(
     })
 }
 
-fn duration_until_next_cycle(
+fn duration_until_cycle(
     manifest: &crow_agent_protocol::ArenaManifestV1,
+    completed_cycles: u64,
 ) -> Result<Duration, LiveRunError> {
     let now = OffsetDateTime::now_utc();
-    if now >= manifest.ends_at {
-        return Err(LiveRunError::Configuration);
+    let next = scheduled_cycle_at(manifest, completed_cycles)?;
+    if next <= now {
+        return Ok(Duration::ZERO);
     }
+    Duration::try_from(next - now).map_err(|_| LiveRunError::State)
+}
+
+fn scheduled_cycle_at(
+    manifest: &crow_agent_protocol::ArenaManifestV1,
+    cycle_index: u64,
+) -> Result<OffsetDateTime, LiveRunError> {
+    let interval = i64::from(manifest.decision_interval_seconds);
+    let cycle_index = i64::try_from(cycle_index).map_err(|_| LiveRunError::State)?;
+    let offset = interval
+        .checked_mul(cycle_index)
+        .ok_or(LiveRunError::State)?;
+    Ok(manifest.starts_at + time::Duration::seconds(offset))
+}
+
+fn due_cycle_count(
+    manifest: &crow_agent_protocol::ArenaManifestV1,
+    now: OffsetDateTime,
+) -> Result<u64, LiveRunError> {
+    let expected = expected_cycle_count(manifest)?;
     if now < manifest.starts_at {
-        return Duration::try_from(manifest.starts_at - now).map_err(|_| LiveRunError::State);
+        return Ok(0);
     }
     let interval = i64::from(manifest.decision_interval_seconds);
-    let elapsed = (now - manifest.starts_at).whole_seconds();
-    let next_offset = (elapsed.div_euclid(interval) + 1)
-        .checked_mul(interval)
-        .ok_or(LiveRunError::State)?;
-    let next = manifest.starts_at + time::Duration::seconds(next_offset);
-    Duration::try_from(next - now).map_err(|_| LiveRunError::State)
+    let elapsed = (now.min(manifest.ends_at) - manifest.starts_at).whole_seconds();
+    let due = elapsed.div_euclid(interval).saturating_add(1);
+    Ok(u64::try_from(due)
+        .map_err(|_| LiveRunError::State)?
+        .min(expected))
 }
 
 fn expected_cycle_count(
@@ -702,6 +802,24 @@ mod tests {
             }
         }))?;
         assert_eq!(expected_cycle_count(&manifest)?, 2);
+        assert_eq!(
+            due_cycle_count(&manifest, manifest.starts_at - time::Duration::seconds(1))?,
+            0
+        );
+        assert_eq!(due_cycle_count(&manifest, manifest.starts_at)?, 1);
+        assert_eq!(
+            due_cycle_count(&manifest, manifest.starts_at + time::Duration::seconds(899))?,
+            1
+        );
+        assert_eq!(
+            due_cycle_count(&manifest, manifest.starts_at + time::Duration::seconds(900))?,
+            2
+        );
+        assert_eq!(due_cycle_count(&manifest, manifest.ends_at)?, 2);
+        assert_eq!(
+            scheduled_cycle_at(&manifest, 1)?,
+            manifest.starts_at + time::Duration::seconds(900)
+        );
         manifest.ends_at += time::Duration::seconds(1);
         assert!(expected_cycle_count(&manifest).is_err());
         Ok(())
