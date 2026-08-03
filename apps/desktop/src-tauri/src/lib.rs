@@ -228,6 +228,7 @@ struct LocalRunSummary {
     arena_starts_at: Option<String>,
     arena_ends_at: Option<String>,
     decision_interval_seconds: Option<u32>,
+    isolated_leverage: Option<u8>,
     event_count: u64,
     cycle_count: u64,
     order_count: u64,
@@ -702,6 +703,7 @@ fn build_local_run_journal(
                 arena_starts_at: schedule.map(|value| value.starts_at.clone()),
                 arena_ends_at: schedule.map(|value| value.ends_at.clone()),
                 decision_interval_seconds: schedule.map(|value| value.decision_interval_seconds),
+                isolated_leverage: None,
                 event_count: 0,
                 cycle_count: 0,
                 order_count: 0,
@@ -715,7 +717,23 @@ fn build_local_run_journal(
         summary.latest_at = occurred_at;
         summary.all_receipted &= event.server_receipt.is_some();
         match event.event_type.as_str() {
-            "run_started" | "run_resumed" => summary.state = "running".into(),
+            "run_started" => {
+                summary.state = "running".into();
+                if let Some(value) = event
+                    .payload
+                    .get("decision_cooldown_seconds")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                {
+                    summary.decision_interval_seconds = Some(value);
+                }
+                summary.isolated_leverage = event
+                    .payload
+                    .get("isolated_leverage")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u8::try_from(value).ok());
+            }
+            "run_resumed" => summary.state = "running".into(),
             "run_paused" => summary.state = "paused".into(),
             "run_stopped" => summary.state = "stopped".into(),
             "cycle_started" => summary.cycle_count += 1,
@@ -1166,7 +1184,7 @@ async fn enroll_arena(
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn start_local_arena(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
@@ -1174,6 +1192,8 @@ async fn start_local_arena(
     agent_version_id: String,
     execution_account: String,
     handoff_snapshot: Option<Value>,
+    decision_cooldown_seconds: u32,
+    isolated_leverage: u8,
 ) -> Result<AgentStatus, String> {
     let _transition_guard = state.companion_transition_lock.lock().await;
     if state
@@ -1187,6 +1207,16 @@ async fn start_local_arena(
     }
     if !valid_execution_account(&execution_account) {
         return Err(DesktopError::Venue.code().into());
+    }
+    if !(crow_agent_protocol::MIN_LIVE_DECISION_INTERVAL_SECONDS
+        ..=crow_agent_protocol::MAX_CLIENT_DECISION_COOLDOWN_SECONDS)
+        .contains(&decision_cooldown_seconds)
+        || !decision_cooldown_seconds.is_multiple_of(60)
+        || !(crow_agent_protocol::MIN_CLIENT_ISOLATED_LEVERAGE
+            ..=crow_agent_protocol::MAX_CLIENT_ISOLATED_LEVERAGE)
+            .contains(&isolated_leverage)
+    {
+        return Err(DesktopError::Arena.code().into());
     }
     let api_wallet_key =
         load_or_create_hyperliquid_api_wallet_key().map_err(|error| error.code().to_owned())?;
@@ -1288,6 +1318,8 @@ async fn start_local_arena(
             "execution_account": execution_account.to_ascii_lowercase(),
             "model_id": strategy.model_id,
             "client_release": env!("CARGO_PKG_VERSION"),
+            "decision_cooldown_seconds": decision_cooldown_seconds,
+            "isolated_leverage": isolated_leverage,
         }
     });
     write_runtime_json(&config_path, &config).map_err(|error| error.code().to_owned())?;
@@ -2220,7 +2252,11 @@ mod tests {
             "0".repeat(64),
             "run_started".into(),
             OffsetDateTime::now_utc(),
-            json!({"mode": "hyperliquid_testnet"}),
+            json!({
+                "mode": "hyperliquid_testnet",
+                "decision_cooldown_seconds": 300,
+                "isolated_leverage": 3
+            }),
         )?;
         let mut fill = crow_agent_protocol::RunEventEnvelopeV1::sign(
             identity.signing_key(),
@@ -2252,6 +2288,8 @@ mod tests {
         assert_eq!(journal.runs.len(), 1);
         assert_eq!(journal.runs[0].state, "paused");
         assert_eq!(journal.runs[0].fill_count, 2);
+        assert_eq!(journal.runs[0].decision_interval_seconds, Some(300));
+        assert_eq!(journal.runs[0].isolated_leverage, Some(3));
         assert!(!journal.runs[0].all_receipted);
         assert_eq!(journal.events.len(), 3);
         assert_eq!(journal.events[1].details["fills"][0]["coin"], "BTC");

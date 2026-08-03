@@ -38,6 +38,8 @@ pub struct HarnessRunV1 {
     pub device_id: Uuid,
     pub agent_version_id: Uuid,
     pub client_release: String,
+    pub decision_cooldown_seconds: u32,
+    pub isolated_leverage: u8,
     pub status: String,
     pub next_sequence: u64,
     pub last_event_hash: String,
@@ -57,6 +59,8 @@ pub struct StartHarnessRunV1 {
     pub agent_version_id: Uuid,
     pub execution_account: String,
     pub client_release: String,
+    pub decision_cooldown_seconds: u32,
+    pub isolated_leverage: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handoff_snapshot: Option<Value>,
 }
@@ -202,6 +206,8 @@ impl HarnessApiClient {
             || response.run.id == Uuid::nil()
             || response.run.arena_id != request.arena_id
             || response.run.agent_version_id != request.agent_version_id
+            || response.run.decision_cooldown_seconds != request.decision_cooldown_seconds
+            || response.run.isolated_leverage != request.isolated_leverage
             || response.run.status != "running"
         {
             return Err(HarnessApiError::Response);

@@ -17,13 +17,13 @@ events, and inference receipts required to verify arena results.
 
 ## Download the free public alpha
 
-Crow Agent v0.1.26-alpha.31 is a free, testnet-only public alpha. Do not connect
+Crow Agent v0.1.27-alpha.32 is a free, testnet-only public alpha. Do not connect
 it to live capital.
 
-- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.26-alpha.31)
-- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.26-alpha.31/Crow.Agent_0.1.26_universal.dmg)
-- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.26-alpha.31/Crow.Agent_0.1.26_x64-setup.exe)
-- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.26-alpha.31/crow-agent-linux-x86_64.tar.zst)
+- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.27-alpha.32)
+- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.27-alpha.32/Crow.Agent_0.1.27_universal.dmg)
+- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.27-alpha.32/Crow.Agent_0.1.27_x64-setup.exe)
+- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.27-alpha.32/crow-agent-linux-x86_64.tar.zst)
 - [Signed BTC/ETH/SOL historical dataset](https://github.com/crow-compute/crow-agent/releases/tag/dataset-v1)
 
 The desktop alpha is distributed directly, not through the Apple App Store or
@@ -110,8 +110,10 @@ The unit opens no inbound socket.
 For a hosted-runner cutover, set `handoff_snapshot` to a root-readable,
 fixed-point JSON snapshot captured after the hosted run stops and reconciles.
 The first local run binds that snapshot to its backend record and signed event
-chain before any resume. Existing isolated 1× positions are preserved; inherited
-shorts may only be reduced by reduce-only buys and can never be increased.
+chain before any resume. The desktop owner selects a 1–60 minute decision
+cooldown (5 minutes by default) and 1×–10× isolated leverage (1× by default).
+The daemon configures and verifies that leverage for BTC, ETH, and SOL before
+reconciliation; inherited long or short positions must match it before trading.
 
 The live daemon starts or reclaims one bound arena run and renews its lease
 every 10 seconds. A new join stays behind its fail-closed execution gate while

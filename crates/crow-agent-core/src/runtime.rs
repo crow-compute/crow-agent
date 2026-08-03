@@ -251,6 +251,7 @@ where
                     &proposal,
                     &PolicyContext {
                         rules: &context.manifest.risk_rules,
+                        isolated_leverage: context.manifest.risk_rules.isolated_leverage,
                         market,
                         portfolio,
                         starting_capital_micro_usdc: i64::try_from(

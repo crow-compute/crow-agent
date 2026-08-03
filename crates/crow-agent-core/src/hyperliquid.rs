@@ -31,6 +31,7 @@ const INFO_USER_MODE_WEIGHT: u16 = 20;
 const INFO_ACCOUNT_STATE_WEIGHT: u16 = 2;
 const INFO_USER_HISTORY_WEIGHT: u16 = 20;
 const INFO_CANDLE_WEIGHT: u16 = 20;
+const INFO_ACTIVE_ASSET_WEIGHT: u16 = 2;
 const MARKET_IOC_SLIPPAGE_BPS: i128 = 500;
 const BPS_SCALE: i128 = 10_000;
 const QUANTITY_E8_SCALE: i128 = 100_000_000;
@@ -64,6 +65,7 @@ pub struct CoreAsset {
     pub symbol: String,
     pub asset_index: u32,
     pub size_decimals: u8,
+    pub max_leverage: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +346,54 @@ impl HyperliquidVenue {
             client_order_id: client_order_id.to_owned(),
             statuses: Value::Array(statuses),
         })
+    }
+
+    pub async fn configure_isolated_leverage(
+        &self,
+        execution_account: &str,
+        leverage: u8,
+    ) -> Result<(), HyperliquidError> {
+        let leverage = u32::from(leverage);
+        if leverage == 0
+            || self
+                .assets
+                .values()
+                .any(|asset| leverage > asset.max_leverage)
+        {
+            return Err(HyperliquidError::Metadata);
+        }
+        let account = parse_account(execution_account)?;
+        for symbol in ALLOWED_SYMBOLS {
+            let asset = self.assets.get(symbol).ok_or(HyperliquidError::Metadata)?;
+            self.budget.consume(1)?;
+            self.client
+                .update_leverage(
+                    &self.signer,
+                    usize::try_from(asset.asset_index).map_err(|_| HyperliquidError::Numeric)?,
+                    false,
+                    leverage,
+                    self.nonce.next(),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|_| HyperliquidError::Sdk)?;
+            self.budget.consume(INFO_ACTIVE_ASSET_WEIGHT)?;
+            let confirmed = self
+                .client
+                .active_asset_data(account, symbol.to_owned())
+                .await
+                .map_err(|_| HyperliquidError::Snapshot)?;
+            if !confirmed
+                .leverage
+                .leverage_type
+                .eq_ignore_ascii_case("isolated")
+                || confirmed.leverage.value != Decimal::from(leverage)
+            {
+                return Err(HyperliquidError::Snapshot);
+            }
+        }
+        Ok(())
     }
 
     pub async fn cancel_direct(
@@ -763,28 +813,34 @@ impl VenueBookLevel for hypersdk::hypercore::types::BookLevel {
 fn discover_core_assets(
     markets: &[PerpMarket],
 ) -> Result<BTreeMap<String, CoreAsset>, HyperliquidError> {
-    discover_core_assets_from(
-        markets
-            .iter()
-            .map(|market| (market.name.as_str(), market.index, market.sz_decimals)),
-    )
+    discover_core_assets_from(markets.iter().map(|market| {
+        (
+            market.name.as_str(),
+            market.index,
+            market.sz_decimals,
+            market.max_leverage,
+        )
+    }))
 }
 
 fn discover_core_assets_from<'a>(
-    markets: impl IntoIterator<Item = (&'a str, usize, i64)>,
+    markets: impl IntoIterator<Item = (&'a str, usize, i64, u64)>,
 ) -> Result<BTreeMap<String, CoreAsset>, HyperliquidError> {
     let mut assets = BTreeMap::new();
-    for (name, index, size_decimals) in markets {
+    for (name, index, size_decimals, max_leverage) in markets {
         if ALLOWED_SYMBOLS.contains(&name) {
             let asset_index = u32::try_from(index).map_err(|_| HyperliquidError::Metadata)?;
             let size_decimals =
                 u8::try_from(size_decimals).map_err(|_| HyperliquidError::Metadata)?;
+            let max_leverage =
+                u32::try_from(max_leverage).map_err(|_| HyperliquidError::Metadata)?;
             assets.insert(
                 name.to_owned(),
                 CoreAsset {
                     symbol: name.to_owned(),
                     asset_index,
                     size_decimals,
+                    max_leverage,
                 },
             );
         }
@@ -929,20 +985,22 @@ mod tests {
     #[test]
     fn metadata_indices_are_discovered_in_venue_order() -> Result<(), HyperliquidError> {
         let assets = discover_core_assets_from([
-            ("DOGE", 0, 0),
-            ("SOL", 1, 2),
-            ("BTC", 2, 5),
-            ("ETH", 3, 4),
+            ("DOGE", 0, 0, 10),
+            ("SOL", 1, 2, 20),
+            ("BTC", 2, 5, 40),
+            ("ETH", 3, 4, 25),
         ])?;
         assert_eq!(assets["SOL"].asset_index, 1);
         assert_eq!(assets["BTC"].asset_index, 2);
         assert_eq!(assets["ETH"].asset_index, 3);
+        assert_eq!(assets["BTC"].max_leverage, 40);
         Ok(())
     }
 
     #[test]
     fn order_builder_is_ioc_only() -> Result<(), HyperliquidError> {
-        let assets = discover_core_assets_from([("BTC", 0, 5), ("ETH", 1, 4), ("SOL", 2, 2)])?;
+        let assets =
+            discover_core_assets_from([("BTC", 0, 5, 40), ("ETH", 1, 4, 25), ("SOL", 2, 2, 20)])?;
         let request = build_ioc_request(
             &OrderDecision {
                 symbol: "BTC".into(),

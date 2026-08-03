@@ -538,6 +538,8 @@ export function App() {
   const [agentModelId, setAgentModelId] = useState("");
   const [executionAccount, setExecutionAccount] = useState("");
   const [handoffSnapshot, setHandoffSnapshot] = useState("");
+  const [decisionCooldownMinutes, setDecisionCooldownMinutes] = useState(5);
+  const [isolatedLeverage, setIsolatedLeverage] = useState(1);
   const [walletSetup, setWalletSetup] = useState<HyperliquidWalletSetup | null>(null);
   const [arenaBusy, setArenaBusy] = useState(false);
   const [journal, setJournal] = useState<LocalRunJournal>({
@@ -736,6 +738,8 @@ export function App() {
     setArenaLaunchNotice(null);
     setWalletSetup(null);
     setHandoffSnapshot("");
+    setDecisionCooldownMinutes(5);
+    setIsolatedLeverage(1);
     setArenaBusy(true);
     setNotice(null);
     setArenaLaunchNotice(null);
@@ -824,6 +828,8 @@ export function App() {
         version.id,
         executionAccount,
         parsedHandoff,
+        decisionCooldownMinutes * 60,
+        isolatedLeverage,
       );
       setStatus(next);
       setSelectedArena(null);
@@ -1185,7 +1191,9 @@ export function App() {
                       <strong>Hyperliquid Testnet</strong>
                       <small>BTC · ETH · SOL · {selectedRun.decisionIntervalSeconds
                         ? `${selectedRun.decisionIntervalSeconds / 60}-minute cycle`
-                        : "signed arena cycle"}</small>
+                        : "signed arena cycle"}{selectedRun.isolatedLeverage
+                          ? ` · ${selectedRun.isolatedLeverage}× isolated`
+                          : ""}</small>
                     </div>
                     {decisionCountdown ? (
                       <div
@@ -1577,6 +1585,34 @@ export function App() {
                   />
                   <small>Required when replacing a hosted runner with open positions. Only structured fixed-point JSON is accepted; venue keys never belong here.</small>
                 </label>
+                <div className="run-settings-grid">
+                  <label className="field-block">
+                    <span>Decision cooldown</span>
+                    <select
+                      aria-label="Decision cooldown"
+                      value={decisionCooldownMinutes}
+                      onChange={(event) => setDecisionCooldownMinutes(Number(event.target.value))}
+                    >
+                      {[1, 2, 3, 5, 10, 15, 30, 60].map((minutes) => (
+                        <option key={minutes} value={minutes}>{minutes} minute{minutes === 1 ? "" : "s"}</option>
+                      ))}
+                    </select>
+                    <small>Chosen by this harness. Default: 5 minutes.</small>
+                  </label>
+                  <label className="field-block">
+                    <span>Isolated leverage</span>
+                    <select
+                      aria-label="Isolated leverage"
+                      value={isolatedLeverage}
+                      onChange={(event) => setIsolatedLeverage(Number(event.target.value))}
+                    >
+                      {Array.from({ length: 10 }, (_, index) => index + 1).map((leverage) => (
+                        <option key={leverage} value={leverage}>{leverage}×</option>
+                      ))}
+                    </select>
+                    <small>Applied locally to BTC, ETH, and SOL before trading.</small>
+                  </label>
+                </div>
                 <div className="launch-contract">
                   <span>ON LAUNCH</span>
                   <p>Enroll one wallet entry, verify the signed arena and encrypted version, bind any explicit handoff snapshot, start the local companion, reconcile positions/fills/funding, then enter running automatically. Any failed check remains fail-closed with zero orders.</p>
