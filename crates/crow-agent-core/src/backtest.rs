@@ -124,6 +124,7 @@ impl BacktestEngine {
             &executable,
             &PolicyContext {
                 rules: &self.rules,
+                isolated_leverage: self.rules.isolated_leverage,
                 market: &market,
                 portfolio,
                 starting_capital_micro_usdc: portfolio.equity_micro_usdc,

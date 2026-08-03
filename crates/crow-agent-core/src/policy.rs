@@ -57,6 +57,7 @@ pub struct PolicyContext<'a> {
     /// quantity. The proposal limit remains the worst executable IOC price
     /// used for every exposure and collateral check.
     pub quantity_reference_price_micro_usdc: Option<i64>,
+    pub isolated_leverage: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,11 +210,18 @@ pub fn evaluate_proposal(
     {
         return Err(PolicyError::ReduceOnly);
     }
+    if context.isolated_leverage == 0 {
+        return Err(PolicyError::Market);
+    }
     let reserve = bps_amount(capital, i64::from(rules.cash_reserve_bps))?;
+    let required_margin = ceil_div(
+        i128::from(actual_notional),
+        i128::from(context.isolated_leverage),
+    )?;
     if !proposal.reduce_only
         && portfolio
             .available_collateral_micro_usdc
-            .checked_sub(actual_notional)
+            .checked_sub(i64::try_from(required_margin).map_err(|_| PolicyError::Overflow)?)
             .ok_or(PolicyError::Overflow)?
             < reserve
     {
@@ -285,6 +293,7 @@ mod tests {
             portfolio,
             starting_capital_micro_usdc: portfolio.equity_micro_usdc,
             quantity_reference_price_micro_usdc: None,
+            isolated_leverage: 1,
         }
     }
 
@@ -322,6 +331,54 @@ mod tests {
         )?;
         assert_eq!(order.quantity_e8, 500_000);
         assert_eq!(order.actual_notional_micro_usdc, 10_000_000);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_leverage_reduces_margin_not_absolute_order_size() -> Result<(), PolicyError> {
+        let rules = RiskRulesV1::default();
+        let market = MarketState {
+            symbol: "BTC".into(),
+            mark_price_micro_usdc: 100_000_000_000,
+            oracle_price_micro_usdc: 100_000_000_000,
+            spread_bps: 1,
+            book_age_seconds: 1,
+            ask_depth_micro_usdc: 1_000_000_000,
+            bid_depth_micro_usdc: 1_000_000_000,
+            size_decimals: 5,
+            delisted: false,
+        };
+        let portfolio = PortfolioState {
+            equity_micro_usdc: 1_000_000_000,
+            available_collateral_micro_usdc: 105_000_000,
+            trading_day_start_equity_micro_usdc: 1_000_000_000,
+            peak_equity_micro_usdc: 1_000_000_000,
+            symbol_position_micro_usdc: 0,
+            orders_today: 0,
+        };
+        let proposal = Proposal {
+            symbol: "BTC".into(),
+            side: Side::Buy,
+            notional_bps: 200,
+            limit_price_micro_usdc: 100_000_000_000,
+            reduce_only: false,
+        };
+        let evaluate = |isolated_leverage| {
+            evaluate_proposal(
+                &proposal,
+                &PolicyContext {
+                    rules: &rules,
+                    market: &market,
+                    portfolio: &portfolio,
+                    starting_capital_micro_usdc: 1_000_000_000,
+                    quantity_reference_price_micro_usdc: None,
+                    isolated_leverage,
+                },
+            )
+        };
+        assert_eq!(evaluate(1), Err(PolicyError::CashReserve));
+        let leveraged = evaluate(4)?;
+        assert_eq!(leveraged.actual_notional_micro_usdc, 20_000_000);
         Ok(())
     }
 
@@ -438,6 +495,7 @@ mod tests {
                 portfolio: &portfolio,
                 starting_capital_micro_usdc: 1_000_000_000,
                 quantity_reference_price_micro_usdc: None,
+                isolated_leverage: 1,
             },
         )?;
         assert_eq!(order.actual_notional_micro_usdc, 20_000_000);

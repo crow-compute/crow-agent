@@ -25,7 +25,7 @@ pub enum LiveCycleError {
     Journal(#[from] crate::JournalError),
     #[error("live risk state is invalid")]
     RiskState,
-    #[error("live account violates isolated one-times policy")]
+    #[error("live account violates configured isolated-leverage policy")]
     AccountPolicy,
 }
 
@@ -202,6 +202,7 @@ pub async fn reconcile_live_state<S, V>(
     run_id: Uuid,
     execution_account: &str,
     venue: &V,
+    isolated_leverage: u8,
     risk: &mut LiveRiskState,
 ) -> Result<String, LiveCycleError>
 where
@@ -216,7 +217,7 @@ where
         .funding_since(execution_account, risk.last_reconciliation_ms, reconcile_at)
         .await?;
     let account = venue.account_snapshot(execution_account).await?;
-    validate_account_policy(&account)?;
+    validate_account_policy(&account, isolated_leverage)?;
     risk.last_reconciliation_ms = reconcile_at;
     update_risk_state(risk, &account, OffsetDateTime::now_utc().date());
 
@@ -287,6 +288,7 @@ pub async fn execute_live_cycle<I, S, V>(
     manifest: &ArenaManifestV1,
     run_id: Uuid,
     model_id: &str,
+    isolated_leverage: u8,
     strategy_instructions: &str,
     execution_account: &str,
     venue: &V,
@@ -305,7 +307,7 @@ where
     let now_ms = unix_milliseconds(now)?;
     let candle_start_ms = now_ms.saturating_sub(32 * 900_000);
     let account = venue.account_snapshot(execution_account).await?;
-    validate_account_policy(&account)?;
+    validate_account_policy(&account, isolated_leverage)?;
     update_risk_state(risk, &account, now.date());
     let snapshots = venue.market_snapshots(books, now_ms).await?;
     let markets = snapshots
@@ -485,7 +487,7 @@ where
     // Inference can take several seconds. Refresh account state first, then
     // fetch the target book last so the IOC crosses dispatch-time liquidity.
     let dispatch_account = venue.account_snapshot(execution_account).await?;
-    validate_account_policy(&dispatch_account)?;
+    validate_account_policy(&dispatch_account, isolated_leverage)?;
     update_risk_state(risk, &dispatch_account, now.date());
     let dispatch_now_ms = unix_milliseconds(OffsetDateTime::now_utc())?;
     let dispatch_snapshot = venue
@@ -534,6 +536,7 @@ where
                     .book
                     .opposing_top_price_micro_usdc(proposal.side)?,
             ),
+            isolated_leverage,
         },
     );
     let order = match normalized_order {
@@ -622,7 +625,7 @@ where
         .funding_since(execution_account, risk.last_reconciliation_ms, reconcile_at)
         .await?;
     let reconciled = venue.account_snapshot(execution_account).await?;
-    validate_account_policy(&reconciled)?;
+    validate_account_policy(&reconciled, isolated_leverage)?;
     risk.last_reconciliation_ms = reconcile_at;
     update_risk_state(risk, &reconciled, now.date());
     writer
@@ -695,12 +698,16 @@ fn update_risk_state(state: &mut LiveRiskState, account: &AccountSnapshot, today
     state.peak_equity_micro_usdc = state.peak_equity_micro_usdc.max(account.equity_micro_usdc);
 }
 
-fn validate_account_policy(account: &AccountSnapshot) -> Result<(), LiveCycleError> {
+fn validate_account_policy(
+    account: &AccountSnapshot,
+    isolated_leverage: u8,
+) -> Result<(), LiveCycleError> {
     if account.equity_micro_usdc <= 0
+        || isolated_leverage == 0
         || account
             .positions
             .values()
-            .any(|position| !position.isolated || position.leverage != 1)
+            .any(|position| !position.isolated || position.leverage != u32::from(isolated_leverage))
     {
         return Err(LiveCycleError::AccountPolicy);
     }
@@ -949,14 +956,21 @@ mod tests {
             withdrawable_micro_usdc: 1,
             positions: BTreeMap::from([(ALLOWED_SYMBOLS[0].into(), position)]),
         };
-        assert!(validate_account_policy(&account).is_err());
+        assert!(validate_account_policy(&account, 1).is_err());
         let inherited_short = AccountSnapshot {
             venue_time_ms: 1,
             equity_micro_usdc: 1,
             withdrawable_micro_usdc: 1,
             positions: BTreeMap::from([(ALLOWED_SYMBOLS[0].into(), inherited_position)]),
         };
-        assert!(validate_account_policy(&inherited_short).is_ok());
+        assert!(validate_account_policy(&inherited_short, 1).is_ok());
+        let mut leveraged_short = inherited_short;
+        assert!(leveraged_short.positions.contains_key(ALLOWED_SYMBOLS[0]));
+        if let Some(position) = leveraged_short.positions.get_mut(ALLOWED_SYMBOLS[0]) {
+            position.leverage = 3;
+        }
+        assert!(validate_account_policy(&leveraged_short, 3).is_ok());
+        assert!(validate_account_policy(&leveraged_short, 1).is_err());
     }
 
     #[tokio::test]
@@ -993,6 +1007,7 @@ mod tests {
             run_id,
             "0x0000000000000000000000000000000000000042",
             &venue,
+            1,
             &mut risk,
         )
         .await?;

@@ -86,6 +86,7 @@ export type LocalRunSummary = {
   arenaStartsAt: string | null;
   arenaEndsAt: string | null;
   decisionIntervalSeconds: number | null;
+  isolatedLeverage?: number | null;
   eventCount: number;
   cycleCount: number;
   orderCount: number;
@@ -195,12 +196,16 @@ export async function startLocalArena(
   agentVersionId: string,
   executionAccount: string,
   handoffSnapshot: Record<string, unknown> | null = null,
+  decisionCooldownSeconds = 300,
+  isolatedLeverage = 1,
 ): Promise<AgentStatus> {
   return invoke<AgentStatus>("start_local_arena", {
     arenaId,
     agentVersionId,
     executionAccount,
     handoffSnapshot,
+    decisionCooldownSeconds,
+    isolatedLeverage,
   });
 }
 

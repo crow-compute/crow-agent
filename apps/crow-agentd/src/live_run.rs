@@ -5,7 +5,10 @@ use crow_agent_core::{
     execute_live_cycle, load_live_risk_state, open_agent_version, reconcile_live_state,
     store_live_risk_state,
 };
-use crow_agent_protocol::{ArenaMode, DeviceIdentity, SignedArenaManifestV1};
+use crow_agent_protocol::{
+    ArenaMode, DeviceIdentity, MAX_CLIENT_DECISION_COOLDOWN_SECONDS, MAX_CLIENT_ISOLATED_LEVERAGE,
+    MIN_CLIENT_ISOLATED_LEVERAGE, MIN_LIVE_DECISION_INTERVAL_SECONDS, SignedArenaManifestV1,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -33,6 +36,10 @@ pub(crate) struct LiveArenaConfig {
     pub execution_account: String,
     pub model_id: String,
     pub client_release: String,
+    #[serde(default)]
+    pub decision_cooldown_seconds: Option<u32>,
+    #[serde(default)]
+    pub isolated_leverage: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +50,8 @@ pub(crate) struct PreparedLiveArena {
     pub execution_account: String,
     pub model_id: String,
     pub client_release: String,
+    pub decision_cooldown_seconds: u32,
+    pub isolated_leverage: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +88,12 @@ pub(crate) fn prepare(config: LiveArenaConfig) -> Result<PreparedLiveArena, Live
     .map_err(|_| LiveRunError::Manifest)?;
     signed.verify().map_err(|_| LiveRunError::Manifest)?;
     let manifest = &signed.manifest;
+    let decision_cooldown_seconds = config
+        .decision_cooldown_seconds
+        .unwrap_or(manifest.decision_interval_seconds);
+    let isolated_leverage = config
+        .isolated_leverage
+        .unwrap_or(manifest.risk_rules.isolated_leverage);
     if manifest.mode != ArenaMode::HyperliquidTestnet
         || !manifest
             .eligible_models
@@ -86,6 +101,11 @@ pub(crate) fn prepare(config: LiveArenaConfig) -> Result<PreparedLiveArena, Live
             .any(|model| model == &config.model_id)
         || config.agent_version_id == Uuid::nil()
         || config.client_release.trim().is_empty()
+        || !(MIN_LIVE_DECISION_INTERVAL_SECONDS..=MAX_CLIENT_DECISION_COOLDOWN_SECONDS)
+            .contains(&decision_cooldown_seconds)
+        || !decision_cooldown_seconds.is_multiple_of(60)
+        || !(MIN_CLIENT_ISOLATED_LEVERAGE..=MAX_CLIENT_ISOLATED_LEVERAGE)
+            .contains(&isolated_leverage)
         || !valid_execution_account(&config.execution_account)
     {
         return Err(LiveRunError::Configuration);
@@ -112,6 +132,8 @@ pub(crate) fn prepare(config: LiveArenaConfig) -> Result<PreparedLiveArena, Live
         execution_account: config.execution_account.to_ascii_lowercase(),
         model_id: config.model_id,
         client_release: config.client_release,
+        decision_cooldown_seconds,
+        isolated_leverage,
     })
 }
 
@@ -135,7 +157,7 @@ pub(crate) async fn run_session(
     if now >= manifest.ends_at {
         return Err(LiveRunError::Configuration);
     }
-    let expected_cycles = expected_cycle_count(manifest)?;
+    let expected_cycles = expected_cycle_count(manifest, config.decision_cooldown_seconds)?;
     let journal_path = state_directory.join("journal.db");
     let mut journal = EncryptedJournal::open(&journal_path, journal_key)?;
     let api = HarnessApiClient::with_access_token(api_origin, access_token.clone())?;
@@ -151,6 +173,9 @@ pub(crate) async fn run_session(
         return Err(LiveRunError::Configuration);
     }
     let venue = HyperliquidVenue::connect_testnet(api_wallet_key).await?;
+    venue
+        .configure_isolated_leverage(&config.execution_account, config.isolated_leverage)
+        .await?;
 
     initialize_event_chain(config, run_id, &mut journal, &api, identity).await?;
     let mut completed_cycles = journal
@@ -185,10 +210,15 @@ pub(crate) async fn run_session(
         run_id,
         &config.execution_account,
         &venue,
+        config.isolated_leverage,
         &mut risk,
     )
     .await?;
-    let due_cycles = due_cycle_count(manifest, OffsetDateTime::now_utc())?;
+    let due_cycles = due_cycle_count(
+        manifest,
+        config.decision_cooldown_seconds,
+        OffsetDateTime::now_utc(),
+    )?;
     while completed_cycles < due_cycles {
         append_missed_cycle(
             &mut journal,
@@ -196,7 +226,7 @@ pub(crate) async fn run_session(
             identity,
             manifest.arena_id,
             run_id,
-            scheduled_cycle_at(manifest, completed_cycles)?,
+            scheduled_cycle_at(manifest, config.decision_cooldown_seconds, completed_cycles)?,
             "companion_unavailable_at_boundary",
         )
         .await?;
@@ -251,8 +281,9 @@ pub(crate) async fn run_session(
     let mut lifecycle_tick = tokio::time::interval(Duration::from_millis(200));
     lifecycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cycle_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + duration_until_cycle(manifest, completed_cycles)?,
-        Duration::from_secs(u64::from(manifest.decision_interval_seconds)),
+        tokio::time::Instant::now()
+            + duration_until_cycle(manifest, config.decision_cooldown_seconds, completed_cycles)?,
+        Duration::from_secs(u64::from(config.decision_cooldown_seconds)),
     );
     cycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     info!(
@@ -363,7 +394,11 @@ pub(crate) async fn run_session(
                         identity,
                         manifest.arena_id,
                         run_id,
-                        scheduled_cycle_at(manifest, completed_cycles)?,
+                        scheduled_cycle_at(
+                            manifest,
+                            config.decision_cooldown_seconds,
+                            completed_cycles,
+                        )?,
                         "execution_paused_at_boundary",
                     ).await?;
                     completed_cycles = completed_cycles.checked_add(1).ok_or(LiveRunError::State)?;
@@ -378,6 +413,7 @@ pub(crate) async fn run_session(
                     manifest,
                     run_id,
                     &config.model_id,
+                    config.isolated_leverage,
                     &strategy.system_instructions,
                     &config.execution_account,
                     &venue,
@@ -448,6 +484,8 @@ async fn acquire_run(
                     agent_version_id: config.agent_version_id,
                     execution_account: config.execution_account.clone(),
                     client_release: config.client_release.clone(),
+                    decision_cooldown_seconds: config.decision_cooldown_seconds,
+                    isolated_leverage: config.isolated_leverage,
                     handoff_snapshot: config.handoff_snapshot.clone(),
                 })
                 .await?;
@@ -468,6 +506,28 @@ async fn initialize_event_chain(
 ) -> Result<(), LiveRunError> {
     let arena_id = config.signed.manifest.arena_id;
     if journal.latest_event_state(run_id)?.is_some() {
+        let started = journal
+            .public_events()?
+            .into_iter()
+            .find(|event| event.run_id == run_id && event.event_type == "run_started")
+            .ok_or(LiveRunError::State)?;
+        let recorded_cooldown = started
+            .payload
+            .get("decision_cooldown_seconds")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(config.signed.manifest.decision_interval_seconds);
+        let recorded_leverage = started
+            .payload
+            .get("isolated_leverage")
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(config.signed.manifest.risk_rules.isolated_leverage);
+        if recorded_cooldown != config.decision_cooldown_seconds
+            || recorded_leverage != config.isolated_leverage
+        {
+            return Err(LiveRunError::Configuration);
+        }
         let writer = DurableRunEventWriter::new(journal, api, identity, arena_id, run_id);
         writer.flush_pending().await?;
         return Ok(());
@@ -482,6 +542,8 @@ async fn initialize_event_chain(
                 "client_release": config.client_release,
                 "manifest_sha256": manifest_sha256,
                 "mode": "hyperliquid_testnet",
+                "decision_cooldown_seconds": config.decision_cooldown_seconds,
+                "isolated_leverage": config.isolated_leverage,
             }),
             &Value::Null,
         )
@@ -577,10 +639,11 @@ fn should_run_after_reconciliation(
 
 fn duration_until_cycle(
     manifest: &crow_agent_protocol::ArenaManifestV1,
+    decision_cooldown_seconds: u32,
     completed_cycles: u64,
 ) -> Result<Duration, LiveRunError> {
     let now = OffsetDateTime::now_utc();
-    let next = scheduled_cycle_at(manifest, completed_cycles)?;
+    let next = scheduled_cycle_at(manifest, decision_cooldown_seconds, completed_cycles)?;
     if next <= now {
         return Ok(Duration::ZERO);
     }
@@ -589,9 +652,10 @@ fn duration_until_cycle(
 
 fn scheduled_cycle_at(
     manifest: &crow_agent_protocol::ArenaManifestV1,
+    decision_cooldown_seconds: u32,
     cycle_index: u64,
 ) -> Result<OffsetDateTime, LiveRunError> {
-    let interval = i64::from(manifest.decision_interval_seconds);
+    let interval = i64::from(decision_cooldown_seconds);
     let cycle_index = i64::try_from(cycle_index).map_err(|_| LiveRunError::State)?;
     let offset = interval
         .checked_mul(cycle_index)
@@ -601,13 +665,14 @@ fn scheduled_cycle_at(
 
 fn due_cycle_count(
     manifest: &crow_agent_protocol::ArenaManifestV1,
+    decision_cooldown_seconds: u32,
     now: OffsetDateTime,
 ) -> Result<u64, LiveRunError> {
-    let expected = expected_cycle_count(manifest)?;
+    let expected = expected_cycle_count(manifest, decision_cooldown_seconds)?;
     if now < manifest.starts_at {
         return Ok(0);
     }
-    let interval = i64::from(manifest.decision_interval_seconds);
+    let interval = i64::from(decision_cooldown_seconds);
     let elapsed = (now.min(manifest.ends_at) - manifest.starts_at).whole_seconds();
     let due = elapsed.div_euclid(interval).saturating_add(1);
     Ok(u64::try_from(due)
@@ -617,10 +682,11 @@ fn due_cycle_count(
 
 fn expected_cycle_count(
     manifest: &crow_agent_protocol::ArenaManifestV1,
+    decision_cooldown_seconds: u32,
 ) -> Result<u64, LiveRunError> {
-    let interval = i64::from(manifest.decision_interval_seconds);
+    let interval = i64::from(decision_cooldown_seconds);
     let duration = (manifest.ends_at - manifest.starts_at).whole_seconds();
-    if interval <= 0 || duration <= 0 || duration % interval != 0 {
+    if interval <= 0 || duration < interval {
         return Err(LiveRunError::Configuration);
     }
     u64::try_from(duration / interval).map_err(|_| LiveRunError::State)
@@ -801,27 +867,39 @@ mod tests {
                 "winner_bps": [5000, 3000, 2000]
             }
         }))?;
-        assert_eq!(expected_cycle_count(&manifest)?, 2);
+        assert_eq!(expected_cycle_count(&manifest, 900)?, 2);
         assert_eq!(
-            due_cycle_count(&manifest, manifest.starts_at - time::Duration::seconds(1))?,
+            due_cycle_count(
+                &manifest,
+                900,
+                manifest.starts_at - time::Duration::seconds(1)
+            )?,
             0
         );
-        assert_eq!(due_cycle_count(&manifest, manifest.starts_at)?, 1);
+        assert_eq!(due_cycle_count(&manifest, 900, manifest.starts_at)?, 1);
         assert_eq!(
-            due_cycle_count(&manifest, manifest.starts_at + time::Duration::seconds(899))?,
+            due_cycle_count(
+                &manifest,
+                900,
+                manifest.starts_at + time::Duration::seconds(899)
+            )?,
             1
         );
         assert_eq!(
-            due_cycle_count(&manifest, manifest.starts_at + time::Duration::seconds(900))?,
+            due_cycle_count(
+                &manifest,
+                900,
+                manifest.starts_at + time::Duration::seconds(900)
+            )?,
             2
         );
-        assert_eq!(due_cycle_count(&manifest, manifest.ends_at)?, 2);
+        assert_eq!(due_cycle_count(&manifest, 900, manifest.ends_at)?, 2);
         assert_eq!(
-            scheduled_cycle_at(&manifest, 1)?,
+            scheduled_cycle_at(&manifest, 900, 1)?,
             manifest.starts_at + time::Duration::seconds(900)
         );
         manifest.ends_at += time::Duration::seconds(1);
-        assert!(expected_cycle_count(&manifest).is_err());
+        assert_eq!(expected_cycle_count(&manifest, 900)?, 2);
         Ok(())
     }
 }
