@@ -5,6 +5,7 @@ export type AgentStatus = {
   executionBoundary: "local_device";
   daemon: "stopped" | "connecting" | "ready" | "running" | "paused";
   activeRun: string | null;
+  error?: string | null;
   deviceAuthorized: boolean;
 };
 
@@ -132,10 +133,17 @@ export async function getLocalRunJournal(
 }
 
 export async function sendLocalCommand(
-  action: "pause" | "resume" | "stop",
+  action: "pause" | "resume" | "stop" | "update_settings",
   agentVersionId?: string,
+  decisionCooldownSeconds?: number,
+  isolatedLeverage?: number,
 ): Promise<AgentStatus> {
-  return invoke<AgentStatus>("send_local_command", { action, agentVersionId });
+  return invoke<AgentStatus>("send_local_command", {
+    action,
+    agentVersionId,
+    decisionCooldownSeconds,
+    isolatedLeverage,
+  });
 }
 
 export async function beginDeviceAuthorization(

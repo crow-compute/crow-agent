@@ -26,7 +26,7 @@ pub use backtest::{
 };
 pub use companion::{
     CompanionActionV1, CompanionIpcError, CompanionRequestV1, CompanionResponseV1,
-    MAX_COMPANION_MESSAGE_BYTES,
+    MAX_COMPANION_MESSAGE_BYTES, RunSettingsV1,
 };
 pub use control_plane::{
     HarnessApiClient, HarnessApiError, HarnessRunV1, RotatingAccessToken, StartHarnessRunV1,

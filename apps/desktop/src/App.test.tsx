@@ -679,6 +679,10 @@ describe("Crow Agent shell", () => {
     expect(arenaLaunchFailure("hyperliquid_testnet_collateral_required")).toMatch(
       /Unified-account USDC is supported/,
     );
+    expect(arenaLaunchFailure("live_arena_reconciliation_failed")).toMatch(
+      /reconciliation failed before launch/,
+    );
+    expect(arenaLaunchFailure("local_companion_unavailable")).not.toMatch(/exited/);
     expect(arenaLaunchFailure("unexpected secret-shaped detail")).toBe(
       "Arena launch failed closed. No order was submitted.",
     );
