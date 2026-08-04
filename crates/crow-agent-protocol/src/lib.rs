@@ -54,6 +54,7 @@ pub enum ProtocolError {
 pub enum ArenaMode {
     HistoricalBacktest,
     HyperliquidTestnet,
+    HyperliquidMainnet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +152,24 @@ pub struct ExecutionAssumptionsV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketConfigV1 {
     pub enabled: bool,
+    #[serde(default)]
+    pub asset: String,
+    #[serde(default)]
+    pub chain_id: u64,
+    #[serde(default)]
+    pub token_address: Option<String>,
+    #[serde(default)]
+    pub ticket_base_units: String,
+    #[serde(default)]
+    pub escrow_address: Option<String>,
+    #[serde(default)]
+    pub withdrawal_policy: String,
+    #[serde(default)]
+    pub payout_policy: String,
+    #[serde(default)]
+    pub prize_asset: String,
+    #[serde(default)]
+    pub prize_base_units: String,
     pub usdc_address: Option<String>,
     pub ticket_micro_usdc: u64,
     pub participant_cap: u32,
@@ -163,6 +182,15 @@ impl Default for TicketConfigV1 {
     fn default() -> Self {
         Self {
             enabled: false,
+            asset: String::new(),
+            chain_id: 0,
+            token_address: None,
+            ticket_base_units: String::new(),
+            escrow_address: None,
+            withdrawal_policy: String::new(),
+            payout_policy: String::new(),
+            prize_asset: String::new(),
+            prize_base_units: String::new(),
             usdc_address: None,
             ticket_micro_usdc: 0,
             participant_cap: 0,
@@ -198,6 +226,7 @@ pub struct ArenaManifestV1 {
 }
 
 impl ArenaManifestV1 {
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.protocol != HARNESS_PROTOCOL_V1 {
             return Err(ProtocolError::InvalidManifest(
@@ -223,7 +252,7 @@ impl ArenaManifestV1 {
                     "historical arenas require the dataset's 15-minute cadence".into(),
                 ));
             }
-            ArenaMode::HyperliquidTestnet
+            ArenaMode::HyperliquidTestnet | ArenaMode::HyperliquidMainnet
                 if self.decision_interval_seconds < MIN_LIVE_DECISION_INTERVAL_SECONDS =>
             {
                 return Err(ProtocolError::InvalidManifest(
@@ -263,12 +292,45 @@ impl ArenaManifestV1 {
                 "scoring weights must sum to 100".into(),
             ));
         }
-        if self.ticket.prize_bps + self.ticket.protocol_bps != 10_000
-            || self.ticket.winner_bps.iter().sum::<u16>() != 10_000
+        let cc_beta_ticket = self.ticket.enabled && self.ticket.asset == "CC";
+        if !cc_beta_ticket
+            && (self.ticket.prize_bps + self.ticket.protocol_bps != 10_000
+                || self.ticket.winner_bps.iter().sum::<u16>() != 10_000)
         {
             return Err(ProtocolError::InvalidManifest(
                 "ticket and winner splits must each sum to 10000 bps".into(),
             ));
+        }
+        if self.ticket.enabled && self.ticket.asset == "CC" {
+            let valid_address = |value: &Option<String>| {
+                value.as_deref().is_some_and(|address| {
+                    address.len() == 42
+                        && address.starts_with("0x")
+                        && address[2..]
+                            .chars()
+                            .all(|character| character.is_ascii_hexdigit())
+                })
+            };
+            if self.mode != ArenaMode::HyperliquidMainnet
+                || self.ticket.chain_id != 4663
+                || self.ticket.ticket_base_units != "750000000000000000000000"
+                || self.ticket.participant_cap != 20
+                || self.ticket.token_address.as_deref().is_none_or(|address| {
+                    !address.eq_ignore_ascii_case("0x859ead0ee2fd39a2804bb27713742577f7be79c1")
+                })
+                || !valid_address(&self.ticket.escrow_address)
+                || self.ticket.withdrawal_policy != "owner_anytime"
+                || self.ticket.payout_policy != "manual_owner_payout"
+                || self.ticket.prize_asset != "ETH"
+                || self.ticket.prize_base_units != "1000000000000000000"
+                || self.ticket.prize_bps != 0
+                || self.ticket.protocol_bps != 0
+                || self.ticket.winner_bps != [0, 0, 0]
+            {
+                return Err(ProtocolError::InvalidManifest(
+                    "CC-entry beta ticket configuration is invalid".into(),
+                ));
+            }
         }
         if self.mode == ArenaMode::HistoricalBacktest
             && self
@@ -1090,6 +1152,36 @@ mod tests {
         assert!(manifest.validate().is_ok());
 
         manifest.decision_interval_seconds = 59;
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn mainnet_beta_manifest_requires_cc_entry_and_one_eth_prize() {
+        let mut manifest = valid_manifest();
+        manifest.mode = ArenaMode::HyperliquidMainnet;
+        manifest.dataset_sha256 = None;
+        manifest.ends_at = manifest.starts_at + time::Duration::hours(1);
+        manifest.decision_interval_seconds = 300;
+        manifest.manifest_version = 2;
+        manifest.ticket = TicketConfigV1 {
+            enabled: true,
+            asset: "CC".into(),
+            chain_id: 4663,
+            token_address: Some("0x859ead0ee2fd39a2804bb27713742577f7be79c1".into()),
+            ticket_base_units: "750000000000000000000000".into(),
+            escrow_address: Some("0x1111111111111111111111111111111111111111".into()),
+            withdrawal_policy: "owner_anytime".into(),
+            payout_policy: "manual_owner_payout".into(),
+            prize_asset: "ETH".into(),
+            prize_base_units: "1000000000000000000".into(),
+            participant_cap: 20,
+            prize_bps: 0,
+            protocol_bps: 0,
+            winner_bps: [0, 0, 0],
+            ..TicketConfigV1::default()
+        };
+        assert!(manifest.validate().is_ok());
+        manifest.ticket.ticket_base_units = "750000000000000000000001".into();
         assert!(manifest.validate().is_err());
     }
 

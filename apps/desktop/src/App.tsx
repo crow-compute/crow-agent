@@ -491,7 +491,23 @@ export function arenaLaunchFailure(error: unknown) {
     case "arena_operation_failed":
       return "Crow rejected the enrollment or immutable arena prerequisite. No order was submitted.";
     case "local_companion_unavailable":
-      return "The signed local companion exited before reconciliation. No order was submitted.";
+      return "The local companion did not reach reconciliation. Crow stopped before any order was allowed; no order was submitted.";
+    case "live_arena_configuration_invalid":
+      return "The signed arena or run settings are invalid. No order was submitted.";
+    case "live_arena_manifest_invalid":
+      return "The signed arena manifest could not be verified locally. No order was submitted.";
+    case "live_arena_control_plane_unavailable":
+      return "Crow could not acquire or renew the run lease. The companion stayed paused; no order was submitted.";
+    case "live_arena_venue_unavailable":
+      return "Hyperliquid Testnet did not confirm the account, leverage, or book state. The companion stayed paused; no order was submitted.";
+    case "live_arena_reconciliation_failed":
+      return "Hyperliquid account reconciliation failed before launch. The companion stayed paused; no order was submitted.";
+    case "live_arena_journal_unavailable":
+      return "The signed local journal could not be flushed. The companion stayed paused; no order was submitted.";
+    case "live_arena_inference_unavailable":
+      return "The model gateway did not return a receipt-bound decision. The companion stayed paused; no order was submitted.";
+    case "live_arena_cycle_failed":
+      return "The live decision cycle failed closed before reconciliation. The companion stayed paused; no order was submitted.";
     case "hyperliquid_api_wallet_unavailable":
       return "The Hyperliquid execution account or local API wallet is unavailable.";
     case "hyperliquid_account_state_unavailable":
@@ -617,6 +633,18 @@ export function App() {
   }, [status.activeRun]);
 
   useEffect(() => {
+    if (!status.activeRun) return;
+    const activeSummary = journal.runs.find((run) => run.runId === status.activeRun);
+    if (!activeSummary) return;
+    if (activeSummary.decisionIntervalSeconds) {
+      setDecisionCooldownMinutes(activeSummary.decisionIntervalSeconds / 60);
+    }
+    if (activeSummary.isolatedLeverage) {
+      setIsolatedLeverage(activeSummary.isolatedLeverage);
+    }
+  }, [journal.runs, status.activeRun]);
+
+  useEffect(() => {
     if (view !== "runs") return;
     setClockNow(Date.now());
     const interval = window.setInterval(() => setClockNow(Date.now()), 1_000);
@@ -701,18 +729,29 @@ export function App() {
     }
   }
 
-  async function controlLocal(action: "pause" | "resume" | "stop") {
+  async function controlLocal(
+    action: "pause" | "resume" | "stop" | "update_settings",
+    settings?: { decisionCooldownSeconds: number; isolatedLeverage: number },
+  ) {
     setLocalBusy(action);
     setNotice(null);
     try {
-      setStatus(await sendLocalCommand(action, action === "resume" ? resumeVersionId || undefined : undefined));
+      setStatus(await sendLocalCommand(
+        action,
+        action === "resume" ? resumeVersionId || undefined : undefined,
+        settings?.decisionCooldownSeconds,
+        settings?.isolatedLeverage,
+      ));
       setNotice(
         action === "resume" && resumeVersionId
           ? "Strategy switch accepted locally. The daemon will bind and receipt it before resuming."
+          : action === "update_settings"
+            ? "Run settings accepted. The signed settings event will be recorded before the next Resume."
           : `Local run ${action} accepted.`,
       );
-    } catch {
-      setNotice(`Local ${action} was not accepted.`);
+    } catch (error) {
+      const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      setNotice(code ? arenaLaunchFailure(code) : `Local ${action} was not accepted.`);
     } finally {
       setLocalBusy("");
     }
@@ -802,11 +841,13 @@ export function App() {
   }
 
   async function continueToVenue() {
-    if (!selectedVersionId) return;
+    if (!selectedArena || !selectedVersionId) return;
     setArenaBusy(true);
     setNotice(null);
     try {
-      setWalletSetup(await prepareHyperliquidWallet());
+      setWalletSetup(
+        await prepareHyperliquidWallet(selectedArena.mode === "hyperliquid_mainnet"),
+      );
       setArenaSetupStep("venue");
     } catch {
       setNotice("The local Hyperliquid API wallet could not be prepared.");
@@ -948,6 +989,13 @@ export function App() {
             <button type="button" aria-label="Dismiss message" onClick={() => setNotice(null)}>×</button>
           </div>
         ) : null}
+        {status.error && !notice ? (
+          <div className="notice" role="alert">
+            <span>Companion</span>
+            <p>{arenaLaunchFailure(status.error)}</p>
+            <button type="button" aria-label="Dismiss message" onClick={() => setStatus((current) => ({ ...current, error: null }))}>×</button>
+          </div>
+        ) : null}
 
         {view === "overview" ? (
           <div className="view command-view">
@@ -1054,7 +1102,49 @@ export function App() {
 
                 {status.activeRun && status.daemon === "paused" ? (
                   <details className="paused-strategy-editor">
-                    <summary>Change private strategy before resume</summary>
+                    <summary>Change run settings before resume</summary>
+                    <div className="run-settings-grid">
+                      <label className="field-block">
+                        <span>Decision cooldown</span>
+                        <select
+                          aria-label="Active run decision cooldown"
+                          value={decisionCooldownMinutes}
+                          onChange={(event) => setDecisionCooldownMinutes(Number(event.target.value))}
+                          disabled={Boolean(localBusy)}
+                        >
+                          {[1, 2, 3, 5, 10, 15, 30, 60].map((minutes) => (
+                            <option key={minutes} value={minutes}>{minutes} minute{minutes === 1 ? "" : "s"}</option>
+                          ))}
+                        </select>
+                        <small>Applied after the signed settings event; no decision runs while paused.</small>
+                      </label>
+                      <label className="field-block">
+                        <span>Isolated leverage</span>
+                        <select
+                          aria-label="Active run isolated leverage"
+                          value={isolatedLeverage}
+                          onChange={(event) => setIsolatedLeverage(Number(event.target.value))}
+                          disabled={Boolean(localBusy)}
+                        >
+                          {Array.from({ length: 10 }, (_, index) => index + 1).map((leverage) => (
+                            <option key={leverage} value={leverage}>{leverage}×</option>
+                          ))}
+                        </select>
+                        <small>Venue confirmation is required before the run can resume.</small>
+                      </label>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={Boolean(localBusy)}
+                      onClick={() => void controlLocal("update_settings", {
+                        decisionCooldownSeconds: decisionCooldownMinutes * 60,
+                        isolatedLeverage,
+                      })}
+                    >
+                      Apply settings while paused
+                    </button>
+                    <hr />
+                    <h4>Change private strategy before resume</h4>
                     <label className="field-block">
                       <span>Strategy name</span>
                       <input value={agentName} maxLength={80} onChange={(event) => setAgentName(event.target.value)} />
@@ -1552,13 +1642,13 @@ export function App() {
                 <div className="venue-key-panel">
                   <span>LOCAL API WALLET ADDRESS</span>
                   <strong>{walletSetup?.address ?? "Preparing…"}</strong>
-                  <p>Register this public address as an API wallet in the Hyperliquid Testnet page that just opened. The private key is already sealed in your OS credential store.</p>
+                  <p>Register this public address as an API wallet in the Hyperliquid {selectedArena.mode === "hyperliquid_mainnet" ? "mainnet" : "Testnet"} page that just opened. The private key is already sealed in your OS credential store.</p>
                   <button
                     className="text-action"
                     type="button"
                     onClick={() => void continueToVenue()}
                   >
-                    Reopen Hyperliquid Testnet ↗
+                    Reopen Hyperliquid {selectedArena.mode === "hyperliquid_mainnet" ? "mainnet" : "Testnet"} ↗
                   </button>
                 </div>
                 <label className="field-block">

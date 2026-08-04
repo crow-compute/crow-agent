@@ -1,6 +1,12 @@
 [advisories]
 yanked = "deny"
 unmaintained = "workspace"
+# rkyv 0.7 remains in Cargo.lock only through disabled optional features of
+# chrono/hashbrown/rust_decimal; no resolved workspace target enables it.
+# glib 0.18 is required by Tauri's Linux WebKitGTK 4.1 integration, and Crow
+# does not use the affected VariantStrIter API. Remove these exceptions when
+# those upstream dependency constraints are retired.
+ignore = ["RUSTSEC-2026-0235", "RUSTSEC-2024-0429"]
 
 [licenses]
 allow = [

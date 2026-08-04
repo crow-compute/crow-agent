@@ -17,6 +17,29 @@ pub enum CompanionActionV1 {
     Pause,
     Resume,
     Stop,
+    UpdateSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSettingsV1 {
+    pub decision_cooldown_seconds: u32,
+    pub isolated_leverage: u8,
+}
+
+impl RunSettingsV1 {
+    pub fn validate(self) -> Result<(), CompanionIpcError> {
+        if !(crow_agent_protocol::MIN_LIVE_DECISION_INTERVAL_SECONDS
+            ..=crow_agent_protocol::MAX_CLIENT_DECISION_COOLDOWN_SECONDS)
+            .contains(&self.decision_cooldown_seconds)
+            || !self.decision_cooldown_seconds.is_multiple_of(60)
+            || !(crow_agent_protocol::MIN_CLIENT_ISOLATED_LEVERAGE
+                ..=crow_agent_protocol::MAX_CLIENT_ISOLATED_LEVERAGE)
+                .contains(&self.isolated_leverage)
+        {
+            return Err(CompanionIpcError::Protocol);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +49,7 @@ pub struct CompanionRequestV1 {
     pub nonce: u64,
     pub action: CompanionActionV1,
     pub strategy: Option<StrategyBundleV1>,
+    pub settings: Option<RunSettingsV1>,
     pub mac: String,
 }
 
@@ -58,6 +82,7 @@ struct UnsignedRequest<'a> {
     nonce: u64,
     action: CompanionActionV1,
     strategy: Option<&'a StrategyBundleV1>,
+    settings: Option<RunSettingsV1>,
 }
 
 #[derive(Serialize)]
@@ -86,6 +111,16 @@ impl CompanionRequestV1 {
         action: CompanionActionV1,
         strategy: Option<StrategyBundleV1>,
     ) -> Result<Self, CompanionIpcError> {
+        Self::sign_with_options(key, nonce, action, strategy, None)
+    }
+
+    pub fn sign_with_options(
+        key: &[u8; 32],
+        nonce: u64,
+        action: CompanionActionV1,
+        strategy: Option<StrategyBundleV1>,
+        settings: Option<RunSettingsV1>,
+    ) -> Result<Self, CompanionIpcError> {
         if strategy.is_some() && action != CompanionActionV1::Resume {
             return Err(CompanionIpcError::Protocol);
         }
@@ -95,6 +130,12 @@ impl CompanionRequestV1 {
         {
             return Err(CompanionIpcError::Protocol);
         }
+        if settings.is_some() && action != CompanionActionV1::UpdateSettings {
+            return Err(CompanionIpcError::Protocol);
+        }
+        if let Some(settings) = settings {
+            settings.validate()?;
+        }
         let request_id = Uuid::new_v4();
         let unsigned = UnsignedRequest {
             protocol: HARNESS_PROTOCOL_V1,
@@ -102,6 +143,7 @@ impl CompanionRequestV1 {
             nonce,
             action,
             strategy: strategy.as_ref(),
+            settings,
         };
         let mac = sign_value(key, &unsigned)?;
         Ok(Self {
@@ -110,6 +152,7 @@ impl CompanionRequestV1 {
             nonce,
             action,
             strategy,
+            settings,
             mac,
         })
     }
@@ -117,6 +160,7 @@ impl CompanionRequestV1 {
     pub fn verify(&self, key: &[u8; 32]) -> Result<(), CompanionIpcError> {
         if self.protocol != HARNESS_PROTOCOL_V1
             || (self.strategy.is_some() && self.action != CompanionActionV1::Resume)
+            || (self.settings.is_some() && self.action != CompanionActionV1::UpdateSettings)
             || self
                 .strategy
                 .as_ref()
@@ -132,6 +176,7 @@ impl CompanionRequestV1 {
                 nonce: self.nonce,
                 action: self.action,
                 strategy: self.strategy.as_ref(),
+                settings: self.settings,
             },
             &self.mac,
         )

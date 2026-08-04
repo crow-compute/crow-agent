@@ -1,9 +1,9 @@
-use crate::{ExecutionGate, PendingStrategy};
+use crate::{ExecutionGate, PendingSettings, PendingStrategy};
 use crow_agent_core::{
     DeviceEncryptionKey, DurableRunEventWriter, EncryptedJournal, GatewayClient, HarnessApiClient,
-    HyperliquidBookStream, HyperliquidVenue, LiveRiskState, RotatingAccessToken, StartHarnessRunV1,
-    execute_live_cycle, load_live_risk_state, open_agent_version, reconcile_live_state,
-    store_live_risk_state,
+    HyperliquidBookStream, HyperliquidVenue, LiveRiskState, RotatingAccessToken, RunSettingsV1,
+    StartHarnessRunV1, execute_live_cycle, load_live_risk_state, open_agent_version,
+    reconcile_live_state, store_live_risk_state,
 };
 use crow_agent_protocol::{
     ArenaMode, DeviceIdentity, MAX_CLIENT_DECISION_COOLDOWN_SECONDS, MAX_CLIENT_ISOLATED_LEVERAGE,
@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 
 const RUN_ID_PREFIX: &str = "live-run-id";
 const RUN_LEASE_PREFIX: &str = "live-run-lease";
+const RUN_SETTINGS_PREFIX: &str = "live-run-settings";
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct LiveArenaConfig {
@@ -81,6 +82,21 @@ pub(crate) enum LiveRunError {
     State,
 }
 
+impl LiveRunError {
+    pub(crate) fn failure_code(&self) -> &'static str {
+        match self {
+            Self::Configuration => "live_arena_configuration_invalid",
+            Self::Manifest => "live_arena_manifest_invalid",
+            Self::ControlPlane(_) => "live_arena_control_plane_unavailable",
+            Self::Venue(_) => "live_arena_venue_unavailable",
+            Self::Journal(_) | Self::Event(_) => "live_arena_journal_unavailable",
+            Self::Cycle(_) => "live_arena_cycle_failed",
+            Self::Gateway(_) => "live_arena_inference_unavailable",
+            Self::State => "live_arena_reconciliation_failed",
+        }
+    }
+}
+
 pub(crate) fn prepare(config: LiveArenaConfig) -> Result<PreparedLiveArena, LiveRunError> {
     let signed = serde_json::from_slice::<SignedArenaManifestV1>(
         &fs::read(&config.arena_manifest).map_err(|_| LiveRunError::Configuration)?,
@@ -94,11 +110,13 @@ pub(crate) fn prepare(config: LiveArenaConfig) -> Result<PreparedLiveArena, Live
     let isolated_leverage = config
         .isolated_leverage
         .unwrap_or(manifest.risk_rules.isolated_leverage);
-    if manifest.mode != ArenaMode::HyperliquidTestnet
-        || !manifest
-            .eligible_models
-            .iter()
-            .any(|model| model == &config.model_id)
+    if !matches!(
+        manifest.mode,
+        ArenaMode::HyperliquidTestnet | ArenaMode::HyperliquidMainnet
+    ) || !manifest
+        .eligible_models
+        .iter()
+        .any(|model| model == &config.model_id)
         || config.agent_version_id == Uuid::nil()
         || config.client_release.trim().is_empty()
         || !(MIN_LIVE_DECISION_INTERVAL_SECONDS..=MAX_CLIENT_DECISION_COOLDOWN_SECONDS)
@@ -151,17 +169,39 @@ pub(crate) async fn run_session(
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
     pending_strategy: &PendingStrategy,
+    pending_settings: &PendingSettings,
 ) -> Result<LiveSessionOutcome, LiveRunError> {
     let manifest = &config.signed.manifest;
     let now = OffsetDateTime::now_utc();
     if now >= manifest.ends_at {
         return Err(LiveRunError::Configuration);
     }
-    let expected_cycles = expected_cycle_count(manifest, config.decision_cooldown_seconds)?;
     let journal_path = state_directory.join("journal.db");
     let mut journal = EncryptedJournal::open(&journal_path, journal_key)?;
     let api = HarnessApiClient::with_access_token(api_origin, access_token.clone())?;
     let run_id = acquire_run(config, &journal, &api).await?;
+    let persisted_settings = journal
+        .secret(&settings_key(run_id))?
+        .and_then(|value| serde_json::from_slice::<RunSettingsV1>(&value).ok())
+        .or_else(|| {
+            journal
+                .public_events()
+                .ok()?
+                .into_iter()
+                .filter(|event| {
+                    event.run_id == run_id && event.event_type == "run_settings_changed"
+                })
+                .max_by_key(|event| event.sequence)
+                .and_then(|event| serde_json::from_value::<RunSettingsV1>(event.payload).ok())
+        });
+    let mut decision_cooldown_seconds = persisted_settings
+        .map_or(config.decision_cooldown_seconds, |settings| {
+            settings.decision_cooldown_seconds
+        });
+    let mut isolated_leverage = persisted_settings.map_or(config.isolated_leverage, |settings| {
+        settings.isolated_leverage
+    });
+    let mut expected_cycles = expected_cycle_count(manifest, decision_cooldown_seconds)?;
     let active_strategy_version = journal
         .secret(&strategy_key(run_id))?
         .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<Uuid>().ok())
@@ -172,9 +212,13 @@ pub(crate) async fn run_session(
     if strategy.model_id != config.model_id {
         return Err(LiveRunError::Configuration);
     }
-    let venue = HyperliquidVenue::connect_testnet(api_wallet_key).await?;
+    let venue = match manifest.mode {
+        ArenaMode::HyperliquidTestnet => HyperliquidVenue::connect_testnet(api_wallet_key).await?,
+        ArenaMode::HyperliquidMainnet => HyperliquidVenue::connect_mainnet(api_wallet_key).await?,
+        ArenaMode::HistoricalBacktest => return Err(LiveRunError::Configuration),
+    };
     venue
-        .configure_isolated_leverage(&config.execution_account, config.isolated_leverage)
+        .configure_isolated_leverage(&config.execution_account, isolated_leverage)
         .await?;
 
     initialize_event_chain(config, run_id, &mut journal, &api, identity).await?;
@@ -210,13 +254,20 @@ pub(crate) async fn run_session(
         run_id,
         &config.execution_account,
         &venue,
-        config.isolated_leverage,
+        isolated_leverage,
         &mut risk,
     )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        crow_agent_core::LiveCycleError::AccountPolicy => LiveRunError::State,
+        crow_agent_core::LiveCycleError::Venue(error) => LiveRunError::Venue(error),
+        crow_agent_core::LiveCycleError::Event(error) => LiveRunError::Event(error),
+        crow_agent_core::LiveCycleError::Journal(error) => LiveRunError::Journal(error),
+        other => LiveRunError::Cycle(other),
+    })?;
     let due_cycles = due_cycle_count(
         manifest,
-        config.decision_cooldown_seconds,
+        decision_cooldown_seconds,
         OffsetDateTime::now_utc(),
     )?;
     while completed_cycles < due_cycles {
@@ -226,7 +277,7 @@ pub(crate) async fn run_session(
             identity,
             manifest.arena_id,
             run_id,
-            scheduled_cycle_at(manifest, config.decision_cooldown_seconds, completed_cycles)?,
+            scheduled_cycle_at(manifest, decision_cooldown_seconds, completed_cycles)?,
             "companion_unavailable_at_boundary",
         )
         .await?;
@@ -249,7 +300,11 @@ pub(crate) async fn run_session(
         *active_run.lock().map_err(|_| LiveRunError::State)? = None;
         return Ok(LiveSessionOutcome::Stopped);
     }
-    let mut stream = HyperliquidBookStream::connect_testnet()?;
+    let mut stream = match manifest.mode {
+        ArenaMode::HyperliquidTestnet => HyperliquidBookStream::connect_testnet()?,
+        ArenaMode::HyperliquidMainnet => HyperliquidBookStream::connect_mainnet()?,
+        ArenaMode::HistoricalBacktest => return Err(LiveRunError::Configuration),
+    };
     let initial = stream.reconcile().await?;
     let mut books = initial
         .into_iter()
@@ -282,8 +337,8 @@ pub(crate) async fn run_session(
     lifecycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cycle_tick = tokio::time::interval_at(
         tokio::time::Instant::now()
-            + duration_until_cycle(manifest, config.decision_cooldown_seconds, completed_cycles)?,
-        Duration::from_secs(u64::from(config.decision_cooldown_seconds)),
+            + duration_until_cycle(manifest, decision_cooldown_seconds, completed_cycles)?,
+        Duration::from_secs(u64::from(decision_cooldown_seconds)),
     );
     cycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     info!(
@@ -326,6 +381,55 @@ pub(crate) async fn run_session(
                     }
                 }
                 if execution_gate.label() == "paused" {
+                    let requested_settings = *pending_settings
+                        .lock()
+                        .map_err(|_| LiveRunError::State)?;
+                    if let Some(requested_settings) = requested_settings {
+                        requested_settings
+                            .validate()
+                            .map_err(|_| LiveRunError::Configuration)?;
+                        venue
+                            .configure_isolated_leverage(
+                                &config.execution_account,
+                                requested_settings.isolated_leverage,
+                            )
+                            .await?;
+                        let mut writer = DurableRunEventWriter::new(
+                            &mut journal,
+                            &api,
+                            identity,
+                            manifest.arena_id,
+                            run_id,
+                        );
+                        writer
+                            .append(
+                                None,
+                                "run_settings_changed",
+                                json!({
+                                    "previous_decision_cooldown_seconds": decision_cooldown_seconds,
+                                    "previous_isolated_leverage": isolated_leverage,
+                                    "decision_cooldown_seconds": requested_settings.decision_cooldown_seconds,
+                                    "isolated_leverage": requested_settings.isolated_leverage,
+                                }),
+                                &Value::Null,
+                            )
+                            .await?;
+                        journal.put_secret(
+                            &settings_key(run_id),
+                            &serde_json::to_vec(&requested_settings)
+                                .map_err(|_| LiveRunError::State)?,
+                        )?;
+                        *pending_settings.lock().map_err(|_| LiveRunError::State)? = None;
+                        decision_cooldown_seconds = requested_settings.decision_cooldown_seconds;
+                        isolated_leverage = requested_settings.isolated_leverage;
+                        expected_cycles = expected_cycle_count(manifest, decision_cooldown_seconds)?;
+                        cycle_tick = tokio::time::interval_at(
+                            tokio::time::Instant::now()
+                                + Duration::from_secs(u64::from(decision_cooldown_seconds)),
+                            Duration::from_secs(u64::from(decision_cooldown_seconds)),
+                        );
+                        cycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    }
                     let candidate = pending_strategy
                         .lock()
                         .map_err(|_| LiveRunError::State)?
@@ -396,7 +500,7 @@ pub(crate) async fn run_session(
                         run_id,
                         scheduled_cycle_at(
                             manifest,
-                            config.decision_cooldown_seconds,
+                            decision_cooldown_seconds,
                             completed_cycles,
                         )?,
                         "execution_paused_at_boundary",
@@ -413,7 +517,7 @@ pub(crate) async fn run_session(
                     manifest,
                     run_id,
                     &config.model_id,
-                    config.isolated_leverage,
+                    isolated_leverage,
                     &strategy.system_instructions,
                     &config.execution_account,
                     &venue,
@@ -449,7 +553,11 @@ pub(crate) async fn run_session(
                             .map(|book| (book.symbol.clone(), book))
                             .collect();
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                        stream = HyperliquidBookStream::connect_testnet()?;
+                        stream = match manifest.mode {
+                            ArenaMode::HyperliquidTestnet => HyperliquidBookStream::connect_testnet()?,
+                            ArenaMode::HyperliquidMainnet => HyperliquidBookStream::connect_mainnet()?,
+                            ArenaMode::HistoricalBacktest => return Err(LiveRunError::Configuration),
+                        };
                     }
                 }
             }
@@ -506,33 +614,16 @@ async fn initialize_event_chain(
 ) -> Result<(), LiveRunError> {
     let arena_id = config.signed.manifest.arena_id;
     if journal.latest_event_state(run_id)?.is_some() {
-        let started = journal
-            .public_events()?
-            .into_iter()
-            .find(|event| event.run_id == run_id && event.event_type == "run_started")
-            .ok_or(LiveRunError::State)?;
-        let recorded_cooldown = started
-            .payload
-            .get("decision_cooldown_seconds")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(config.signed.manifest.decision_interval_seconds);
-        let recorded_leverage = started
-            .payload
-            .get("isolated_leverage")
-            .and_then(Value::as_u64)
-            .and_then(|value| u8::try_from(value).ok())
-            .unwrap_or(config.signed.manifest.risk_rules.isolated_leverage);
-        if recorded_cooldown != config.decision_cooldown_seconds
-            || recorded_leverage != config.isolated_leverage
-        {
-            return Err(LiveRunError::Configuration);
-        }
         let writer = DurableRunEventWriter::new(journal, api, identity, arena_id, run_id);
         writer.flush_pending().await?;
         return Ok(());
     }
     let manifest_sha256 = config.signed.manifest_sha256.clone();
+    let venue_mode = match config.signed.manifest.mode {
+        ArenaMode::HyperliquidMainnet => "hyperliquid_mainnet",
+        ArenaMode::HyperliquidTestnet => "hyperliquid_testnet",
+        ArenaMode::HistoricalBacktest => "historical_backtest",
+    };
     let mut writer = DurableRunEventWriter::new(journal, api, identity, arena_id, run_id);
     writer
         .append(
@@ -541,7 +632,7 @@ async fn initialize_event_chain(
             json!({
                 "client_release": config.client_release,
                 "manifest_sha256": manifest_sha256,
-                "mode": "hyperliquid_testnet",
+                "mode": venue_mode,
                 "decision_cooldown_seconds": config.decision_cooldown_seconds,
                 "isolated_leverage": config.isolated_leverage,
             }),
@@ -709,6 +800,10 @@ fn lease_key(arena_id: Uuid) -> String {
 
 fn strategy_key(run_id: Uuid) -> String {
     format!("active-strategy-version-{run_id}")
+}
+
+fn settings_key(run_id: Uuid) -> String {
+    format!("{RUN_SETTINGS_PREFIX}-{run_id}")
 }
 
 fn valid_execution_account(value: &str) -> bool {

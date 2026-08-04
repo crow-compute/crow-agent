@@ -3,7 +3,7 @@ use crow_agent_core::{
     AgentVersionRecipient, CompanionActionV1, CompanionRequestV1, CompanionResponseV1,
     DeviceAuthorizationClient, DeviceAuthorizationError, DeviceAuthorizationSession,
     DeviceEncryptionKey, DeviceTokens, EncryptedJournal, MAX_COMPANION_MESSAGE_BYTES,
-    REQUIRED_STRATEGY_TOOLS, StrategyBundleV1, decode_device_encryption_public_key,
+    REQUIRED_STRATEGY_TOOLS, RunSettingsV1, StrategyBundleV1, decode_device_encryption_public_key,
     hyperliquid_api_wallet_address, open_agent_version, seal_agent_version,
 };
 use crow_agent_protocol::{
@@ -55,6 +55,7 @@ const HYPERLIQUID_API_WALLET_ACCOUNT: &str = "hyperliquid-api-wallet-key";
 const PRODUCTION_API_ORIGIN: &str = "https://api.crowcompute.ai";
 const PRODUCTION_RELAY_URL: &str = "wss://api.crowcompute.ai/harness/v1/connect";
 const HYPERLIQUID_TESTNET_API_URL: &str = "https://app.hyperliquid-testnet.xyz/API";
+const HYPERLIQUID_MAINNET_API_URL: &str = "https://app.hyperliquid.xyz/API";
 const COMPANION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 // Live startup performs several signed venue/API calls before it can publish
 // an active run over IPC. Fifteen seconds was short enough to kill a healthy
@@ -118,6 +119,7 @@ struct AgentStatus {
     execution_boundary: &'static str,
     daemon: String,
     active_run: Option<String>,
+    error: Option<String>,
     device_authorized: bool,
 }
 
@@ -544,13 +546,15 @@ impl DesktopState {
         &self,
         action: CompanionActionV1,
     ) -> Result<CompanionResponseV1, DesktopError> {
-        self.companion_request_with_strategy(action, None).await
+        self.companion_request_with_options(action, None, None)
+            .await
     }
 
-    async fn companion_request_with_strategy(
+    async fn companion_request_with_options(
         &self,
         action: CompanionActionV1,
         strategy: Option<StrategyBundleV1>,
+        settings: Option<RunSettingsV1>,
     ) -> Result<CompanionResponseV1, DesktopError> {
         // Nonces are ordered by issuance, so the matching IPC requests must
         // remain ordered through delivery and response verification as well.
@@ -560,9 +564,14 @@ impl DesktopState {
         let _request_guard = self.companion_request_lock.lock().await;
         let credentials = self.companion_credentials()?;
         let nonce = next_companion_nonce(&self.companion_nonce)?;
-        let request =
-            CompanionRequestV1::sign_with_strategy(&credentials.secret, nonce, action, strategy)
-                .map_err(|_| DesktopError::Companion)?;
+        let request = CompanionRequestV1::sign_with_options(
+            &credentials.secret,
+            nonce,
+            action,
+            strategy,
+            settings,
+        )
+        .map_err(|_| DesktopError::Companion)?;
         tokio::time::timeout(
             COMPANION_TIMEOUT,
             send_companion_request(&credentials.ipc_name, &credentials.secret, &request),
@@ -584,6 +593,7 @@ async fn get_agent_status(
             execution_boundary: "local_device",
             daemon: "stopped".into(),
             active_run: None,
+            error: None,
             device_authorized,
         });
     }
@@ -605,8 +615,10 @@ async fn get_agent_status(
             .as_ref()
             .map_or_else(|| "stopped".into(), |value| value.execution_state.clone()),
         active_run: response
+            .as_ref()
             .and_then(|value| value.active_run)
             .map(|run_id| run_id.to_string()),
+        error: response.as_ref().and_then(|value| value.error.clone()),
         device_authorized,
     })
 }
@@ -683,6 +695,7 @@ fn verified_local_arena_schedule(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_local_run_journal(
     public_events: &[crow_agent_protocol::RunEventEnvelopeV1],
     requested_run_id: Option<&str>,
@@ -740,6 +753,18 @@ fn build_local_run_journal(
             "run_resumed" => summary.state = "running".into(),
             "run_paused" => summary.state = "paused".into(),
             "run_stopped" => summary.state = "stopped".into(),
+            "run_settings_changed" => {
+                summary.decision_interval_seconds = event
+                    .payload
+                    .get("decision_cooldown_seconds")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+                summary.isolated_leverage = event
+                    .payload
+                    .get("isolated_leverage")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u8::try_from(value).ok());
+            }
             "cycle_started" => summary.cycle_count += 1,
             "order_submitted" => summary.order_count += 1,
             "fill" => {
@@ -910,13 +935,32 @@ async fn unlock_device_credentials(
 async fn send_local_command(
     action: String,
     agent_version_id: Option<String>,
+    decision_cooldown_seconds: Option<u32>,
+    isolated_leverage: Option<u8>,
     state: State<'_, DesktopState>,
 ) -> Result<AgentStatus, String> {
     let action = match action.as_str() {
         "pause" => CompanionActionV1::Pause,
         "resume" => CompanionActionV1::Resume,
         "stop" => CompanionActionV1::Stop,
+        "update_settings" => CompanionActionV1::UpdateSettings,
         _ => return Err(DesktopError::Companion.code().into()),
+    };
+    let settings = if action == CompanionActionV1::UpdateSettings {
+        let settings = RunSettingsV1 {
+            decision_cooldown_seconds: decision_cooldown_seconds
+                .ok_or_else(|| DesktopError::Arena.code().to_owned())?,
+            isolated_leverage: isolated_leverage
+                .ok_or_else(|| DesktopError::Arena.code().to_owned())?,
+        };
+        settings
+            .validate()
+            .map_err(|_| DesktopError::Arena.code().to_owned())?;
+        Some(settings)
+    } else if decision_cooldown_seconds.is_some() || isolated_leverage.is_some() {
+        return Err(DesktopError::Companion.code().into());
+    } else {
+        None
     };
     let strategy = if action == CompanionActionV1::Resume {
         if let Some(version_id) = agent_version_id {
@@ -951,7 +995,7 @@ async fn send_local_command(
         None
     };
     let response = state
-        .companion_request_with_strategy(action, strategy)
+        .companion_request_with_options(action, strategy, settings)
         .await
         .map_err(|error| error.code().to_owned())?;
     if !response.accepted {
@@ -962,6 +1006,7 @@ async fn send_local_command(
         execution_boundary: "local_device",
         daemon: response.execution_state,
         active_run: response.active_run.map(|run_id| run_id.to_string()),
+        error: response.error,
         device_authorized: state.device_authorized(),
     })
 }
@@ -1155,16 +1200,20 @@ async fn create_agent_version(
 }
 
 #[tauri::command]
-fn prepare_hyperliquid_wallet() -> Result<HyperliquidWalletSetup, String> {
+fn prepare_hyperliquid_wallet(mainnet: Option<bool>) -> Result<HyperliquidWalletSetup, String> {
     let key =
         load_or_create_hyperliquid_api_wallet_key().map_err(|error| error.code().to_owned())?;
     let address =
         hyperliquid_api_wallet_address(&key).map_err(|_| DesktopError::Venue.code().to_owned())?;
-    open::that_detached(HYPERLIQUID_TESTNET_API_URL)
-        .map_err(|_| DesktopError::Browser.code().to_owned())?;
+    let approval_url = if mainnet.unwrap_or(false) {
+        HYPERLIQUID_MAINNET_API_URL
+    } else {
+        HYPERLIQUID_TESTNET_API_URL
+    };
+    open::that_detached(approval_url).map_err(|_| DesktopError::Browser.code().to_owned())?;
     Ok(HyperliquidWalletSetup {
         address,
-        approval_url: HYPERLIQUID_TESTNET_API_URL.into(),
+        approval_url: approval_url.into(),
     })
 }
 
@@ -1336,16 +1385,21 @@ async fn start_local_arena(
     let start_deadline = tokio::time::Instant::now() + DESKTOP_RUN_START_TIMEOUT;
     while tokio::time::Instant::now() < start_deadline {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Ok(response) = state.companion_request(CompanionActionV1::Status).await
-            && response.active_run.is_some()
-        {
-            return Ok(AgentStatus {
-                protocol: HARNESS_PROTOCOL_V1,
-                execution_boundary: "local_device",
-                daemon: response.execution_state,
-                active_run: response.active_run.map(|run_id| run_id.to_string()),
-                device_authorized: true,
-            });
+        if let Ok(response) = state.companion_request(CompanionActionV1::Status).await {
+            if let Some(error) = response.error {
+                state.stop_owned_companion();
+                return Err(error);
+            }
+            if response.active_run.is_some() {
+                return Ok(AgentStatus {
+                    protocol: HARNESS_PROTOCOL_V1,
+                    execution_boundary: "local_device",
+                    daemon: response.execution_state,
+                    active_run: response.active_run.map(|run_id| run_id.to_string()),
+                    error: None,
+                    device_authorized: true,
+                });
+            }
         }
     }
     state.stop_owned_companion();

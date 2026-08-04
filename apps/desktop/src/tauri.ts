@@ -5,6 +5,7 @@ export type AgentStatus = {
   executionBoundary: "local_device";
   daemon: "stopped" | "connecting" | "ready" | "running" | "paused";
   activeRun: string | null;
+  error?: string | null;
   deviceAuthorized: boolean;
 };
 
@@ -44,7 +45,7 @@ export type RemoteState = {
 
 export type PublicArena = {
   id: string;
-  mode: string;
+  mode: "historical_backtest" | "hyperliquid_testnet" | "hyperliquid_mainnet" | string;
   manifest: Record<string, unknown>;
   state: string;
   startsAt: string;
@@ -132,10 +133,17 @@ export async function getLocalRunJournal(
 }
 
 export async function sendLocalCommand(
-  action: "pause" | "resume" | "stop",
+  action: "pause" | "resume" | "stop" | "update_settings",
   agentVersionId?: string,
+  decisionCooldownSeconds?: number,
+  isolatedLeverage?: number,
 ): Promise<AgentStatus> {
-  return invoke<AgentStatus>("send_local_command", { action, agentVersionId });
+  return invoke<AgentStatus>("send_local_command", {
+    action,
+    agentVersionId,
+    decisionCooldownSeconds,
+    isolatedLeverage,
+  });
 }
 
 export async function beginDeviceAuthorization(
@@ -179,8 +187,8 @@ export async function createAgentVersion(
   });
 }
 
-export async function prepareHyperliquidWallet(): Promise<HyperliquidWalletSetup> {
-  return invoke<HyperliquidWalletSetup>("prepare_hyperliquid_wallet");
+export async function prepareHyperliquidWallet(mainnet = false): Promise<HyperliquidWalletSetup> {
+  return invoke<HyperliquidWalletSetup>("prepare_hyperliquid_wallet", { mainnet });
 }
 
 export async function enrollArena(

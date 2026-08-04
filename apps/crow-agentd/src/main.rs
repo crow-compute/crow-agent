@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 use crow_agent_core::{
     BacktestEngine, CompanionActionV1, CompanionIpcError, CompanionRequestV1, CompanionResponseV1,
     DeviceAuthorizationClient, DeviceAuthorizationError, DeviceEncryptionKey, EncryptedJournal,
-    MAX_COMPANION_MESSAGE_BYTES, RotatingAccessToken, ScheduledProposal, StrategyBundleV1,
-    TlsProviderError, install_tls_crypto_provider, read_verified_dataset,
+    MAX_COMPANION_MESSAGE_BYTES, RotatingAccessToken, RunSettingsV1, ScheduledProposal,
+    StrategyBundleV1, TlsProviderError, install_tls_crypto_provider, read_verified_dataset,
 };
 use crow_agent_protocol::{
     DatasetManifestV1, DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1,
@@ -130,6 +130,8 @@ struct DesktopCredentials {
 }
 
 type PendingStrategy = Arc<Mutex<Option<StrategyBundleV1>>>;
+type PendingSettings = Arc<Mutex<Option<RunSettingsV1>>>;
+type LastError = Arc<Mutex<Option<String>>>;
 
 fn production_api_origin() -> String {
     "https://api.crowcompute.ai".into()
@@ -381,6 +383,8 @@ async fn main() -> Result<(), DaemonError> {
             let execution_gate = ExecutionGate::new();
             let active_run = Arc::new(Mutex::new(None));
             let pending_strategy = Arc::new(Mutex::new(None));
+            let pending_settings = Arc::new(Mutex::new(None));
+            let last_error = Arc::new(Mutex::new(None));
             tokio::select! {
                 result = run_companion_listener(
                     &ipc_name,
@@ -388,6 +392,8 @@ async fn main() -> Result<(), DaemonError> {
                     &execution_gate,
                     &active_run,
                     &pending_strategy,
+                    &pending_settings,
+                    &last_error,
                 ) => result?,
                 result = run_relay(
                     &config,
@@ -401,6 +407,8 @@ async fn main() -> Result<(), DaemonError> {
                     &execution_gate,
                     &active_run,
                     &pending_strategy,
+                    &pending_settings,
+                    &last_error,
                 ) => result?,
             }
         }
@@ -432,6 +440,8 @@ async fn main() -> Result<(), DaemonError> {
             let execution_gate = ExecutionGate::new();
             let active_run = Arc::new(Mutex::new(None));
             let pending_strategy = Arc::new(Mutex::new(None));
+            let pending_settings = Arc::new(Mutex::new(None));
+            let last_error = Arc::new(Mutex::new(None));
             Box::pin(run_relay(
                 &config,
                 &identity,
@@ -444,6 +454,8 @@ async fn main() -> Result<(), DaemonError> {
                 &execution_gate,
                 &active_run,
                 &pending_strategy,
+                &pending_settings,
+                &last_error,
             ))
             .await?;
         }
@@ -470,22 +482,29 @@ async fn run_companion(ipc_name: &str) -> Result<(), DaemonError> {
     let execution_gate = ExecutionGate::new();
     let active_run = Arc::new(Mutex::new(None));
     let pending_strategy = Arc::new(Mutex::new(None));
+    let pending_settings = Arc::new(Mutex::new(None));
+    let last_error = Arc::new(Mutex::new(None));
     run_companion_listener(
         ipc_name,
         &secret,
         &execution_gate,
         &active_run,
         &pending_strategy,
+        &pending_settings,
+        &last_error,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_companion_listener(
     ipc_name: &str,
     secret: &[u8; 32],
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
     pending_strategy: &PendingStrategy,
+    pending_settings: &PendingSettings,
+    last_error: &LastError,
 ) -> Result<(), DaemonError> {
     let name = local_socket_name(ipc_name)?;
     let listener = ListenerOptions::new()
@@ -504,6 +523,8 @@ async fn run_companion_listener(
             execution_gate,
             active_run,
             pending_strategy,
+            pending_settings,
+            last_error,
         )
         .await
         {
@@ -512,6 +533,7 @@ async fn run_companion_listener(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_companion_connection(
     connection: LocalSocketStream,
     secret: &[u8; 32],
@@ -519,6 +541,8 @@ async fn handle_companion_connection(
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
     pending_strategy: &PendingStrategy,
+    pending_settings: &PendingSettings,
+    last_error: &LastError,
 ) -> Result<(), DaemonError> {
     let reader = BufReader::new(&connection);
     let mut reader = reader.take((MAX_COMPANION_MESSAGE_BYTES + 1) as u64);
@@ -535,6 +559,8 @@ async fn handle_companion_connection(
         execution_gate,
         active_run,
         pending_strategy,
+        pending_settings,
+        last_error,
     )?;
     let mut encoded = serde_json::to_vec(&response)?;
     encoded.push(b'\n');
@@ -543,6 +569,7 @@ async fn handle_companion_connection(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_companion_request(
     request: &CompanionRequestV1,
     secret: &[u8; 32],
@@ -550,6 +577,8 @@ fn apply_companion_request(
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
     pending_strategy: &PendingStrategy,
+    pending_settings: &PendingSettings,
+    last_error: &LastError,
 ) -> Result<CompanionResponseV1, DaemonError> {
     request.verify(secret)?;
     if request.nonce <= *highest_nonce {
@@ -585,7 +614,42 @@ fn apply_companion_request(
             }
         }
         CompanionActionV1::Stop => execution_gate.apply(RemoteAction::Stop),
+        CompanionActionV1::UpdateSettings => {
+            if execution_gate.label() != "paused"
+                || active_run
+                    .lock()
+                    .map_err(|_| DaemonError::RemoteCommand)?
+                    .is_none()
+                || request.settings.is_none()
+            {
+                false
+            } else {
+                let mut pending = pending_settings
+                    .lock()
+                    .map_err(|_| DaemonError::RemoteCommand)?;
+                if pending.is_some() {
+                    false
+                } else {
+                    *pending = request.settings;
+                    true
+                }
+            }
+        }
     };
+    let error = if request.action == CompanionActionV1::Status {
+        last_error
+            .lock()
+            .map_err(|_| DaemonError::RemoteCommand)?
+            .clone()
+    } else {
+        (!accepted).then(|| "invalid_transition".into())
+    };
+    if accepted
+        && request.action != CompanionActionV1::Status
+        && let Ok(mut diagnostic) = last_error.lock()
+    {
+        *diagnostic = None;
+    }
     CompanionResponseV1::sign(
         secret,
         request.request_id,
@@ -593,7 +657,7 @@ fn apply_companion_request(
         accepted,
         execution_gate.label(),
         *active_run.lock().map_err(|_| DaemonError::RemoteCommand)?,
-        (!accepted).then(|| "invalid_transition".into()),
+        error,
     )
     .map_err(DaemonError::from)
 }
@@ -739,6 +803,8 @@ async fn run_relay(
     execution_gate: &ExecutionGate,
     active_run: &Arc<Mutex<Option<Uuid>>>,
     pending_strategy: &PendingStrategy,
+    pending_settings: &PendingSettings,
+    last_error: &LastError,
 ) -> Result<(), DaemonError> {
     let url = Url::parse(&config.relay_url).map_err(|_| DaemonError::RelayUrl)?;
     if url.scheme() != "wss" {
@@ -776,6 +842,7 @@ async fn run_relay(
             execution_gate,
             active_run,
             pending_strategy,
+            pending_settings,
         )))
     } else {
         None
@@ -825,7 +892,17 @@ async fn run_relay(
                 live_session = None;
                 backoff = Duration::from_secs(1);
             }
-            SessionResult::Live(Err(error)) => return Err(DaemonError::LiveRun(error)),
+            SessionResult::Live(Err(error)) => {
+                warn!(error = %error, code = error.failure_code(), "live arena session stopped before reconciliation; no orders are permitted");
+                if let Ok(mut diagnostic) = last_error.lock() {
+                    *diagnostic = Some(error.failure_code().to_owned());
+                }
+                execution_gate
+                    .state
+                    .store(EXECUTION_PAUSED, Ordering::SeqCst);
+                live_session = None;
+                backoff = Duration::from_secs(1);
+            }
             SessionResult::Relay(Err(error)) => {
                 warn!(error = %error, "relay session ended; no new decisions are permitted");
                 execution_gate
@@ -1095,6 +1172,8 @@ mod tests {
         let run_id = Uuid::new_v4();
         let active_run = Arc::new(Mutex::new(Some(run_id)));
         let pending_strategy = Arc::new(Mutex::new(None));
+        let pending_settings = Arc::new(Mutex::new(None));
+        let last_error = Arc::new(Mutex::new(None));
         let mut highest_nonce = 0;
         let request = CompanionRequestV1::sign(&secret, 1, CompanionActionV1::Resume)?;
         let response = apply_companion_request(
@@ -1104,6 +1183,8 @@ mod tests {
             &gate,
             &active_run,
             &pending_strategy,
+            &pending_settings,
+            &last_error,
         )?;
         response.verify(&secret, &request)?;
         assert!(response.accepted);
@@ -1117,6 +1198,8 @@ mod tests {
                 &gate,
                 &active_run,
                 &pending_strategy,
+                &pending_settings,
+                &last_error,
             )
             .is_err()
         );
@@ -1131,6 +1214,8 @@ mod tests {
                 &gate,
                 &active_run,
                 &pending_strategy,
+                &pending_settings,
+                &last_error,
             )
             .is_err()
         );
@@ -1145,6 +1230,8 @@ mod tests {
         let gate = ExecutionGate::new();
         let active_run = Arc::new(Mutex::new(Some(Uuid::new_v4())));
         let pending_strategy = Arc::new(Mutex::new(None));
+        let pending_settings = Arc::new(Mutex::new(None));
+        let last_error = Arc::new(Mutex::new(None));
         let strategy = StrategyBundleV1 {
             protocol: HARNESS_PROTOCOL_V1.into(),
             version_id: Uuid::new_v4(),
@@ -1170,6 +1257,8 @@ mod tests {
             &gate,
             &active_run,
             &pending_strategy,
+            &pending_settings,
+            &last_error,
         )?;
         assert!(response.accepted);
         assert_eq!(response.execution_state, "paused");
@@ -1180,6 +1269,69 @@ mod tests {
                 .as_ref(),
             Some(&strategy)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn companion_queues_settings_only_while_paused() -> Result<(), Box<dyn std::error::Error>> {
+        let secret = [29_u8; 32];
+        let gate = ExecutionGate::new();
+        let active_run = Arc::new(Mutex::new(Some(Uuid::new_v4())));
+        let pending_strategy = Arc::new(Mutex::new(None));
+        let pending_settings = Arc::new(Mutex::new(None));
+        let last_error = Arc::new(Mutex::new(None));
+        let settings = RunSettingsV1 {
+            decision_cooldown_seconds: 600,
+            isolated_leverage: 3,
+        };
+        let request = CompanionRequestV1::sign_with_options(
+            &secret,
+            1,
+            CompanionActionV1::UpdateSettings,
+            None,
+            Some(settings),
+        )?;
+        let mut nonce = 0;
+        let response = apply_companion_request(
+            &request,
+            &secret,
+            &mut nonce,
+            &gate,
+            &active_run,
+            &pending_strategy,
+            &pending_settings,
+            &last_error,
+        )?;
+        assert!(response.accepted);
+        assert_eq!(
+            pending_settings
+                .lock()
+                .map_err(|_| "pending lock")?
+                .as_ref(),
+            Some(&settings)
+        );
+        gate.apply(RemoteAction::Resume);
+        let rejected = CompanionRequestV1::sign_with_options(
+            &secret,
+            2,
+            CompanionActionV1::UpdateSettings,
+            None,
+            Some(RunSettingsV1 {
+                decision_cooldown_seconds: 900,
+                isolated_leverage: 4,
+            }),
+        )?;
+        let response = apply_companion_request(
+            &rejected,
+            &secret,
+            &mut nonce,
+            &gate,
+            &active_run,
+            &pending_strategy,
+            &pending_settings,
+            &last_error,
+        )?;
+        assert!(!response.accepted);
         Ok(())
     }
 
