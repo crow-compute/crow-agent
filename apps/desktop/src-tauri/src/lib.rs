@@ -56,6 +56,10 @@ const PRODUCTION_API_ORIGIN: &str = "https://api.crowcompute.ai";
 const PRODUCTION_RELAY_URL: &str = "wss://api.crowcompute.ai/harness/v1/connect";
 const HYPERLIQUID_TESTNET_API_URL: &str = "https://app.hyperliquid-testnet.xyz/API";
 const COMPANION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+// Live startup performs several signed venue/API calls before it can publish
+// an active run over IPC. Fifteen seconds was short enough to kill a healthy
+// companion during reconciliation on a normal network path.
+const DESKTOP_RUN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const MAX_DESKTOP_REFRESH_TOKEN_BYTES: usize = 512;
 const CREDENTIAL_VAULT_VERSION: u8 = 1;
 
@@ -1329,7 +1333,8 @@ async fn start_local_arena(
         .launch_desktop_run(&app, &config_path, &credential_frame)
         .await
         .map_err(|error| error.code().to_owned())?;
-    for _ in 0..75 {
+    let start_deadline = tokio::time::Instant::now() + DESKTOP_RUN_START_TIMEOUT;
+    while tokio::time::Instant::now() < start_deadline {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if let Ok(response) = state.companion_request(CompanionActionV1::Status).await
             && response.active_run.is_some()
@@ -1348,7 +1353,11 @@ async fn start_local_arena(
 }
 
 fn validate_launch_account(account: &crow_agent_core::AccountSnapshot) -> Result<(), DesktopError> {
-    if account.equity_micro_usdc <= 0 || account.withdrawable_micro_usdc <= 0 {
+    // Withdrawable collateral can be zero while an account has valid isolated
+    // positions consuming its margin. Equity is the launch invariant; order
+    // sizing later uses the reconciled available collateral and fails closed
+    // when no new order can fit.
+    if account.equity_micro_usdc <= 0 {
         return Err(DesktopError::VenueCollateral);
     }
     Ok(())
@@ -2112,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_launch_requires_positive_verified_collateral() {
+    fn arena_launch_requires_positive_equity() {
         let account = crow_agent_core::AccountSnapshot {
             venue_time_ms: 1,
             equity_micro_usdc: 1_001_473_289,
@@ -2123,12 +2132,17 @@ mod tests {
         let empty = crow_agent_core::AccountSnapshot {
             equity_micro_usdc: 0,
             withdrawable_micro_usdc: 0,
-            ..account
+            ..account.clone()
         };
         assert!(matches!(
             validate_launch_account(&empty),
             Err(DesktopError::VenueCollateral)
         ));
+        let position_backed = crow_agent_core::AccountSnapshot {
+            withdrawable_micro_usdc: 0,
+            ..account
+        };
+        assert!(validate_launch_account(&position_backed).is_ok());
     }
 
     #[test]
