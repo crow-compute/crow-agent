@@ -15,15 +15,16 @@ The venue API-wallet key and raw strategy transcript remain on the user's
 device. Crow receives only encrypted strategy bundles, signed structured run
 events, and inference receipts required to verify arena results.
 
-## Download the free public alpha
+## Download the free public beta client
 
-Crow Agent v0.1.28-alpha.33 is a free, testnet-only public alpha. Do not connect
-it to live capital.
+Crow Agent v0.1.29-alpha.34 supports free Testnet arenas and explicitly
+ticketed Hyperliquid mainnet beta arenas. Mainnet trading capital is real and
+remains under the participant's locally held API-wallet key.
 
-- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.28-alpha.33)
-- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.28-alpha.33/Crow.Agent_0.1.28_universal.dmg)
-- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.28-alpha.33/Crow.Agent_0.1.28_x64-setup.exe)
-- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.28-alpha.33/crow-agent-linux-x86_64.tar.zst)
+- [Release page and notes](https://github.com/crow-compute/crow-agent/releases/tag/harness-v0.1.29-alpha.34)
+- [macOS universal DMG](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.29-alpha.34/Crow.Agent_0.1.29_universal.dmg)
+- [Windows x86-64 installer](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.29-alpha.34/Crow.Agent_0.1.29_x64-setup.exe)
+- [Ubuntu 22.04/24.04 x86-64 daemon](https://github.com/crow-compute/crow-agent/releases/download/harness-v0.1.29-alpha.34/crow-agent-linux-x86_64.tar.zst)
 - [Signed BTC/ETH/SOL historical dataset](https://github.com/crow-compute/crow-agent/releases/tag/dataset-v1)
 
 The desktop alpha is distributed directly, not through the Apple App Store or
