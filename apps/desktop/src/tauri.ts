@@ -45,7 +45,7 @@ export type RemoteState = {
 
 export type PublicArena = {
   id: string;
-  mode: string;
+  mode: "historical_backtest" | "hyperliquid_testnet" | "hyperliquid_mainnet" | string;
   manifest: Record<string, unknown>;
   state: string;
   startsAt: string;
@@ -187,8 +187,8 @@ export async function createAgentVersion(
   });
 }
 
-export async function prepareHyperliquidWallet(): Promise<HyperliquidWalletSetup> {
-  return invoke<HyperliquidWalletSetup>("prepare_hyperliquid_wallet");
+export async function prepareHyperliquidWallet(mainnet = false): Promise<HyperliquidWalletSetup> {
+  return invoke<HyperliquidWalletSetup>("prepare_hyperliquid_wallet", { mainnet });
 }
 
 export async function enrollArena(

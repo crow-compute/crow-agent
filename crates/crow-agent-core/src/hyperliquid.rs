@@ -248,13 +248,20 @@ pub struct HyperliquidVenue {
     nonce: NonceHandler,
     assets: BTreeMap<String, CoreAsset>,
     budget: Arc<RequestBudget>,
+    network: HyperliquidNetwork,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HyperliquidNetwork {
+    Testnet,
+    Mainnet,
 }
 
 impl std::fmt::Debug for HyperliquidVenue {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("HyperliquidVenue")
-            .field("network", &"testnet")
+            .field("network", &self.network)
             .field("assets", &self.assets)
             .field("api_wallet", &"[REDACTED]")
             .finish_non_exhaustive()
@@ -265,13 +272,29 @@ impl HyperliquidVenue {
     pub async fn connect_testnet(
         api_wallet_key: &Zeroizing<[u8; 32]>,
     ) -> Result<Self, HyperliquidError> {
+        Self::connect(api_wallet_key, HyperliquidNetwork::Testnet).await
+    }
+
+    pub async fn connect_mainnet(
+        api_wallet_key: &Zeroizing<[u8; 32]>,
+    ) -> Result<Self, HyperliquidError> {
+        Self::connect(api_wallet_key, HyperliquidNetwork::Mainnet).await
+    }
+
+    async fn connect(
+        api_wallet_key: &Zeroizing<[u8; 32]>,
+        network: HyperliquidNetwork,
+    ) -> Result<Self, HyperliquidError> {
         let encoded_key = Zeroizing::new(format!("0x{}", hex::encode(api_wallet_key.as_ref())));
         let signer = encoded_key
             .parse::<PrivateKeySigner>()
             .map_err(|_| HyperliquidError::Wallet)?;
         let budget = Arc::new(RequestBudget::new());
         budget.consume(INFO_META_WEIGHT)?;
-        let client = hypercore::testnet();
+        let client = match network {
+            HyperliquidNetwork::Testnet => hypercore::testnet(),
+            HyperliquidNetwork::Mainnet => hypercore::mainnet(),
+        };
         let markets = client.perps().await.map_err(|_| HyperliquidError::Sdk)?;
         let assets = discover_core_assets(&markets)?;
         Ok(Self {
@@ -280,6 +303,7 @@ impl HyperliquidVenue {
             nonce: NonceHandler::default(),
             assets,
             budget,
+            network,
         })
     }
 
@@ -708,21 +732,33 @@ pub struct HyperliquidBookStream {
     info: HttpClient,
     stream: WebSocket,
     budget: Arc<RequestBudget>,
+    network: HyperliquidNetwork,
 }
 
 impl std::fmt::Debug for HyperliquidBookStream {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("HyperliquidBookStream")
-            .field("network", &"testnet")
+            .field("network", &self.network)
             .finish_non_exhaustive()
     }
 }
 
 impl HyperliquidBookStream {
     pub fn connect_testnet() -> Result<Self, HyperliquidError> {
+        Ok(Self::connect(HyperliquidNetwork::Testnet))
+    }
+
+    pub fn connect_mainnet() -> Result<Self, HyperliquidError> {
+        Ok(Self::connect(HyperliquidNetwork::Mainnet))
+    }
+
+    fn connect(network: HyperliquidNetwork) -> Self {
         let budget = Arc::new(RequestBudget::new());
-        let stream = hypercore::testnet_ws();
+        let stream = match network {
+            HyperliquidNetwork::Testnet => hypercore::testnet_ws(),
+            HyperliquidNetwork::Mainnet => hypercore::mainnet_ws(),
+        };
         for symbol in ALLOWED_SYMBOLS {
             stream.subscribe(Subscription::L2Book {
                 coin: symbol.to_owned(),
@@ -731,11 +767,15 @@ impl HyperliquidBookStream {
                 fast: false,
             });
         }
-        Ok(Self {
-            info: hypercore::testnet(),
+        Self {
+            info: match network {
+                HyperliquidNetwork::Testnet => hypercore::testnet(),
+                HyperliquidNetwork::Mainnet => hypercore::mainnet(),
+            },
             stream,
             budget,
-        })
+            network,
+        }
     }
 
     pub async fn next_snapshot(&mut self) -> Result<BookSnapshot, HyperliquidError> {

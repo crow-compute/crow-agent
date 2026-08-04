@@ -43,7 +43,7 @@ pub use device_auth::{
 pub use gateway::{GatewayClient, GatewayError, InferenceRequest, InferenceResponse};
 pub use hyperliquid::{
     AccountSnapshot, BookLevel, BookSnapshot, CoreAsset, HyperliquidBookStream, HyperliquidError,
-    HyperliquidVenue, MarketSnapshot, PositionSnapshot, VenueSubmission,
+    HyperliquidNetwork, HyperliquidVenue, MarketSnapshot, PositionSnapshot, VenueSubmission,
     hyperliquid_api_wallet_address,
 };
 pub use journal::{EncryptedJournal, JournalError};

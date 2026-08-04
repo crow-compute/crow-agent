@@ -55,6 +55,7 @@ const HYPERLIQUID_API_WALLET_ACCOUNT: &str = "hyperliquid-api-wallet-key";
 const PRODUCTION_API_ORIGIN: &str = "https://api.crowcompute.ai";
 const PRODUCTION_RELAY_URL: &str = "wss://api.crowcompute.ai/harness/v1/connect";
 const HYPERLIQUID_TESTNET_API_URL: &str = "https://app.hyperliquid-testnet.xyz/API";
+const HYPERLIQUID_MAINNET_API_URL: &str = "https://app.hyperliquid.xyz/API";
 const COMPANION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 // Live startup performs several signed venue/API calls before it can publish
 // an active run over IPC. Fifteen seconds was short enough to kill a healthy
@@ -1199,16 +1200,20 @@ async fn create_agent_version(
 }
 
 #[tauri::command]
-fn prepare_hyperliquid_wallet() -> Result<HyperliquidWalletSetup, String> {
+fn prepare_hyperliquid_wallet(mainnet: Option<bool>) -> Result<HyperliquidWalletSetup, String> {
     let key =
         load_or_create_hyperliquid_api_wallet_key().map_err(|error| error.code().to_owned())?;
     let address =
         hyperliquid_api_wallet_address(&key).map_err(|_| DesktopError::Venue.code().to_owned())?;
-    open::that_detached(HYPERLIQUID_TESTNET_API_URL)
-        .map_err(|_| DesktopError::Browser.code().to_owned())?;
+    let approval_url = if mainnet.unwrap_or(false) {
+        HYPERLIQUID_MAINNET_API_URL
+    } else {
+        HYPERLIQUID_TESTNET_API_URL
+    };
+    open::that_detached(approval_url).map_err(|_| DesktopError::Browser.code().to_owned())?;
     Ok(HyperliquidWalletSetup {
         address,
-        approval_url: HYPERLIQUID_TESTNET_API_URL.into(),
+        approval_url: approval_url.into(),
     })
 }
 

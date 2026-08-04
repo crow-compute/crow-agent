@@ -841,11 +841,13 @@ export function App() {
   }
 
   async function continueToVenue() {
-    if (!selectedVersionId) return;
+    if (!selectedArena || !selectedVersionId) return;
     setArenaBusy(true);
     setNotice(null);
     try {
-      setWalletSetup(await prepareHyperliquidWallet());
+      setWalletSetup(
+        await prepareHyperliquidWallet(selectedArena.mode === "hyperliquid_mainnet"),
+      );
       setArenaSetupStep("venue");
     } catch {
       setNotice("The local Hyperliquid API wallet could not be prepared.");
@@ -1640,13 +1642,13 @@ export function App() {
                 <div className="venue-key-panel">
                   <span>LOCAL API WALLET ADDRESS</span>
                   <strong>{walletSetup?.address ?? "Preparing…"}</strong>
-                  <p>Register this public address as an API wallet in the Hyperliquid Testnet page that just opened. The private key is already sealed in your OS credential store.</p>
+                  <p>Register this public address as an API wallet in the Hyperliquid {selectedArena.mode === "hyperliquid_mainnet" ? "mainnet" : "Testnet"} page that just opened. The private key is already sealed in your OS credential store.</p>
                   <button
                     className="text-action"
                     type="button"
                     onClick={() => void continueToVenue()}
                   >
-                    Reopen Hyperliquid Testnet ↗
+                    Reopen Hyperliquid {selectedArena.mode === "hyperliquid_mainnet" ? "mainnet" : "Testnet"} ↗
                   </button>
                 </div>
                 <label className="field-block">

@@ -110,11 +110,13 @@ pub(crate) fn prepare(config: LiveArenaConfig) -> Result<PreparedLiveArena, Live
     let isolated_leverage = config
         .isolated_leverage
         .unwrap_or(manifest.risk_rules.isolated_leverage);
-    if manifest.mode != ArenaMode::HyperliquidTestnet
-        || !manifest
-            .eligible_models
-            .iter()
-            .any(|model| model == &config.model_id)
+    if !matches!(
+        manifest.mode,
+        ArenaMode::HyperliquidTestnet | ArenaMode::HyperliquidMainnet
+    ) || !manifest
+        .eligible_models
+        .iter()
+        .any(|model| model == &config.model_id)
         || config.agent_version_id == Uuid::nil()
         || config.client_release.trim().is_empty()
         || !(MIN_LIVE_DECISION_INTERVAL_SECONDS..=MAX_CLIENT_DECISION_COOLDOWN_SECONDS)
@@ -210,7 +212,11 @@ pub(crate) async fn run_session(
     if strategy.model_id != config.model_id {
         return Err(LiveRunError::Configuration);
     }
-    let venue = HyperliquidVenue::connect_testnet(api_wallet_key).await?;
+    let venue = match manifest.mode {
+        ArenaMode::HyperliquidTestnet => HyperliquidVenue::connect_testnet(api_wallet_key).await?,
+        ArenaMode::HyperliquidMainnet => HyperliquidVenue::connect_mainnet(api_wallet_key).await?,
+        ArenaMode::HistoricalBacktest => return Err(LiveRunError::Configuration),
+    };
     venue
         .configure_isolated_leverage(&config.execution_account, isolated_leverage)
         .await?;
@@ -294,7 +300,11 @@ pub(crate) async fn run_session(
         *active_run.lock().map_err(|_| LiveRunError::State)? = None;
         return Ok(LiveSessionOutcome::Stopped);
     }
-    let mut stream = HyperliquidBookStream::connect_testnet()?;
+    let mut stream = match manifest.mode {
+        ArenaMode::HyperliquidTestnet => HyperliquidBookStream::connect_testnet()?,
+        ArenaMode::HyperliquidMainnet => HyperliquidBookStream::connect_mainnet()?,
+        ArenaMode::HistoricalBacktest => return Err(LiveRunError::Configuration),
+    };
     let initial = stream.reconcile().await?;
     let mut books = initial
         .into_iter()
@@ -543,7 +553,11 @@ pub(crate) async fn run_session(
                             .map(|book| (book.symbol.clone(), book))
                             .collect();
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                        stream = HyperliquidBookStream::connect_testnet()?;
+                        stream = match manifest.mode {
+                            ArenaMode::HyperliquidTestnet => HyperliquidBookStream::connect_testnet()?,
+                            ArenaMode::HyperliquidMainnet => HyperliquidBookStream::connect_mainnet()?,
+                            ArenaMode::HistoricalBacktest => return Err(LiveRunError::Configuration),
+                        };
                     }
                 }
             }
@@ -605,6 +619,11 @@ async fn initialize_event_chain(
         return Ok(());
     }
     let manifest_sha256 = config.signed.manifest_sha256.clone();
+    let venue_mode = match config.signed.manifest.mode {
+        ArenaMode::HyperliquidMainnet => "hyperliquid_mainnet",
+        ArenaMode::HyperliquidTestnet => "hyperliquid_testnet",
+        ArenaMode::HistoricalBacktest => "historical_backtest",
+    };
     let mut writer = DurableRunEventWriter::new(journal, api, identity, arena_id, run_id);
     writer
         .append(
@@ -613,7 +632,7 @@ async fn initialize_event_chain(
             json!({
                 "client_release": config.client_release,
                 "manifest_sha256": manifest_sha256,
-                "mode": "hyperliquid_testnet",
+                "mode": venue_mode,
                 "decision_cooldown_seconds": config.decision_cooldown_seconds,
                 "isolated_leverage": config.isolated_leverage,
             }),
