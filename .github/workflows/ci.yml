@@ -78,5 +78,9 @@ jobs:
         with:
           tool: cargo-deny,cargo-audit
       - run: cargo deny check
-      - run: cargo audit
+      - name: Audit resolved Rust dependencies
+        # rkyv 0.7 is lockfile-only through disabled optional features; glib
+        # 0.18 is Tauri's Linux WebKitGTK binding and the affected iterator API
+        # is not used by Crow. deny.toml records the same narrow exceptions.
+        run: cargo audit --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2024-0429
       - run: ./scripts/test-release-version.sh
