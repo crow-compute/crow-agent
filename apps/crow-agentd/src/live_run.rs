@@ -233,7 +233,7 @@ pub(crate) async fn run_session(
         state
     } else {
         let account = venue.account_snapshot(&config.execution_account).await?;
-        if account.equity_micro_usdc <= 0 {
+        if !valid_initial_venue_account(manifest, &account) {
             return Err(LiveRunError::State);
         }
         let state = LiveRiskState {
@@ -563,6 +563,24 @@ pub(crate) async fn run_session(
             }
         }
     }
+}
+
+fn valid_initial_venue_account(
+    manifest: &crow_agent_protocol::ArenaManifestV1,
+    account: &crow_agent_core::AccountSnapshot,
+) -> bool {
+    if manifest.mode == ArenaMode::HyperliquidMainnet
+        && manifest.ticket.enabled
+        && manifest.ticket.asset == "CC"
+    {
+        let Ok(required) = i64::try_from(manifest.starting_capital_micro_usdc) else {
+            return false;
+        };
+        return account.equity_micro_usdc == required
+            && account.withdrawable_micro_usdc == required
+            && account.positions.is_empty();
+    }
+    account.equity_micro_usdc > 0
 }
 
 async fn acquire_run(
@@ -962,6 +980,23 @@ mod tests {
                 "winner_bps": [5000, 3000, 2000]
             }
         }))?;
+        let clean_account = crow_agent_core::AccountSnapshot {
+            venue_time_ms: 1,
+            equity_micro_usdc: 100_000_000,
+            withdrawable_micro_usdc: 100_000_000,
+            positions: std::collections::BTreeMap::new(),
+        };
+        assert!(valid_initial_venue_account(&manifest, &clean_account));
+        manifest.mode = ArenaMode::HyperliquidMainnet;
+        manifest.ticket.enabled = true;
+        manifest.ticket.asset = "CC".into();
+        manifest.starting_capital_micro_usdc = 100_000_000;
+        assert!(valid_initial_venue_account(&manifest, &clean_account));
+        let wrong_balance = crow_agent_core::AccountSnapshot {
+            equity_micro_usdc: 100_000_001,
+            ..clean_account
+        };
+        assert!(!valid_initial_venue_account(&manifest, &wrong_balance));
         assert_eq!(expected_cycle_count(&manifest, 900)?, 2);
         assert_eq!(
             due_cycle_count(

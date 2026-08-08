@@ -7,8 +7,8 @@ use crow_agent_core::{
     hyperliquid_api_wallet_address, open_agent_version, seal_agent_version,
 };
 use crow_agent_protocol::{
-    AgentVersionEnvelopeV1, DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction, RemoteCommandV1,
-    SignedArenaManifestV1, sha256,
+    AgentVersionEnvelopeV1, ArenaMode, DeviceIdentity, HARNESS_PROTOCOL_V1, RemoteAction,
+    RemoteCommandV1, SignedArenaManifestV1, sha256,
 };
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, Name,
@@ -1271,16 +1271,6 @@ async fn start_local_arena(
     {
         return Err(DesktopError::Arena.code().into());
     }
-    let api_wallet_key =
-        load_or_create_hyperliquid_api_wallet_key().map_err(|error| error.code().to_owned())?;
-    let venue = crow_agent_core::HyperliquidVenue::connect_testnet(&api_wallet_key)
-        .await
-        .map_err(|_| DesktopError::VenueAccount.code().to_owned())?;
-    let account = venue
-        .account_snapshot(&execution_account)
-        .await
-        .map_err(|_| DesktopError::VenueAccount.code().to_owned())?;
-    validate_launch_account(&account).map_err(|error| error.code().to_owned())?;
     let arena_id = Uuid::parse_str(&arena_id).map_err(|_| DesktopError::Arena.code().to_owned())?;
     let agent_version_id = Uuid::parse_str(&agent_version_id)
         .map_err(|_| DesktopError::AgentVersion.code().to_owned())?;
@@ -1302,6 +1292,30 @@ async fn start_local_arena(
         arena.signature,
     )
     .map_err(|_| DesktopError::Arena.code().to_owned())?;
+    let api_wallet_key =
+        load_or_create_hyperliquid_api_wallet_key().map_err(|error| error.code().to_owned())?;
+    let venue = match signed.manifest.mode {
+        ArenaMode::HyperliquidTestnet => {
+            crow_agent_core::HyperliquidVenue::connect_testnet(&api_wallet_key).await
+        }
+        ArenaMode::HyperliquidMainnet => {
+            crow_agent_core::HyperliquidVenue::connect_mainnet(&api_wallet_key).await
+        }
+        ArenaMode::HistoricalBacktest => return Err(DesktopError::Arena.code().into()),
+    }
+    .map_err(|_| DesktopError::VenueAccount.code().to_owned())?;
+    let account = venue
+        .account_snapshot(&execution_account)
+        .await
+        .map_err(|_| DesktopError::VenueAccount.code().to_owned())?;
+    let exact_clean_capital = (signed.manifest.mode == ArenaMode::HyperliquidMainnet
+        && signed.manifest.ticket.enabled
+        && signed.manifest.ticket.asset == "CC")
+        .then(|| i64::try_from(signed.manifest.starting_capital_micro_usdc))
+        .transpose()
+        .map_err(|_| DesktopError::Arena.code().to_owned())?;
+    validate_launch_account(&account, exact_clean_capital)
+        .map_err(|error| error.code().to_owned())?;
     let envelope = list_agent_version_envelopes(&token.access_token)
         .await
         .map_err(|error| error.code().to_owned())?
@@ -1406,7 +1420,19 @@ async fn start_local_arena(
     Err(DesktopError::Companion.code().into())
 }
 
-fn validate_launch_account(account: &crow_agent_core::AccountSnapshot) -> Result<(), DesktopError> {
+fn validate_launch_account(
+    account: &crow_agent_core::AccountSnapshot,
+    exact_clean_capital: Option<i64>,
+) -> Result<(), DesktopError> {
+    if let Some(required) = exact_clean_capital {
+        if account.equity_micro_usdc != required
+            || account.withdrawable_micro_usdc != required
+            || !account.positions.is_empty()
+        {
+            return Err(DesktopError::VenueCollateral);
+        }
+        return Ok(());
+    }
     // Withdrawable collateral can be zero while an account has valid isolated
     // positions consuming its margin. Equity is the launch invariant; order
     // sizing later uses the reconciled available collateral and fails closed
@@ -2182,21 +2208,59 @@ mod tests {
             withdrawable_micro_usdc: 1_001_473_289,
             positions: BTreeMap::new(),
         };
-        assert!(validate_launch_account(&account).is_ok());
+        assert!(validate_launch_account(&account, None).is_ok());
         let empty = crow_agent_core::AccountSnapshot {
             equity_micro_usdc: 0,
             withdrawable_micro_usdc: 0,
             ..account.clone()
         };
         assert!(matches!(
-            validate_launch_account(&empty),
+            validate_launch_account(&empty, None),
             Err(DesktopError::VenueCollateral)
         ));
         let position_backed = crow_agent_core::AccountSnapshot {
             withdrawable_micro_usdc: 0,
             ..account
         };
-        assert!(validate_launch_account(&position_backed).is_ok());
+        assert!(validate_launch_account(&position_backed, None).is_ok());
+    }
+
+    #[test]
+    fn replacement_beta_requires_an_exact_clean_one_hundred_usdc_account() {
+        let clean = crow_agent_core::AccountSnapshot {
+            venue_time_ms: 1,
+            equity_micro_usdc: 100_000_000,
+            withdrawable_micro_usdc: 100_000_000,
+            positions: BTreeMap::new(),
+        };
+        assert!(validate_launch_account(&clean, Some(100_000_000)).is_ok());
+
+        let extra_equity = crow_agent_core::AccountSnapshot {
+            equity_micro_usdc: 100_000_001,
+            ..clean.clone()
+        };
+        assert!(validate_launch_account(&extra_equity, Some(100_000_000)).is_err());
+
+        let reserved_margin = crow_agent_core::AccountSnapshot {
+            withdrawable_micro_usdc: 99_000_000,
+            ..clean.clone()
+        };
+        assert!(validate_launch_account(&reserved_margin, Some(100_000_000)).is_err());
+
+        let mut open_position = clean;
+        open_position.positions.insert(
+            "BTC".into(),
+            crow_agent_core::PositionSnapshot {
+                symbol: "BTC".into(),
+                quantity_e8: 1,
+                notional_micro_usdc: 1,
+                entry_price_micro_usdc: Some(100_000_000),
+                unrealized_pnl_micro_usdc: 0,
+                isolated: true,
+                leverage: 1,
+            },
+        );
+        assert!(validate_launch_account(&open_position, Some(100_000_000)).is_err());
     }
 
     #[test]
