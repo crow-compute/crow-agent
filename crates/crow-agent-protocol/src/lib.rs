@@ -14,6 +14,7 @@ use uuid::Uuid;
 pub const HARNESS_PROTOCOL_V1: &str = "crow.harness.v1";
 pub const DEFAULT_STARTING_CAPITAL_MICRO_USDC: u64 = 1_000_000_000;
 pub const MIN_STARTING_CAPITAL_MICRO_USDC: u64 = 500_000_000;
+pub const REPLACEMENT_BETA_STARTING_CAPITAL_MICRO_USDC: u64 = 100_000_000;
 pub const MAX_STARTING_CAPITAL_MICRO_USDC: u64 = 1_000_000_000_000;
 pub const MIN_LIVE_DECISION_INTERVAL_SECONDS: u32 = 60;
 pub const MAX_CLIENT_DECISION_COOLDOWN_SECONDS: u32 = 3_600;
@@ -261,8 +262,13 @@ impl ArenaManifestV1 {
             }
             _ => {}
         }
-        if !(MIN_STARTING_CAPITAL_MICRO_USDC..=MAX_STARTING_CAPITAL_MICRO_USDC)
-            .contains(&self.starting_capital_micro_usdc)
+        let replacement_beta_capital = self.mode == ArenaMode::HyperliquidMainnet
+            && self.ticket.enabled
+            && self.ticket.asset == "CC"
+            && self.starting_capital_micro_usdc == REPLACEMENT_BETA_STARTING_CAPITAL_MICRO_USDC;
+        if !replacement_beta_capital
+            && !(MIN_STARTING_CAPITAL_MICRO_USDC..=MAX_STARTING_CAPITAL_MICRO_USDC)
+                .contains(&self.starting_capital_micro_usdc)
         {
             return Err(ProtocolError::InvalidManifest(
                 "starting capital must be between 500 and 1,000,000 USDC".into(),
@@ -313,8 +319,9 @@ impl ArenaManifestV1 {
             };
             if self.mode != ArenaMode::HyperliquidMainnet
                 || self.ticket.chain_id != 4663
-                || self.ticket.ticket_base_units != "750000000000000000000000"
-                || self.ticket.participant_cap != 20
+                || self.starting_capital_micro_usdc != REPLACEMENT_BETA_STARTING_CAPITAL_MICRO_USDC
+                || self.ticket.ticket_base_units != "250000000000000000000000"
+                || self.ticket.participant_cap != 100
                 || self.ticket.token_address.as_deref().is_none_or(|address| {
                     !address.eq_ignore_ascii_case("0x859ead0ee2fd39a2804bb27713742577f7be79c1")
                 })
@@ -1168,20 +1175,24 @@ mod tests {
             asset: "CC".into(),
             chain_id: 4663,
             token_address: Some("0x859ead0ee2fd39a2804bb27713742577f7be79c1".into()),
-            ticket_base_units: "750000000000000000000000".into(),
+            ticket_base_units: "250000000000000000000000".into(),
             escrow_address: Some("0x1111111111111111111111111111111111111111".into()),
             withdrawal_policy: "owner_anytime".into(),
             payout_policy: "manual_owner_payout".into(),
             prize_asset: "ETH".into(),
             prize_base_units: "1000000000000000000".into(),
-            participant_cap: 20,
+            participant_cap: 100,
             prize_bps: 0,
             protocol_bps: 0,
             winner_bps: [0, 0, 0],
             ..TicketConfigV1::default()
         };
+        manifest.starting_capital_micro_usdc = REPLACEMENT_BETA_STARTING_CAPITAL_MICRO_USDC;
         assert!(manifest.validate().is_ok());
-        manifest.ticket.ticket_base_units = "750000000000000000000001".into();
+        manifest.starting_capital_micro_usdc += 1;
+        assert!(manifest.validate().is_err());
+        manifest.starting_capital_micro_usdc = REPLACEMENT_BETA_STARTING_CAPITAL_MICRO_USDC;
+        manifest.ticket.ticket_base_units = "250000000000000000000001".into();
         assert!(manifest.validate().is_err());
     }
 
